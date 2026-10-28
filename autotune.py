@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
     "speed_url": probe.DEFAULT_SPEED_URL,
     "ping_host": probe.DEFAULT_PING_HOST,
-    "candidate_bands": [3, 40],     # 默认只测这两个，--bands all 才全测
+    "candidate_bands": [3, 40],     # 仅 --bands preferred 时用来缩小范围
 }
 
 
@@ -149,6 +149,22 @@ def _band_label(band):
     return f"BAND {band}" if band else "自动"
 
 
+def resolve_bands(caps, args, cfg):
+    """决定要实测哪些频段。
+
+    默认走「设备自己声明的全部频段」——先问设备支持什么，再逐个测，
+    而不是拿一份写死的清单去猜。config 里的 candidate_bands 只在
+    --bands preferred 时作为缩小范围用。
+    """
+    supported = list(caps.get("bands") or [])
+    if args.bands in ("default", "all"):
+        return supported or list(cfg.get("candidate_bands") or [])
+    if args.bands == "preferred":
+        pref = [b for b in (cfg.get("candidate_bands") or []) if b in supported]
+        return pref or supported
+    return [int(x) for x in args.bands.split(",") if x.strip()]
+
+
 def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     cur_band, cur_ch = st0["band"], st0["channel"]
     rounds = max(1, min(args.rounds, 2))
@@ -178,17 +194,15 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     lte = []
     best_band = None
     if not args.wifi_only and caps.get("can_lock_band"):
-        cand = cfg.get("candidate_bands") or [3, 40]
-        if args.bands == "all":
-            bands = list(caps["bands"])
-        elif args.bands != "default":
-            bands = [int(x) for x in args.bands.split(",")]
+        bands = resolve_bands(caps, args, cfg)
+        if not bands:
+            print("\n[2/2] 驱动没有声明可用频段，跳过频段实测。")
         else:
-            bands = [b for b in cand if b in caps["bands"]] or list(caps["bands"])[:2]
-
-        print(f"\n[2/2] 逐个实测频段 {bands}（每段 {rounds} 轮，期间会短暂断网，"
-              f"结束后自动切回原频段）…")
-        for b in bands:
+            per = SETTLE_SEC + rounds * 20 + 6
+            print(f"\n[2/2] 设备声明支持 {len(bands)} 个频段：{bands}")
+            print(f"      逐个实测（每段 {rounds} 轮，约 {per} 秒/个，"
+                  f"合计约 {per * len(bands) // 60} 分钟；期间会短暂断网，结束后自动切回原频段）…")
+        for b in bands or []:
             r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
             lte.append(r)
             if r["ok"]:
@@ -196,6 +210,30 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                       f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
             else:
                 print(f"      {_band_label(b):<8} 无服务（该频段在当地没有覆盖）")
+
+        usable = [r for r in lte if r["ok"]]
+        # 决赛：全部粗测完后，对「最优」和「当前」各补一轮。
+        # 单轮结果容易被瞬时调度带偏，而这两者的差值正是决策依据，值得多花 90 秒确认。
+        if usable and len(bands) > 2:
+            usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
+            contest = [b for b in dict.fromkeys([usable[0]["band"], cur_band]) if b]
+            print(f"\n[决赛] 对 {[f'BAND {b}' for b in contest]} 各补 1 轮确认…")
+            by_band = {r["band"]: r for r in lte}
+            for b in contest:
+                prev = by_band.get(b)
+                if not prev or not prev["ok"]:
+                    continue
+                extra = measure_band(dev, b, rounds=1,
+                                     speed_url=speed_url, ping_host=ping_host)
+                if extra.get("ok"):
+                    merged = sorted(prev["mbps_all"] + extra["mbps_all"])
+                    prev["mbps"] = round(statistics.median(merged), 1)
+                    prev["mbps_all"] = merged
+                    prev["mbps_min"] = min(merged)
+                    prev["mbps_max"] = max(merged)
+                    prev["rounds"] = len(merged)
+                    print(f"      {_band_label(b):<8} 复测后 {prev['mbps']} Mbps"
+                          f"（{merged}）")
 
         # 无论结论如何，先把设备恢复原状，用户不动手也不会被留在别的频段
         now_band = dev.get_state()["band"]
@@ -493,7 +531,8 @@ def main():
     ap.add_argument("--apply", action="store_true", help="实际应用最优设置（默认只检测）")
     ap.add_argument("--wifi-only", action="store_true", help="只优化 WiFi 信道")
     ap.add_argument("--lte-only", action="store_true", help="只优化 LTE 频段")
-    ap.add_argument("--bands", default="default", help="default / all / 逗号分隔，如 3,40,41")
+    ap.add_argument("--bands", default="default",
+                    help="default=设备声明的全部频段 / preferred=配置里的子集 / 逗号分隔如 3,40")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
     ap.add_argument("--host", default="192.168.0.1", help="设备管理地址")
     ap.add_argument("--user", default="admin", help="后台账号")
@@ -649,13 +688,7 @@ def main():
             print("\n[2/2] 该机型不支持锁定频段，跳过（只优化 WiFi）。")
             report["lte"] = {"supported": False}
         else:
-            cand = cfg.get("candidate_bands") or [3, 40]
-            if args.bands == "all":
-                bands = list(caps["bands"])
-            elif args.bands != "default":
-                bands = [int(x) for x in args.bands.split(",")]
-            else:
-                bands = [b for b in cand if b in caps["bands"]] or list(caps["bands"])[:2]
+            bands = resolve_bands(caps, args, cfg)
             per = SETTLE_SEC + args.rounds * 18 + 5
             print(f"\n[2/2] 实测 LTE 频段 {bands}（每频段 {args.rounds} 轮取中位数，"
                   f"约 {per} 秒/个，期间会短暂断网）…")
