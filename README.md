@@ -85,12 +85,20 @@ score(信道) = Σ  邻居  (信号%/100)² × (重叠宽度 / 20MHz)
 
 ## 安装
 
-无需 `pip install`，Python 3.8+ 即可：
+**方式一：直接用源码**（推荐，改起来方便）
 
 ```bash
 git clone https://github.com/Healton1314/mifi-autotune.git
 cd mifi-autotune
 python autotune.py            # 只体检，不改设备
+```
+
+**方式二：装成命令**
+
+```bash
+pip install .
+mifi-autotune                 # 等价于 python autotune.py
+mifi-panel --lan              # 等价于 python server.py --lan
 ```
 
 前置条件：
@@ -115,6 +123,7 @@ python autotune.py --wifi-only          # 只优化 WiFi 信道
 python autotune.py --lte-only           # 只优化 LTE 频段
 python autotune.py --restore            # 还原为「频段不锁定 + 信道自动」
 python autotune.py --list-drivers       # 看当前装了哪些设备驱动
+python autotune.py --watch              # 守护模式：长期跑，劣化才自动重测
 ```
 
 常用参数：
@@ -125,6 +134,36 @@ python autotune.py --list-drivers       # 看当前装了哪些设备驱动
 | `--ping-host` | 延迟探测目标，默认 `223.5.5.5` |
 | `--speed-url` | 测速下载地址，默认 Cloudflare；国内建议换成国内大文件镜像 |
 | `--rounds` / `--scan-rounds` | 频段测量轮数 / 信道扫描轮数 |
+| `--watch-interval` | 守护模式探测间隔，默认 300 秒 |
+| `--watch-cooldown` | 两次自动重测的最小间隔，默认 900 秒 |
+| `--watch-dry-run` | 守护演练：只报告会触发什么，不动设备 |
+
+## 守护模式：让它自己盯着
+
+一次性跑完就结束，对「每天固定时段变慢」这种情况没什么用。`--watch` 补上了这一段：
+
+```bash
+python autotune.py --watch                          # 默认 5 分钟探一次，15 分钟冷却
+python autotune.py --watch --watch-dry-run          # 先演练一周，只看会不会误报
+python autotune.py --watch --watch-interval 600     # 探得更稀一些
+```
+
+**为什么不是「每隔几分钟测一次速」**：一次测速要跑几十兆流量，本身就干扰你在用的网络，长期跑不现实。所以守护模式平时只打 10 个 ping（几百字节），只有真的异常了，才付出「断网几十秒」的代价去重测。
+
+触发条件（满足任一）：
+
+| 指标 | 阈值 |
+|---|---|
+| 丢包 | ≥ 3% |
+| 延迟 | > `min(260ms, max(基线×1.8, 80ms))` |
+| 抖动 | > `min(80ms, max(基线×1.8, 25ms))` |
+
+这个三段式是有意设计的：**下限**保证正常波动不触发（否则一抖动就断网重连）；**倍数**让本来就慢的链路按比例放宽；**上限**防止基线太高时阈值一起飘走、永远触发不了。还没积累基线时（冷启动）用 180ms / 40ms 兜底。
+
+触发后跑一次完整重测并应用，然后进入冷却期（默认 15 分钟），避免在噪声里反复切换——**频繁切频段比不切更伤体验**。
+
+> 实际就是「白天好、晚上七八点开始卡」场景的解药：卡的那一下它自己重测一次，选出当时环境下最快的频段。
+
 
 ### 关于「排除自己的 AP」
 
@@ -149,6 +188,8 @@ python autotune.py --list-drivers       # 看当前装了哪些设备驱动
 | **状态留档** | 改动前写入 `state.json`，`--restore` 一键还原 |
 | **失败不改** | 信道写入后读回校验，未生效则恢复原值 |
 | **趋势记录** | 每次运行追加 `autotune-log.jsonl`，可用来观察时段规律 |
+| **面板鉴权** | 所有 `/api/*` 校验访问令牌，防止同网段的人改你的路由器 |
+| **切换冷却** | 守护模式两次重测至少间隔 15 分钟，避免反复断网 |
 
 **注意**：`--apply` 期间会短暂断网（换频段需要重新注册，每个频段约 26 秒；默认测 2 个频段，合计约 4 分钟）。正在下载或开会时别跑。
 
@@ -219,22 +260,42 @@ python autotune.py --driver yourbrand          # 4. 验证
 python server.py --lan       # 手机和电脑连同一个 Wi-Fi
 ```
 
-手机浏览器打开终端里打印的 `http://<电脑IP>:8787`，iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上可以看实时信号、扫描信道（带柱状图）、一键体检 / 优化 / 恢复。
+终端会打印类似这样一行，**手机浏览器直接打开它**：
 
-> 面板不含登录态，但它能操作你的路由器，**别把 8787 端口映射到公网**。
+```
+手机访问： http://192.168.1.23:8787/?k=Xk3pQ9vLm2Rt
+```
+
+iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上可以看实时信号、扫描信道（带柱状图）、一键体检 / 优化 / 恢复。
+
+### 访问令牌（重要）
+
+所有 `/api/*` 都要求令牌，否则返回 401。为什么必须有：
+
+**面板能改设备频段、能让整个网络断线。** 而 `--lan` 是把端口暴露在整个局域网里的——不校验的话，同一 WiFi 下任何人都能操作你的路由器。
+
+- 令牌首次启动时自动生成，存在 `.panel-token`（已加入 `.gitignore`，权限 600）
+- 用带 `?k=` 的地址打开一次，令牌会写进 Cookie（HttpOnly），之后正常访问即可
+- 也可以自定义：`--token 你的令牌`，或设环境变量 `MIFI_PANEL_TOKEN`
+- 脚本调用：请求头加 `X-Panel-Token: <令牌>`
+
+> 即便如此，**别把 8787 端口映射到公网**。这是局域网工具，不是给外网用的。
 
 ## 目录结构
 
 ```
 mifi-autotune/
-├── autotune.py            引擎（命令行入口）
+├── autotune.py            引擎（命令行入口，含 --watch 守护模式）
 ├── scanner.py             2.4G 扫描层（跨平台 + 多语言）
 ├── probe.py               带宽 / 延迟测量层
-├── server.py              本地 Web 面板服务
+├── server.py              本地 Web 面板服务（带令牌校验）
+├── pyproject.toml         打包配置（pip install . 得到 mifi-autotune 命令）
 ├── web/                   手机端面板（PWA）
 │   ├── index.html
 │   ├── manifest.webmanifest
 │   └── icon.svg
+├── tests/                 纯逻辑单元测试（CI 三系统跑）
+├── .github/workflows/     CI
 └── drivers/
     ├── base.py            设备抽象基类
     ├── zte_rta.py         ZTE-RTA 实现
@@ -242,7 +303,7 @@ mifi-autotune/
     └── __init__.py        注册表 + 自动探测
 ```
 
-运行期产物（`state.json`、`config.json`、`autotune-log.jsonl`）已在 `.gitignore` 里。
+运行期产物（`state.json`、`config.json`、`autotune-log.jsonl`、`.panel-token`）已在 `.gitignore` 里。
 
 ## 接口备忘
 
@@ -276,9 +337,11 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 
 - [x] 多轮测量 + 中位数 + 切换阈值
 - [x] 驱动化架构，不绑定型号
-- [x] 手机端面板（PWA，局域网访问）
-- [ ] 按时段自动切换（白天 / 晚高峰用不同频段）
+- [x] 手机端面板（PWA，局域网访问 + 访问令牌）
+- [x] 守护模式 `--watch`（劣化才重测，带冷却）
+- [x] 打包为可安装命令（`pip install .`）
 - [ ] 从 `autotune-log.jsonl` 生成长期趋势图
+- [ ] 按时段策略切换（夜里宽容、晚高峰激进）
 - [ ] 更多机型驱动（欢迎 PR）
 - [ ] Linux / macOS 实机验证
 
@@ -288,12 +351,15 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 
 - Zero dependencies (Python 3.8+ standard library only)
 - Read-only by default; `--apply` to write. Auto-rollback if the new band can't get online
+- `--watch` daemon mode: cheap latency probing, full re-measure only when the link actually degrades
 - Driver-based: the engine knows nothing about brands. `drivers/zte_rta.py` is verified; copy `drivers/template.py` to add yours
-- Ships with a local PWA dashboard for your phone (`python server.py --lan`)
+- Ships with a local PWA dashboard for your phone (`python server.py --lan`), protected by an access token
+- `pip install .` gives you `mifi-autotune` and `mifi-panel` commands
 
 ```bash
 python autotune.py            # report only
 python autotune.py --apply    # measure and apply
+python autotune.py --watch    # keep watching, re-tune when it degrades
 python autotune.py --restore  # unlock band + auto channel  ← do this before travelling
 ```
 

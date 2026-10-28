@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mifi-autotune"
+version = "0.2.0"
+description = "自动为 4G 随身WiFi / CPE 选出最优 LTE 频段与 2.4G 信道（跨平台、零依赖、驱动化）"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Healton1314" }]
+keywords = ["mifi", "4g", "lte", "cpe", "wifi", "channel", "autotune", "band-lock"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: System :: Networking",
+  "Environment :: Console",
+]
+
+[project.urls]
+Homepage = "https://github.com/Healton1314/mifi-autotune"
+Issues = "https://github.com/Healton1314/mifi-autotune/issues"
+
+[project.scripts]
+mifi-autotune = "autotune:main"
+mifi-panel = "server:main"
+
+[tool.setuptools]
+py-modules = ["autotune", "scanner", "probe", "server"]
+packages = ["drivers"]
+
+# 面板静态文件随包安装到 share/，server.py 会在源码目录找不到时回落到这里
+[tool.setuptools.data-files]
+"share/mifi-autotune/web" = [
+  "web/index.html",
+  "web/manifest.webmanifest",
+  "web/icon.svg",
+]

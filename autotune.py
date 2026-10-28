@@ -17,15 +17,17 @@ import argparse
 import json
 import re
 import statistics
+import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import probe
 import scanner
 from drivers import detect, list_drivers
-from drivers.base import Unsupported
+from drivers.base import DeviceBusy, Unsupported
 
 HERE = Path(__file__).resolve().parent
 STATE = HERE / "state.json"
@@ -35,6 +37,22 @@ CONFIG = HERE / "config.json"
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
+
+# 守护模式（--watch）的劣化判定阈值。
+# 三段式：min(上限, max(基线×倍数, 下限))
+#   下限   —— 正常波动不许触发，否则一有抖动就断网重连
+#   倍数   —— 本来就慢的链路（基线 120ms）按比例放宽，不误判
+#   上限   —— 防止基线太高时阈值一起飘走，那样永远触发不了
+WATCH_LOSS_LIMIT = 3                # 丢包 ≥3% 视为劣化
+WATCH_FACTOR = 1.8                  # 相对基线的倍数
+
+WATCH_MIN_MS = 80                   # 延迟下限
+WATCH_CAP_MS = 260                  # 延迟上限
+WATCH_COLD_MS = 180                 # 冷启动（还没有基线）时的默认阈值
+
+WATCH_JITTER_MIN_MS = 25            # 抖动下限
+WATCH_JITTER_CAP_MS = 80            # 抖动上限
+WATCH_JITTER_COLD_MS = 40           # 冷启动抖动阈值
 
 DEFAULT_CONFIG = {
     "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
@@ -116,6 +134,119 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     }
 
 
+# ---------------- 守护模式 ----------------
+
+def _threshold(base, floor_ms, cold_ms, cap_ms):
+    """算出触发阈值：min(上限, max(基线×倍数, 下限))；没有基线时用冷启动默认值。"""
+    if base is None:
+        return cold_ms
+    return min(cap_ms, max(base * WATCH_FACTOR, floor_ms))
+
+
+def judge_degradation(stats, base_avg=None, base_jitter=None):
+    """判断一次探测是否算「网络劣化」，返回命中的原因列表（空列表 = 健康）。
+
+    阈值同时看绝对值和相对基线：只比绝对值会在本来就慢的链路上频繁误报；
+    只比相对基线，又会让已经很差的链路永远算「正常」。所以两边都设边界。
+    """
+    reasons = []
+    if stats.get("avg") is None:
+        return ["无法上网"]
+    if (stats.get("loss") or 0) >= WATCH_LOSS_LIMIT:
+        reasons.append(f"丢包 {stats['loss']}%")
+
+    avg_floor = _threshold(base_avg, WATCH_MIN_MS, WATCH_COLD_MS, WATCH_CAP_MS)
+    if stats["avg"] > avg_floor:
+        reasons.append(f"延迟 {stats['avg']}ms 超过 {int(avg_floor)}ms")
+
+    jit = stats.get("jitter") or 0
+    jit_floor = _threshold(base_jitter, WATCH_JITTER_MIN_MS,
+                           WATCH_JITTER_COLD_MS, WATCH_JITTER_CAP_MS)
+    if jit > jit_floor:
+        reasons.append(f"抖动 {jit}ms 超过 {int(jit_floor)}ms")
+    return reasons
+
+
+def run_cycle(args):
+    """跑一次完整的体检 + 应用，返回子进程退出码。"""
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
+    if args.wifi_only:
+        cmd.append("--wifi-only")
+    if args.lte_only:
+        cmd.append("--lte-only")
+    if args.bands != "default":
+        cmd += ["--bands", args.bands]
+    if args.ssid:
+        cmd += ["--ssid", args.ssid]
+    cmd.append("--apply")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+    for raw in iter(p.stdout.readline, b""):
+        line = raw.decode("utf-8", "ignore").rstrip()
+        if line:
+            print("      " + line, flush=True)
+    p.wait()
+    return p.returncode
+
+
+def watch(args, cfg):
+    """守护模式：低成本探测，只在明显劣化时才触发完整重测。
+
+    为什么不是「每隔几分钟测一次速」：测速要跑几十兆流量，本身就干扰你在用的
+    网络，长期跑不现实。所以平时只打 10 个 ping（几百字节），只有延迟/抖动/丢包
+    明显偏离基线时，才付出「断网几十秒」的代价。
+    """
+    interval = max(10, args.watch_interval)
+    cooldown = max(interval, args.watch_cooldown)
+    host = cfg["ping_host"]
+    hist, jit_hist = deque(maxlen=12), deque(maxlen=12)
+    next_allowed, dry = 0.0, args.watch_dry_run
+
+    print("=" * 62)
+    print(f"守护模式：每 {interval}s 探测 {host}，明显劣化才触发重测")
+    print(f"  触发：丢包≥{WATCH_LOSS_LIMIT}% ｜ 延迟>{WATCH_MIN_MS}~{WATCH_CAP_MS}ms"
+          f"（基线×{WATCH_FACTOR}）｜ 抖动>{WATCH_JITTER_MIN_MS}~{WATCH_JITTER_CAP_MS}ms")
+    print(f"  冷却：{cooldown}s（避免反复断网）"
+          f"{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
+    print("=" * 62)
+    try:
+        while True:
+            st = probe.ping_stats(10, host)
+            base_avg = statistics.median(hist) if len(hist) >= 3 else None
+            base_jit = statistics.median(jit_hist) if len(jit_hist) >= 3 else None
+            reasons = judge_degradation(st, base_avg, base_jit)
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = (f"{ts}  延迟 {st['avg'] if st['avg'] is not None else '—'}ms"
+                    f"  抖动 {st['jitter'] if st['jitter'] is not None else '—'}ms"
+                    f"  丢包 {st['loss']}%"
+                    f"  基线 {str(int(base_avg)) + 'ms' if base_avg else '采样中'}")
+
+            if not reasons:
+                print(line + "  ✓", flush=True)
+                if st["avg"] is not None:
+                    hist.append(st["avg"])
+                if st["jitter"] is not None:
+                    jit_hist.append(st["jitter"])
+            elif time.time() < next_allowed:
+                print(line + f"  ⚠ {'/'.join(reasons)}（冷却中，"
+                             f"{int(next_allowed - time.time())}s 后再评估）", flush=True)
+            else:
+                print(line + f"  ✗ 判定劣化：{'/'.join(reasons)}", flush=True)
+                if dry:
+                    print("      （演练模式，未改动设备）", flush=True)
+                else:
+                    print("      → 开始完整重测…", flush=True)
+                    code = run_cycle(args)
+                    print(f"      → 重测结束（exit={code}）", flush=True)
+                    hist.clear()
+                    jit_hist.clear()
+                next_allowed = time.time() + cooldown
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[守护模式] 已停止")
+        return 0
+
+
 # ---------------- 主流程 ----------------
 
 def main():
@@ -138,6 +269,14 @@ def main():
     ap.add_argument("--ping-host", default=None, help="延迟探测目标（默认 223.5.5.5）")
     ap.add_argument("--rounds", type=int, default=3, help="每个频段的测量轮数（默认 3，取中位数）")
     ap.add_argument("--scan-rounds", type=int, default=5, help="信道扫描轮数（默认 5，合并并滤除幽灵 AP）")
+    ap.add_argument("--watch", action="store_true",
+                    help="守护模式：持续监测，明显劣化时才自动重测并切换")
+    ap.add_argument("--watch-interval", type=int, default=300,
+                    help="守护模式探测间隔秒数（默认 300）")
+    ap.add_argument("--watch-cooldown", type=int, default=900,
+                    help="两次自动重测之间的最小间隔秒数（默认 900）")
+    ap.add_argument("--watch-dry-run", action="store_true",
+                    help="守护模式演练：只报告会触发什么，不改设备")
     args = ap.parse_args()
 
     if args.list_drivers:
@@ -156,10 +295,17 @@ def main():
         cfg["ping_host"] = args.ping_host
         save_config(cfg)
 
+    if args.watch:
+        return watch(args, cfg)
+
     try:
         dev = detect(args.host, args.user, args.password, name=args.driver)
     except LookupError as e:
         print(f"[×] {e}")
+        return 1
+    except DeviceBusy as e:
+        print("[×] 设备在线，但当前拒绝提供服务：")
+        print(f"    {e}")
         return 1
     except Exception as e:  # noqa: BLE001
         print(f"[×] 连不上设备：{type(e).__name__}: {e}")
