@@ -1,4 +1,4 @@
-# fm-autotune
+# mifi-autotune
 
 给 4G 随身WiFi / CPE 用的**自动调优工具**：扫一遍周围 2.4G 信道占用，逐个实测 LTE 频段，算出当前环境下最快的组合，然后一键应用。
 
@@ -88,8 +88,8 @@ score(信道) = Σ  邻居  (信号%/100)² × (重叠宽度 / 20MHz)
 无需 `pip install`，Python 3.8+ 即可：
 
 ```bash
-git clone https://github.com/Healton1314/fm-autotune.git
-cd fm-autotune
+git clone https://github.com/Healton1314/mifi-autotune.git
+cd mifi-autotune
 python autotune.py            # 只体检，不改设备
 ```
 
@@ -226,7 +226,7 @@ python server.py --lan       # 手机和电脑连同一个 Wi-Fi
 ## 目录结构
 
 ```
-fm-autotune/
+mifi-autotune/
 ├── autotune.py            引擎（命令行入口）
 ├── scanner.py             2.4G 扫描层（跨平台 + 多语言）
 ├── probe.py               带宽 / 延迟测量层
@@ -284,7 +284,7 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 
 ## English
 
-**fm-autotune** automatically finds the best LTE band and 2.4GHz WiFi channel for your 4G dongle / MiFi / CPE — it scans neighbouring APs, measures each band with multiple rounds, and applies the winner.
+**mifi-autotune** automatically finds the best LTE band and 2.4GHz WiFi channel for your 4G dongle / MiFi / CPE — it scans neighbouring APs, measures each band with multiple rounds, and applies the winner.
 
 - Zero dependencies (Python 3.8+ standard library only)
 - Read-only by default; `--apply` to write. Auto-rollback if the new band can't get online

@@ -288,14 +288,24 @@ def freq(ch):
     return 2412 + (ch - 1) * 5
 
 
-def score_channels(aps, channels=range(1, 14), width_mhz=20):
+def score_channels(aps, channels=None, width_mhz=20):
     """把邻居 AP 折算成对每条候选信道的干扰分。
 
     重叠宽度 = width - |频差|，只算正重叠；权重再乘 (信号/100)^2，
     因为强信号的影响远大于弱信号（平方比线性更贴近实际）。
+
+    channels 传 None 表示全部 1~13；传列表则**只评估这些信道**
+    （用于设备只支持部分信道的情况，例如某些地区 1~11）。
     """
+    if channels is None:
+        candidates = list(range(1, 14))
+    else:
+        candidates = sorted({int(c) for c in channels if 1 <= int(c) <= 14})
+        if not candidates:
+            candidates = list(range(1, 14))
+
     rows = []
-    for ch in range(min(channels), max(channels) + 1):
+    for ch in candidates:
         total, detail = 0.0, []
         for ap in aps:
             gap = abs(freq(ap["ch"]) - freq(ch))
