@@ -4,6 +4,7 @@
 # 用法（在 Termux 里）：
 #   bash install.sh                          # 从默认面板地址取安装包
 #   PANEL=http://192.168.1.23:8787 bash install.sh
+#   bash install.sh -f                       # 忽略本地旧包，强制重新下载（升级用）
 #
 # 这个脚本只做一次事：把代码放到手机上 + 建一个 mifi 命令。
 # 装完之后不再需要电脑。
@@ -46,8 +47,12 @@ fi
 # 为什么要支持本地 zip：手机上 curl 未必装好，而 python -m zipfile 一定有，
 # 所以「先下载再解包再装」这条路不需要 curl。
 say "[2/4] 准备安装包…"
+FRESH=0
 PKG="${1:-}"
-if [ -z "$PKG" ]; then
+case "$PKG" in
+  -f|--fresh) FRESH=1; PKG="" ;;
+esac
+if [ -z "$PKG" ] && [ "$FRESH" -eq 0 ]; then
   for cand in "./mifi-autotune-phone.zip" "$HOME/p.zip" "$HOME/mifi-autotune-phone.zip"; do
     [ -f "$cand" ] && PKG="$cand" && break
   done

@@ -63,14 +63,16 @@ class ZteRtaClient:
     def _login(self):
         """用设备自己的 login.cgi 主动建会话（不需要人工开浏览器）。
 
-        这套流程是抓设备前端真实请求得到的，不是猜的：
-          1) GET /login.cgi → 响应头带 WWW-Authenticate: Digest realm=.. nonce=.. qop=auth
-             **关键**：xml_action.cgi 处于 KICKOFF / UNAUTHORIZED 时，
-             这个接口照样发挑战，所以它是可用的自救通道；
-          2) HA1 = md5(user:realm:password)，HA2 = md5("GET:/cgi/protected.cgi")
-             （注意是 protected.cgi，不是 xml_action.cgi，写错会 401）
-          3) GET /login.cgi?Action=Digest&userName=..&realm=..&nonce=..&response=..&qop=..&cnonce=..&temp=asr
-        登录成功后同一个 nonce 可以继续用于 xml_action.cgi 的 Digest 认证。
+        这套流程是抓设备前端**完整请求**得到的，有两个坑：
+
+        坑 1：登录请求里有两份认证，缺一个就不算登录成功
+          · URL 参数里的 response —— HA2 = md5("GET:/cgi/protected.cgi")
+          · 请求头里的 Authorization: Digest —— HA2 = md5("GET:/cgi/xml_action.cgi")
+          只发 URL 那份时，设备照样回 200，但同时再甩你一个新的 WWW-Authenticate
+          （这其实是「没通过」），随后访问一律 UNAUTHORIZED / KICKOFF。
+          这个现象骗了很久：只看状态码会以为登录成功。
+
+        坑 2：判定成功的依据不是 200，而是「响应里不再带 WWW-Authenticate」。
         """
         code, _txt, hdrs = self._raw("/login.cgi")
         www = hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate")
@@ -83,21 +85,28 @@ class ZteRtaClient:
         if not info.get("nonce"):
             return False
         qop = (info.get("qop") or "auth").split(",")[0]
-        cnonce = _md5(str(time.time()))[:16]
-        ha1 = _md5(f"{self.user}:{info['realm']}:{self.password}")
-        ha2 = _md5("GET:/cgi/protected.cgi")
-        response = _md5(f"{ha1}:{info['nonce']}:00000001:{cnonce}:{qop}:{ha2}")
-        path = (f"/login.cgi?Action=Digest&userName={self.user}&realm={info['realm']}"
-                f"&nonce={info['nonce']}&response={response}&qop={qop}"
-                f"&cnonce={cnonce}&temp=asr")
-        code2, txt2, _ = self._raw(path)
-        if code2 != 200:
-            return False
-        self._nonce = info
-        self._nc = 1              # 登录这一次已经用掉 nc=00000001
 
-        # 设备有时对登录请求回 200 却没真的建立会话（实测：随后访问仍是 KICKOFF）。
-        # 所以这里做一次验证，别谎报「已自动登录」。
+        # ① URL 里的 response（protected.cgi）
+        cnonce_q = _md5(str(time.time()))[:16]
+        ha1 = _md5(f"{self.user}:{info['realm']}:{self.password}")
+        q_resp = _md5(f"{ha1}:{info['nonce']}:00000001:{cnonce_q}:{qop}:"
+                      f"{_md5('GET:/cgi/protected.cgi')}")
+        path = (f"/login.cgi?Action=Digest&userName={self.user}&realm={info['realm']}"
+                f"&nonce={info['nonce']}&response={q_resp}&qop={qop}"
+                f"&cnonce={cnonce_q}&temp=asr")
+
+        # ② 请求头里的 Digest（xml_action.cgi）—— 少了这一份登录不生效
+        self._nonce = info
+        self._nc = 0
+        auth_header = self._auth("GET")      # 内部把 _nc 加到 1
+
+        code2, _body, hdrs2 = self._raw(path, "GET", None, auth_header)
+        still_challenged = bool(hdrs2.get("WWW-Authenticate") or hdrs2.get("Www-Authenticate"))
+        if code2 != 200 or still_challenged:
+            self._nonce = None
+            return False
+
+        # 真的建立了吗？再实测一次（设备状态机偶尔会有延迟）
         try:
             c3, t3, _h3 = self._raw("/xml_action.cgi?method=get&module=duster&file=wan",
                                     "GET", None, self._auth("GET"))
