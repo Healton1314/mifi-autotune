@@ -80,9 +80,9 @@ class ZteRtaClient:
         if unauthorized:
             raise DeviceBusy(
                 "设备返回 login_status=UNAUTHORIZED，且没有发出 Digest 认证挑战。\n"
-                "    常见原因：① 后台被浏览器占用（同一时间只允许一个管理员会话）；\n"
-                "             ② 登录失败次数过多被临时锁定；③ 设备刚重启还没就绪。\n"
-                "    处理：关掉浏览器里的设备后台，或拔插一次设备电源，等 30 秒后重试。")
+                "    这类状态下设备仍然接受 Digest，只是不再主动下发 nonce。\n"
+                "    有效处理：用浏览器打开后台（http://设备IP），用管理员账号登录一次再退出，\n"
+                "             然后重试本命令。实测拔插电源对此无效。")
         return False
 
     def _auth(self, method):
