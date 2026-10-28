@@ -400,37 +400,50 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 
 ## 在手机上独立运行（不依赖电脑）
 
-这是个局域网工具，它要访问的设备地址是 `192.168.0.1`——只有连在这台随身WiFi 上的设备才够得着。所以有两种「不依赖电脑」的做法。
+这不是「手机访问电脑上的面板」——那样电脑一关就没了。这里说的是**代码装在手机里、手机自己跑**，之后和电脑没有任何关系。
 
-### 方案 A：让手机自己跑（Termux，推荐）
+设备地址是 `192.168.0.1`，只有连在这台随身WiFi 上的设备才够得着。手机本来就一直连着它，所以手机是最合适的运行环境。
 
-手机本来就一直连着「月亮糖」，它自己就是最合适的运行环境。
+### 一次性安装（约 5 分钟，之后永久独立）
 
 ```bash
-# 1. 装两个 App（F-Droid 搜 Termux；Termux:API 也在同一来源）
-#    Termux       —— 终端环境
-#    Termux:API   —— 让 Termux 调系统接口（扫 WiFi 要用）
+# 1. 装 Termux（F-Droid 或应用商店搜，选 F-Droid 版更省心）
 
-# 2. Termux 里执行
-pkg update && pkg install python git termux-api
-git clone https://github.com/Healton1314/mifi-autotune.git
-cd mifi-autotune
+# 2. 让手机拿到代码。两种来源任选：
+#    a) 电脑上的面板还没关：打开面板，点「下载手机安装包」，或在 Termux 里直接
+curl -o p.zip http://<电脑局域网IP>:8787/api/phone-package
+#    b) 能从 GitHub 下载的话
+#       curl -L -o p.zip https://github.com/Healton1314/mifi-autotune/archive/refs/heads/main.zip
 
-# 3. 体检（手机已连该 WiFi，默认就能找到 192.168.0.1）
-python autotune.py --preview
-python autotune.py --apply-plan
-
-# 4. 想要图形界面
-python server.py --port 8787
-# 手机浏览器打开 http://127.0.0.1:8787
+# 3. 在 Termux 里装
+pkg install -y python
+python -m zipfile -e p.zip ~/ && bash ~/mifi-autotune/phone/install.sh
 ```
 
-零第三方依赖，不需要 `pip install`。
+`install.sh` 会做三件事：装 Python、把代码放到 `~/mifi-autotune`、创建 `mifi` 命令。
 
-**两个必须知道的点**：
+### 之后每天怎么用
 
-- 安卓 10+ 把 WiFi 扫描算作位置信息，`termux-wifi-scaninfo` 需要给 Termux:API **授予定位权限**，否则返回空数组。拿不到扫描结果时工具会明确提示并跳过信道优化——**频段优化不受影响**，那部分走 HTTP 直连设备。
-- MIUI / HyperOS 会杀后台，记得给 Termux 关掉省电限制，并把 Termux 加到「自启动」白名单。
+```bash
+mifi
+```
+
+它会在手机上起一个**只监听本机**的面板，并自动用浏览器打开。界面和电脑上完全一样：体检 → 看结论 → 一键应用。建议把页面「添加到主屏幕」，就是一个 App。
+
+也可以不用界面，直接看文字结论：
+
+```bash
+cd ~/mifi-autotune
+python autotune.py --preview       # 体检，给对比和建议
+python autotune.py --apply-plan    # 应用上次体检的结论
+python autotune.py --watch         # 挂后台持续盯（Ctrl+C 停）
+```
+
+**三个手机上特有的点**：
+
+- **换频段时「上网」会断 30 秒左右，但手机和设备的 WiFi 不会断**（设备的 AP 不依赖移动网络），所以面板不会失联，测完会自动切回原频段。
+- 安卓普通应用拿不到 ICMP，`ping` 也用不了。工具会自动改用 **TCP 握手耗时**测延迟（`probe._tcp_latency`），不影响判断。
+- 想扫周边 WiFi 需要装 Termux:API 并给**定位权限**（安卓 10+ 把 WiFi 扫描算作位置信息）。拿不到就跳过信道优化，**频段优化不受影响**。MIUI/HyperOS 记得给 Termux 关掉省电限制。
 
 ### 方案 B：扔到一台常开的小机器上
 

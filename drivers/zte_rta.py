@@ -95,7 +95,18 @@ class ZteRtaClient:
             return False
         self._nonce = info
         self._nc = 1              # 登录这一次已经用掉 nc=00000001
-        return True
+
+        # 设备有时对登录请求回 200 却没真的建立会话（实测：随后访问仍是 KICKOFF）。
+        # 所以这里做一次验证，别谎报「已自动登录」。
+        try:
+            c3, t3, _h3 = self._raw("/xml_action.cgi?method=get&module=duster&file=wan",
+                                    "GET", None, self._auth("GET"))
+        except DeviceUnreachable:
+            return True           # 网络抖动，先当成功，让上层重试决定
+        if c3 == 200 and "login_status" not in t3 and len(t3) > 40:
+            return True
+        self._nonce = None
+        return False
 
     def _challenge(self):
         unauthorized = False

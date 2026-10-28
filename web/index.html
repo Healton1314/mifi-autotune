@@ -93,6 +93,22 @@
   <div class="note" id="planHint"></div>
 </div>
 
+<div class="sec" id="phoneSec">
+  <h2>让手机自己跑（一次性安装）</h2>
+  <div class="note" style="margin-top:0">
+    现在这个页面靠电脑上的服务在跑，电脑关了就没了。
+    想彻底摆脱电脑：把代码装到手机里，之后手机连着随身WiFi 就能自己体检、自己优化。
+  </div>
+  <button class="wide" id="btnPhonePkg" style="margin-top:10px">下载手机安装包（约 60KB）</button>
+  <div class="note" id="phoneSteps">
+    手机装 <b>Termux</b>（应用商店或 F-Droid），打开后依次粘贴这三行：<br>
+    <code>pkg install -y python</code><br>
+    <code>curl -o p.zip __PKG_URL__</code><br>
+    <code>python -m zipfile -e p.zip ~ &amp;&amp; bash ~/mifi-autotune/phone/install.sh</code><br>
+    装完后在 Termux 里输入 <code>mifi</code> 就能启动，<b>不再需要这台电脑</b>。
+  </div>
+</div>
+
 <div class="sec" id="watchSec">
   <h2>持续检测（可选）</h2>
   <div class="pl"><span class="lbl">状态</span><span class="val" id="watchState"><span class="dot"></span>未开启</span></div>
@@ -460,6 +476,15 @@ setInterval(() => { if (!busy) loadStatus(); }, 6000);
 setInterval(loadWatch, 5000);
 // 结论会过期（可能在命令行跑过体检/应用），定期重新拉一次，避免界面拿着旧数据误导
 setInterval(() => { if (!busy) loadPlan(); }, 15000);
+
+// 手机安装包：地址用当前访问的主机名，换成局域网地址手机才连得上
+(function initPhone() {
+  const url = `${location.protocol}//${location.host}/api/phone-package`;
+  const box = $("phoneSteps");
+  if (box) box.innerHTML = box.innerHTML.replace("__PKG_URL__", url);
+  const btn = $("btnPhonePkg");
+  if (btn) btn.onclick = () => { location.href = "/api/phone-package"; };
+})();
 </script>
 </body>
 </html>
