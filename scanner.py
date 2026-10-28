@@ -17,6 +17,7 @@
   "某个信道很干净"的错误结论。默认 5 轮，同一 AP 至少出现 2 轮才计入。
 """
 
+import json
 import os
 import re
 import shutil
@@ -130,6 +131,54 @@ def _scan_windows(ssid_hint=None):
     return aps
 
 
+# ---------------------------------------------------------------- Android（Termux）
+
+
+def freq_to_channel(freq):
+    """中心频率 → 信道号。Termux 给的是 MHz，netsh 直接给信道号。"""
+    if not freq:
+        return None
+    if freq == 2484:
+        return 14
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
+    if 5000 <= freq <= 5900:
+        return (freq - 5000) // 5
+    return None
+
+
+def _scan_termux():
+    """Android 上通过 Termux:API 拿扫描结果。
+
+    需要：装 Termux:API 应用 + `pkg install termux-api` + 授予定位权限
+    （Android 10+ 把 WiFi 扫描算作位置信息，没权限会返回空数组）。
+    """
+    if not shutil.which("termux-wifi-scaninfo"):
+        return []
+    out = sh(["termux-wifi-scaninfo"], timeout=45)
+    try:
+        data = json.loads(out)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(data, list):
+        return []
+    aps = []
+    for ap in data:
+        ssid = (ap.get("ssid") or "").strip()
+        freq = ap.get("frequency")
+        if not ssid or not freq:
+            continue
+        ch = freq_to_channel(int(freq))
+        if not ch:
+            continue
+        lvl = ap.get("level")
+        # Termux 给 dBm，和 Windows 的百分比统一到 0~100
+        sig = max(0, min(100, 2 * (int(lvl) + 100))) if lvl is not None else 0
+        aps.append({"ssid": ssid, "bssid": ap.get("bssid", ""),
+                    "ch": ch, "sig": sig, "band": None})
+    return aps
+
+
 # ---------------------------------------------------------------- Linux
 
 
@@ -220,7 +269,8 @@ def scan_once(ssid_hint=None):
         return _scan_windows(ssid_hint)
     if sys.platform == "darwin":
         return _scan_macos()
-    return _scan_linux()
+    # Android(Termux) 上 nmcli/iw 都不可用，先试 Termux:API
+    return _scan_termux() or _scan_linux()
 
 
 def scan_2g(rounds=5, delay=3, min_hits=2, own_ssid=None):
