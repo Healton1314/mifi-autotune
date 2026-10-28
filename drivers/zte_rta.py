@@ -63,10 +63,12 @@ class ZteRtaClient:
             www = hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate")
             if not www:
                 # 设备可达但拒答：正常固件会先回 401 + 挑战；某些状态下它会直接
-                # 回 200 + <login_status>UNAUTHORIZED</login_status>。
+                # 回 200 + <login_status>...</login_status>，一个挑战都不给。
+                # 已观测到两种值：UNAUTHORIZED（无有效会话）、KICKOFF（会话被顶掉）。
                 # 这时换驱动/换地址都没用，要把原因说清楚。
-                if "UNAUTHORIZED" in (txt or ""):
-                    unauthorized = True
+                m = re.search(r"<login_status>([A-Za-z_]+)</login_status>", txt or "")
+                if m:
+                    unauthorized = m.group(1)
                 continue
             info = {}
             for k in ("realm", "nonce", "qop"):
@@ -78,11 +80,16 @@ class ZteRtaClient:
             self._nc = 0
             return True
         if unauthorized:
+            hint = {
+                "KICKOFF": "管理员会话被其他登录顶掉了（KICKOFF）",
+                "UNAUTHORIZED": "当前没有有效的管理员会话（UNAUTHORIZED）",
+            }.get(unauthorized, f"设备要求重新登录（login_status={unauthorized}）")
             raise DeviceBusy(
-                "设备返回 login_status=UNAUTHORIZED，且没有发出 Digest 认证挑战。\n"
-                "    这类状态下设备仍然接受 Digest，只是不再主动下发 nonce。\n"
-                "    有效处理：用浏览器打开后台（http://设备IP），用管理员账号登录一次再退出，\n"
-                "             然后重试本命令。实测拔插电源对此无效。")
+                f"{hint}，且设备没有发出 Digest 认证挑战。\n"
+                "    这类状态下设备仍然接受 Digest，只是不再主动下发 nonce，\n"
+                "    所以程序自己登录不进去，需要你帮它一次：\n"
+                "    用浏览器打开后台（http://设备IP），用管理员账号登录一次，\n"
+                "    登录成功后回本命令重试即可（实测拔插电源无效）。")
         return False
 
     def _auth(self, method):
