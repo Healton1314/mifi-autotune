@@ -8,6 +8,11 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # Windows runner 的默认控制台编码不是 UTF-8，脚本里一旦 print 中文就会
+    # UnicodeEncodeError 直接失败（跟代码逻辑无关）。统一强制 UTF-8。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false
       matrix:
@@ -30,13 +35,12 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # 防止 setup 静默回落到别的版本，导致「3.8 通过」其实根本没测 3.8。
-      # 注意：不要给这一步指定 shell: bash —— Windows 上 setup-python 设的 PATH
-      # 对强制 bash 的步骤不一定生效，会变成「找不到 python」而误伤。
-      # 用环境变量传版本号，避免不同 shell 的引号规则把命令拼坏。
+      # 输出保持纯 ASCII：这一步要在三个系统的默认 shell 里跑，
+      # 任何非 ASCII 字符都可能踩到编码问题。
       - name: 版本自检
         env:
           WANT_PY: ${{ matrix.python }}
-        run: python -c "import os,sys; v=sys.version.split()[0]; w=os.environ['WANT_PY']; print('实际 Python', v, '期望', w); sys.exit(0 if v.startswith(w) else 1)"
+        run: python -c "import os,sys; v=sys.version.split()[0]; w=os.environ['WANT_PY']; print('actual python', v, 'expected', w, 'stdout', sys.stdout.encoding); sys.exit(0 if v.startswith(w) else 1)"
 
       - name: 语法检查
         run: python -m compileall -q autotune.py server.py scanner.py probe.py drivers
