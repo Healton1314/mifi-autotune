@@ -29,11 +29,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 防止 setup 静默回落到别的版本，导致「3.8 通过」其实根本没测 3.8
+      # 防止 setup 静默回落到别的版本，导致「3.8 通过」其实根本没测 3.8。
+      # 注意：不要给这一步指定 shell: bash —— Windows 上 setup-python 设的 PATH
+      # 对强制 bash 的步骤不一定生效，会变成「找不到 python」而误伤。
+      # 用环境变量传版本号，避免不同 shell 的引号规则把命令拼坏。
       - name: 版本自检
-        shell: bash
-        run: |
-          python -c "import sys; v=sys.version.split()[0]; want='${{ matrix.python }}'; print('实际 Python', v); assert v.startswith(want), 'expected %s got %s' % (want, v)"
+        env:
+          WANT_PY: ${{ matrix.python }}
+        run: python -c "import os,sys; v=sys.version.split()[0]; w=os.environ['WANT_PY']; print('实际 Python', v, '期望', w); sys.exit(0 if v.startswith(w) else 1)"
 
       - name: 语法检查
         run: python -m compileall -q autotune.py server.py scanner.py probe.py drivers
