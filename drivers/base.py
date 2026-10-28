@@ -14,6 +14,15 @@ class Unsupported(Exception):
     """设备不支持该操作（例如某机型无法锁定频段）。"""
 
 
+class DeviceBusy(ConnectionError):
+    """设备可达、但当前拒绝服务。
+
+    典型场景：管理员会话被别的客户端（浏览器后台）占用、登录失败次数过多被
+    临时锁定、或设备刚重启还没准备好。这类问题**换驱动没用**，应该告诉用户
+    去重启设备，而不是报「没有驱动认得这台设备」。
+    """
+
+
 class DeviceDriver(ABC):
     #: 驱动标识，命令行用 --driver 指定
     name = "base"

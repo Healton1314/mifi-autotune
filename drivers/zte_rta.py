@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .base import DeviceDriver, Unsupported
+from .base import DeviceBusy, DeviceDriver, Unsupported
 
 
 def _md5(s):
@@ -54,10 +54,16 @@ class ZteRtaClient:
             return e.code, e.read().decode("utf-8", "ignore"), dict(e.headers)
 
     def _challenge(self):
+        unauthorized = False
         for f in ("wan", "status1", "uapxb_wlan_basic_settings"):
-            code, _, hdrs = self._raw(f"/xml_action.cgi?method=get&module=duster&file={f}")
+            code, txt, hdrs = self._raw(f"/xml_action.cgi?method=get&module=duster&file={f}")
             www = hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate")
             if not www:
+                # 设备可达但拒答：正常固件会先回 401 + 挑战；某些状态下它会直接
+                # 回 200 + <login_status>UNAUTHORIZED</login_status>。
+                # 这时换驱动/换地址都没用，要把原因说清楚。
+                if "UNAUTHORIZED" in (txt or ""):
+                    unauthorized = True
                 continue
             info = {}
             for k in ("realm", "nonce", "qop"):
@@ -68,6 +74,12 @@ class ZteRtaClient:
             self._nonce = info
             self._nc = 0
             return True
+        if unauthorized:
+            raise DeviceBusy(
+                "设备返回 login_status=UNAUTHORIZED，且没有发出 Digest 认证挑战。\n"
+                "    常见原因：① 后台被浏览器占用（同一时间只允许一个管理员会话）；\n"
+                "             ② 登录失败次数过多被临时锁定；③ 设备刚重启还没就绪。\n"
+                "    处理：关掉浏览器里的设备后台，或拔插一次设备电源，等 30 秒后重试。")
         return False
 
     def _auth(self, method):
@@ -123,6 +135,8 @@ class ZteRtaDriver(DeviceDriver):
             c = ZteRtaClient(host, user, password, timeout)
             txt = c.get("wan", retries=0)
             return "<wan>" in txt
+        except DeviceBusy:
+            raise                      # 设备在但拒答，交给上层说清楚，别当成"不是这个驱动"
         except Exception:  # noqa: BLE001
             return False
 

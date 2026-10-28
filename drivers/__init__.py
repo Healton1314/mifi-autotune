@@ -3,7 +3,7 @@
 新增机型时，只需要在 DRIVERS 里加一行，autotune / server 都不用改。
 """
 
-from .base import DeviceDriver, Unsupported
+from .base import DeviceBusy, DeviceDriver, Unsupported
 from .zte_rta import ZteRtaDriver
 
 # 探测顺序：越通用的放越后面也没关系，identify 要准
@@ -36,6 +36,8 @@ def detect(host="192.168.0.1", user="admin", password="admin", name=None, timeou
         try:
             if cls.identify(host, user, password, timeout=timeout):
                 return cls(host, user, password, timeout=timeout)
+        except DeviceBusy:
+            raise                       # 设备可达但拒答，原因比"没驱动"重要得多
         except Exception:  # noqa: BLE001
             continue
     raise LookupError(
