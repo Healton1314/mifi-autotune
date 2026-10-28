@@ -90,24 +90,85 @@ def append_log(entry):
 
 # ---------------- LTE 频段 ----------------
 
-def set_and_settle(dev, band):
-    """锁定频段并等待重新注册。"""
-    dev.set_band(band)
-    time.sleep(SETTLE_SEC)
-    return probe.ping_stats(6)
+def _signal_usable(st):
+    """设备是否报了可用的服务小区。
+
+    RSRP 常见的"没服务"取值：空、0、-0、0dBm、--。不同固件写法不一样，
+    所以只做保守判断：拿得到一个像样的负数 dBm 才算有信号。
+    """
+    sig = st.get("signal") or {}
+    raw = str(sig.get("rsrp") or "").strip()
+    m = re.search(r"-?\d+", raw)
+    if not m:
+        return False
+    return int(m.group()) < 0          # RSRP 一定是负值，0/正数都代表无效
+
+
+def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
+    """等设备在目标频段重新注册，并尽快识别"这个频段根本没信号"。
+
+    为什么不能只 sleep 固定秒数：
+      - 有信号的频段可能 12 秒就注册上了，傻等 26 秒纯属浪费；
+      - 没信号的频段（运营商在当地没部署）等再久也没用，越早跳过早省事。
+    所以改成轮询设备状态，两个退出条件：
+      1) 报出可用的 RSRP 且当前频段=目标 → 成功
+      2) 连续 dead_confirm 次仍无可用信号 → 判定无服务，立即返回
+    返回 (status, 秒数)，status ∈ {"ok", "no_signal", "timeout"}。
+    """
+    timeout = SETTLE_SEC + 10 if timeout is None else timeout
+    t0 = time.time()
+    miss = 0
+    seen_band = False
+    while time.time() - t0 < timeout:
+        time.sleep(step)
+        try:
+            st = dev.get_state()
+        except Exception:  # noqa: BLE001
+            continue
+        now_band = st.get("band")
+        if band and str(now_band) == str(band):
+            seen_band = True
+        if _signal_usable(st):
+            if not band or str(now_band) == str(band):
+                return "ok", round(time.time() - t0, 1)
+            miss += 1
+        else:
+            miss += 1
+        if miss >= dead_confirm and not _signal_usable(st):
+            # 已经过了几轮仍没有任何服务小区 → 当地大概率没这个频段，别等了
+            return "no_signal", round(time.time() - t0, 1)
+        if not seen_band and time.time() - t0 > timeout - step:
+            break
+    # 最后再看一眼：可能刚注册上
+    try:
+        st = dev.get_state()
+        if _signal_usable(st) and (not band or str(st.get("band")) == str(band)):
+            return "ok", round(time.time() - t0, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return "timeout", round(time.time() - t0, 1)
 
 
 def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """单频段多轮实测，取中位数，同时保留离散度用于判断可信程度。
 
-    单轮容易撞上瞬时限速或基站调度抖动，所以至少 3 轮；
-    中位数抗异常值，min/max 用来看波动大不大。
+    无服务的频段会在 wait_for_service 阶段就被判定并跳过，
+    不再白等固定的 26 秒，也不会去跑根本跑不动的测速。
     """
-    st = set_and_settle(dev, band)
+    dev.set_band(band)
+    status, waited = wait_for_service(dev, band)
+    if status != "ok":
+        return {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
+                "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
+                "jitter": None, "loss": 100, "rounds": 0,
+                "reason": status, "waited": waited}
+
+    st = probe.ping_stats(6, ping_host)
     if st["avg"] is None or st["loss"] == 100:
         return {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
                 "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-                "jitter": None, "loss": 100, "rounds": 0}
+                "jitter": None, "loss": 100, "rounds": 0,
+                "reason": "no_data", "waited": waited}
 
     samples = []
     for i in range(rounds):
@@ -167,7 +228,7 @@ def resolve_bands(caps, args, cfg):
 
 def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     cur_band, cur_ch = st0["band"], st0["channel"]
-    rounds = max(1, min(args.rounds, 2))
+    rounds = args.rounds or 1          # 体检默认 1 轮粗筛，精度靠后面的「决赛」补
     plan = {"ts": datetime.now().isoformat(),
             "device": getattr(dev, "description", dev.name),
             "current": {"band": cur_band, "channel": cur_ch}}
@@ -200,8 +261,9 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         else:
             per = SETTLE_SEC + rounds * 20 + 6
             print(f"\n[2/2] 设备声明支持 {len(bands)} 个频段：{bands}")
-            print(f"      逐个实测（每段 {rounds} 轮，约 {per} 秒/个，"
-                  f"合计约 {per * len(bands) // 60} 分钟；期间会短暂断网，结束后自动切回原频段）…")
+            print(f"      逐个实测（每段 {rounds} 轮，快的约 {per} 秒；"
+                  f"没信号的频段会提前跳过，最多约 {per * len(bands) // 60} 分钟）")
+            print("      期间会短暂断网，全部测完自动切回原频段…")
         for b in bands or []:
             r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
             lte.append(r)
@@ -209,7 +271,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
                       f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
             else:
-                print(f"      {_band_label(b):<8} 无服务（该频段在当地没有覆盖）")
+                why = {"no_signal": "无信号（当地没这个频段）",
+                       "timeout": "注册超时",
+                       "no_data": "有信号但数据不通"}.get(r.get("reason"), "不可用")
+                print(f"      {_band_label(b):<8} {why}  已跳过（{r.get('waited', '?')}s）")
 
         usable = [r for r in lte if r["ok"]]
         # 决赛：全部粗测完后，对「最优」和「当前」各补一轮。
@@ -548,7 +613,8 @@ def main():
                     help="自己设备的 WiFi 名称，扫描时排除（默认自动识别，识别不到则不过滤）")
     ap.add_argument("--speed-url", default=None, help="测速下载地址（默认 Cloudflare，国内可换国内镜像）")
     ap.add_argument("--ping-host", default=None, help="延迟探测目标（默认 223.5.5.5）")
-    ap.add_argument("--rounds", type=int, default=3, help="每个频段的测量轮数（默认 3，取中位数）")
+    ap.add_argument("--rounds", type=int, default=None,
+                    help="每个频段的测量轮数（体检默认 1，应用默认 3，均取中位数）")
     ap.add_argument("--scan-rounds", type=int, default=5, help="信道扫描轮数（默认 5，合并并滤除幽灵 AP）")
     ap.add_argument("--preview", action="store_true",
                     help="体检并给出「预期提升」，结束时恢复原配置（推荐的第一步）")
@@ -694,15 +760,18 @@ def main():
             report["lte"] = {"supported": False}
         else:
             bands = resolve_bands(caps, args, cfg)
-            per = SETTLE_SEC + args.rounds * 18 + 5
-            print(f"\n[2/2] 实测 LTE 频段 {bands}（每频段 {args.rounds} 轮取中位数，"
-                  f"约 {per} 秒/个，期间会短暂断网）…")
+            rounds_n = args.rounds or 3
+            per = SETTLE_SEC + rounds_n * 18 + 5
+            print(f"\n[2/2] 实测 LTE 频段 {bands}（每频段 {rounds_n} 轮取中位数，"
+                  f"约 {per} 秒/个；没信号的会提前跳过，期间会短暂断网）…")
             results = []
             for b in bands:
-                r = measure_band(dev, b, rounds=args.rounds,
+                r = measure_band(dev, b, rounds=rounds_n,
                                  speed_url=speed_url, ping_host=ping_host)
                 results.append(r)
-                state = "可用" if r["ok"] else "无服务"
+                state = "可用" if r["ok"] else {
+                    "no_signal": "无信号", "timeout": "注册超时",
+                    "no_data": "数据不通"}.get(r.get("reason"), "无服务")
                 spread = (f"[{r['mbps_min']}~{r['mbps_max']}]"
                           if r["ok"] and r.get("rounds") else "")
                 print(f"      BAND {b:<2} {state:<5} {r['mbps']:>5} Mbps {spread:<12} "

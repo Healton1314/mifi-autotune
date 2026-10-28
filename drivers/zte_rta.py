@@ -55,7 +55,10 @@ class ZteRtaClient:
 
     def _challenge(self):
         unauthorized = False
-        for f in ("wan", "status1", "uapxb_wlan_basic_settings"):
+        # 顺序有意义：file=login 是最稳定的挑战来源（前端登录页也走它）。
+        # 某些状态下设备会对 wan/status1 直接回 200 + login_status=UNAUTHORIZED，
+        # 却仍然对 login 正常发挑战，所以把它排在前面。
+        for f in ("login", "wan", "status1", "uapxb_wlan_basic_settings"):
             code, txt, hdrs = self._raw(f"/xml_action.cgi?method=get&module=duster&file={f}")
             www = hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate")
             if not www:
@@ -194,7 +197,7 @@ class ZteRtaDriver(DeviceDriver):
             f"<prefer_lte_type_action>1</prefer_lte_type_action>"
             f"<Prefer_Band>{int(band)}</Prefer_Band><Prefer_Band_Action>1</Prefer_Band_Action>"
         )
-        code, txt = self.c.post(
+        code, txt, _hdrs = self.c.post(
             "wan",
             f"<wan><cellular>{cellular}</cellular>"
             f"<mtu>{wan.get('mtu', '1500')}</mtu><mtu_action>0</mtu_action></wan>")
@@ -210,7 +213,7 @@ class ZteRtaDriver(DeviceDriver):
             if w.get(k) not in (None, ""):
                 keep.append(f"<{k}>{w[k]}</{k}>")
         keep.append(f"<channel>{int(channel)}</channel>")
-        code, _ = self.c.post("uapxb_wlan_basic_settings",
+        code, _txt, _hdrs = self.c.post("uapxb_wlan_basic_settings",
                               "<wlan_settings>" + "".join(keep) + "</wlan_settings>")
         if code != 200:
             raise Unsupported(f"设置信道失败（HTTP {code}）")
