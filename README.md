@@ -74,6 +74,7 @@ score(信道) = Σ  邻居  (信号%/100)² × (重叠宽度 / 20MHz)
 | 系统 | 信道扫描 | 状态 |
 |---|---|---|
 | Windows 10/11 | `netsh wlan show networks mode=bssid` | ✅ 已验证。字段名多语言适配（中/英/日/韩/德/法/西/意/葡/俄/繁） |
+| **Android（Termux）** | `termux-wifi-scaninfo` | ⚠️ 已实现，需 Termux:API + 定位权限。**可在手机上完全独立运行** |
 | Linux | `nmcli` → 失败回落 `iw` | ⚠️ 已实现，未实机验证。`iw` 需 root 才能主动扫描 |
 | macOS | `airport -s` | ⚠️ macOS 14+ 已移除 `airport`，届时需自行替换扫描实现 |
 
@@ -355,6 +356,54 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 - 脚本调用：请求头加 `X-Panel-Token: <令牌>`
 
 > 即便如此，**别把 8787 端口映射到公网**。这是局域网工具，不是给外网用的。
+
+> ⚠️ 这种方式**依赖电脑一直开着**。想摆脱电脑，看下一节。
+
+## 在手机上独立运行（不依赖电脑）
+
+这是个局域网工具，它要访问的设备地址是 `192.168.0.1`——只有连在这台随身WiFi 上的设备才够得着。所以有两种「不依赖电脑」的做法。
+
+### 方案 A：让手机自己跑（Termux，推荐）
+
+手机本来就一直连着「月亮糖」，它自己就是最合适的运行环境。
+
+```bash
+# 1. 装两个 App（F-Droid 搜 Termux；Termux:API 也在同一来源）
+#    Termux       —— 终端环境
+#    Termux:API   —— 让 Termux 调系统接口（扫 WiFi 要用）
+
+# 2. Termux 里执行
+pkg update && pkg install python git termux-api
+git clone https://github.com/Healton1314/mifi-autotune.git
+cd mifi-autotune
+
+# 3. 体检（手机已连该 WiFi，默认就能找到 192.168.0.1）
+python autotune.py --preview
+python autotune.py --apply-plan
+
+# 4. 想要图形界面
+python server.py --port 8787
+# 手机浏览器打开 http://127.0.0.1:8787
+```
+
+零第三方依赖，不需要 `pip install`。
+
+**两个必须知道的点**：
+
+- 安卓 10+ 把 WiFi 扫描算作位置信息，`termux-wifi-scaninfo` 需要给 Termux:API **授予定位权限**，否则返回空数组。拿不到扫描结果时工具会明确提示并跳过信道优化——**频段优化不受影响**，那部分走 HTTP 直连设备。
+- MIUI / HyperOS 会杀后台，记得给 Termux 关掉省电限制，并把 Termux 加到「自启动」白名单。
+
+### 方案 B：扔到一台常开的小机器上
+
+树莓派、软路由、NAS 都行，只要它连在这台随身WiFi 的网里：
+
+```bash
+python server.py --lan
+```
+
+手机从任何地方访问它即可——这是真正「永远在线」的做法，也最省心。
+
+> 想从**外网**访问，别直接把 8787 映射出去（明文 HTTP）。用 Tailscale / ZeroTier 这类组网工具。
 
 ## 目录结构
 
