@@ -9,6 +9,7 @@ env/
 state.json
 config.json
 .panel-token
+plan.json
 autotune-log.jsonl
 *.log
 
