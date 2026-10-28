@@ -1,0 +1,12 @@
+{
+  "name": "随身WiFi 调优",
+  "short_name": "WiFi调优",
+  "description": "自动检测周边信道占用与 LTE 频段表现，一键选择最优配置",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#F7F7F5",
+  "theme_color": "#F7F7F5",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

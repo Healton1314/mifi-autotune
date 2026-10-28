@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#F7F7F5">
+<title>随身WiFi 调优</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg">
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;padding:16px 14px calc(24px + env(safe-area-inset-bottom));
+       background:#F7F7F5;color:#1F1F1D;
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  h1{font-size:17px;font-weight:600;margin:0 0 2px}
+  .sub{font-size:12px;color:#8A8A85;margin-bottom:14px}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#C9C9C4;margin-right:5px;vertical-align:middle}
+  .dot.on{background:#1D9E75}.dot.err{background:#D64545}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .card{background:#fff;border:1px solid #EAEAE4;border-radius:14px;padding:12px 13px}
+  .k{font-size:11px;color:#8A8A85;letter-spacing:.02em}
+  .v{font-size:20px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+  .v small{font-size:12px;font-weight:400;color:#8A8A85;margin-left:2px}
+  .acts{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:12px 0}
+  button{appearance:none;border:1px solid #DEDED8;background:#fff;color:#1F1F1D;
+         border-radius:12px;padding:13px 8px;font-size:14px;font-weight:500;font-family:inherit}
+  button:active{background:#F0F0EB}
+  button.primary{background:#185FA5;border-color:#185FA5;color:#fff}
+  button.primary:active{background:#124A82}
+  button.warn{color:#A32D2D;border-color:#F0C9C9}
+  button:disabled{opacity:.45}
+  .wide{grid-column:span 2}
+  .sec{background:#fff;border:1px solid #EAEAE4;border-radius:14px;padding:13px;margin-bottom:12px}
+  .sec h2{font-size:13px;font-weight:600;margin:0 0 10px;color:#3A3A37}
+  .bars{display:flex;align-items:flex-end;gap:3px;height:88px}
+  .b{flex:1;background:#C9C9C4;border-radius:3px 3px 0 0;position:relative;min-height:2px}
+  .b.cur{background:#185FA5}.b.best{background:#1D9E75}
+  .xaxis{display:flex;gap:3px;margin-top:4px}
+  .xaxis span{flex:1;text-align:center;font-size:9px;color:#A5A59F}
+  .legend{font-size:11px;color:#8A8A85;margin-top:8px}
+  .legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin:0 3px 0 8px}
+  .log{background:#1F1F1D;color:#D8D8D2;border-radius:12px;padding:11px 12px;
+       font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;
+       white-space:pre-wrap;max-height:230px;overflow:auto;display:none}
+  .log.show{display:block}
+  .ap{display:flex;justify-content:space-between;font-size:12px;padding:5px 0;border-bottom:1px solid #F2F2ED}
+  .ap:last-child{border:0}
+  .ap b{font-weight:500}
+  .ap span{color:#8A8A85;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<h1>随身WiFi 调优</h1>
+<div class="sub" id="conn"><span class="dot"></span>连接中…</div>
+
+<div class="grid">
+  <div class="card"><div class="k">LTE 频段</div><div class="v" id="band">—</div></div>
+  <div class="card"><div class="k">WiFi 信道</div><div class="v" id="chan">—</div></div>
+  <div class="card"><div class="k">信号 RSRP</div><div class="v" id="rsrp">—</div></div>
+  <div class="card"><div class="k">信噪比 SINR</div><div class="v" id="sinr">—</div></div>
+</div>
+
+<div class="acts">
+  <button id="btnScan">扫描信道</button>
+  <button id="btnCheck">体检（不改）</button>
+  <button id="btnWifi">优化 Wi-Fi</button>
+  <button id="btnLte">优化 LTE</button>
+  <button class="primary wide" id="btnAll">全部优化（约 2 分钟，会断网）</button>
+  <button class="warn wide" id="btnRestore">恢复默认（不锁频段 + 自动信道）</button>
+</div>
+
+<div class="sec" id="chanSec" style="display:none">
+  <h2>2.4G 信道干扰评分（越低越好）</h2>
+  <div class="bars" id="bars"></div>
+  <div class="xaxis" id="xaxis"></div>
+  <div class="legend" id="legend"></div>
+</div>
+
+<div class="sec" id="apSec" style="display:none">
+  <h2>周边 2.4G 接入点</h2>
+  <div id="aps"></div>
+</div>
+
+<div class="log" id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let polling = null, busy = false;
+
+function setConn(ok, text) {
+  $("conn").innerHTML = `<span class="dot ${ok ? "on" : "err"}"></span>${text}`;
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    const d = await r.json();
+    $("band").innerHTML = d.band ? `BAND ${d.band}` : "未锁定<small>自动</small>";
+    $("chan").innerHTML = d.channel ? `${d.channel}<small>ch</small>` : "自动";
+    const rsrp = d.lte.rsrp ? parseInt(d.lte.rsrp) : null;
+    $("rsrp").innerHTML = rsrp ? `${rsrp}<small>dBm</small>` : "—";
+    const sinr = d.lte.sinr ? parseFloat(d.lte.sinr) : null;
+    $("sinr").innerHTML = sinr ? `${sinr}<small>dB</small>` : "—";
+    setConn(true, `已连接 · 延迟 ${d.ping.avg ?? "—"}ms · 丢包 ${d.ping.loss ?? "—"}%`);
+  } catch (e) {
+    setConn(false, `设备不可达：${e.message}`);
+  }
+}
+
+async function scan() {
+  $("btnScan").disabled = true;
+  $("btnScan").textContent = "扫描中…";
+  try {
+    const r = await fetch("/api/scan", { cache: "no-store" });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    renderScan(d);
+  } catch (e) {
+    alert("扫描失败：" + e.message);
+  } finally {
+    $("btnScan").disabled = false;
+    $("btnScan").textContent = "扫描信道";
+  }
+}
+
+function renderScan(d) {
+  const max = Math.max(...d.scores.map((s) => s.score), 0.1);
+  $("bars").innerHTML = d.scores.map((s) => {
+    const h = Math.max(2, Math.round((s.score / max) * 84));
+    const cls = s.ch === d.current ? "cur" : (s.ch === d.best ? "best" : "");
+    return `<div class="b ${cls}" style="height:${h}px" title="${s.ch}"></div>`;
+  }).join("");
+  $("xaxis").innerHTML = d.scores.map((s) => `<span>${s.ch}</span>`).join("");
+  $("legend").innerHTML =
+    `<i style="background:#185FA5"></i>当前 ${d.current}` +
+    `<i style="background:#1D9E75"></i>最优 ${d.best}` +
+    `<i style="background:#C9C9C4"></i>其余`;
+  $("chanSec").style.display = "block";
+
+  if (d.aps.length) {
+    $("apSec").style.display = "block";
+    $("aps").innerHTML = d.aps
+      .slice()
+      .sort((a, b) => b.sig - a.sig)
+      .map((a) => `<div class="ap"><b>${a.ssid}</b><span>ch${a.ch} · ${a.sig}%</span></div>`)
+      .join("");
+  } else {
+    $("apSec").style.display = "none";
+  }
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return r.json();
+}
+
+async function startJob(url, body) {
+  if (busy) return;
+  busy = true;
+  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  $("log").classList.add("show");
+  $("log").textContent = "启动中…\n";
+  try {
+    const d = await post(url, body);
+    if (!d.ok) {
+      $("log").textContent += "失败：" + (d.msg || d.error) + "\n";
+      stopPolling();
+      return;
+    }
+    pollJob();
+    polling = setInterval(pollJob, 1500);
+  } catch (e) {
+    $("log").textContent += "请求失败：" + e.message + "\n";
+    stopPolling();
+  }
+}
+
+function stopPolling() {
+  if (polling) clearInterval(polling);
+  polling = null;
+  busy = false;
+  document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+}
+
+async function pollJob() {
+  try {
+    const r = await fetch("/api/job", { cache: "no-store" });
+    const d = await r.json();
+    const el = $("log");
+    el.textContent = d.lines.join("\n");
+    el.scrollTop = el.scrollHeight;
+    if (!d.running && d.exit !== null) {
+      stopPolling();
+      loadStatus();
+      setTimeout(() => scan(), 800);
+    }
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+$("btnScan").onclick = scan;
+$("btnCheck").onclick = () => startJob("/api/optimize", { mode: "check" });
+$("btnWifi").onclick = () => startJob("/api/optimize", { mode: "wifi" });
+$("btnLte").onclick = () => startJob("/api/optimize", { mode: "lte" });
+$("btnAll").onclick = () => {
+  if (confirm("全部优化会逐个切换 LTE 频段实测，期间断网约 2 分钟。继续？")) {
+    startJob("/api/optimize", { mode: "all" });
+  }
+};
+$("btnRestore").onclick = () => {
+  if (confirm("将把频段改回「不锁定」、信道改回「自动」。适合带出门前使用。继续？")) {
+    startJob("/api/restore");
+  }
+};
+
+loadStatus();
+setInterval(() => { if (!busy) loadStatus(); }, 6000);
+</script>
+</body>
+</html>
