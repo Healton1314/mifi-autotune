@@ -101,10 +101,11 @@
   </div>
   <button class="wide" id="btnPhonePkg" style="margin-top:10px">下载手机安装包（约 60KB）</button>
   <div class="note" id="phoneSteps">
-    手机装 <b>Termux</b>（应用商店或 F-Droid），打开后依次粘贴这三行：<br>
+    手机装 <b>Termux</b>（F-Droid 版更稳），打开后依次粘贴这几行：<br>
     <code>pkg install -y python</code><br>
-    <code>curl -o p.zip __PKG_URL__</code><br>
-    <code>python -m zipfile -e p.zip ~ &amp;&amp; bash ~/mifi-autotune/phone/install.sh</code><br>
+    <code>python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('__PKG_URL__').read())"</code><br>
+    <code>python -m zipfile -e p.zip ~</code><br>
+    <code>bash ~/mifi-autotune/phone/install.sh</code><br>
     装完后在 Termux 里输入 <code>mifi</code> 就能启动，<b>不再需要这台电脑</b>。
   </div>
 </div>
