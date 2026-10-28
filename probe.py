@@ -21,6 +21,19 @@ IS_MAC = sys.platform == "darwin"
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
 DEFAULT_PING_HOST = "223.5.5.5"
 
+# 测速源候选表。为什么要给这么多：
+#   实测遇到过整条链路上「HTTPS 到多数 CDN 失败、HTTP 正常」的情况
+#   （curl 直接 exit 28/000，而 http:// 同一文件能跑 2.9MB/s），
+#   如果只写一个 https 源，工具会把「源连不上」记成「这个频段 0 Mbps」，
+#   进而给出完全错误的切换建议。
+SPEED_CANDIDATES = [
+    "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe",
+    "http://dldir1.qq.com/weixin/Windows/WeChatSetup.exe",
+    "http://mirrors.tuna.tsinghua.edu.cn/speedtest/100mb.bin",
+    "https://mirrors.tuna.tsinghua.edu.cn/speedtest/100mb.bin",
+    "https://speed.cloudflare.com/__down?bytes=25000000",
+]
+
 
 def _env():
     return {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
@@ -138,3 +151,49 @@ def throughput(conn=4, secs=8, url=DEFAULT_SPEED_URL):
     for t in threads:
         t.join()
     return round(sum(results) * 8 / secs / 1e6, 1)
+
+
+def throughput_any(urls, conn=4, secs=8):
+    """依次试多个测速源，返回第一个测出 > 0 的结果：(mbps, 实际用的 url)。
+
+    为什么需要：单个源会在某些链路上挂掉（实测 HTTPS 到 CDN 全失败、HTTP 正常），
+    或者某个频段下这个源的 CDN 节点就是不通。一个源返回 0 不代表「这个频段 0 兆」。
+    """
+    for u in urls:
+        if not u:
+            continue
+        v = throughput(conn, secs, u)
+        if v > 0:
+            return v, u
+    return 0.0, urls[0] if urls else None
+
+
+def probe_url(url, secs=3, min_bytes=100_000):
+    """快速验证一个源能不能真的下到东西（3 秒内至少 min_bytes）。"""
+    got = _one_curl(url, secs) if _curl() else _one_urllib(url, secs)
+    return got >= min_bytes, got
+
+
+def resolve_speed_url(preferred=None, verbose=True):
+    """挑一个当前环境下真能下东西的测速源。
+
+    顺序：用户指定的 → 常见国内源（含 http 版本）→ Cloudflare。
+    先花最多十几秒找到可用源，比后面 6 个频段各失败一次（还可能得出错误结论）划算得多。
+    """
+    tried = []
+    seen = set()
+    for url in [preferred] + SPEED_CANDIDATES:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        ok, got = probe_url(url, secs=3)
+        tried.append((url, got, ok))
+        if ok:
+            if verbose and url != preferred:
+                print(f"      [测速源] 自动选用 {url}")
+            return url
+    if verbose:
+        print("      [!] 所有测速源都下不动（常见原因：链路上 HTTPS 被拦、或当下流量几乎断）")
+        for url, got, _ok in tried:
+            print(f"          {url} → {got} 字节")
+    return preferred or DEFAULT_SPEED_URL

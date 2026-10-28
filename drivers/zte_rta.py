@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .base import DeviceBusy, DeviceDriver, Unsupported
+from .base import DeviceBusy, DeviceDriver, DeviceUnreachable, Unsupported
 
 
 def _md5(s):
@@ -52,6 +52,50 @@ class ZteRtaClient:
                 return r.status, r.read().decode("utf-8", "ignore"), dict(r.headers)
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "ignore"), dict(e.headers)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            # 切频段时设备射频会重启，web 服务有 5~20 秒不响应，这是正常现象。
+            # 这里必须转成可识别的异常，否则会以裸 traceback 冒到最外层，
+            # 把整个体检中止在半路（设备就留在别人频段上了，实测踩过）。
+            raise DeviceUnreachable(
+                f"设备 {self.host} 暂时没有响应（{type(e).__name__}: {e}）。\n"
+                "    切频段时设备射频会重启，web 后台通常 5~20 秒后恢复。") from e
+
+    def _login(self):
+        """用设备自己的 login.cgi 主动建会话（不需要人工开浏览器）。
+
+        这套流程是抓设备前端真实请求得到的，不是猜的：
+          1) GET /login.cgi → 响应头带 WWW-Authenticate: Digest realm=.. nonce=.. qop=auth
+             **关键**：xml_action.cgi 处于 KICKOFF / UNAUTHORIZED 时，
+             这个接口照样发挑战，所以它是可用的自救通道；
+          2) HA1 = md5(user:realm:password)，HA2 = md5("GET:/cgi/protected.cgi")
+             （注意是 protected.cgi，不是 xml_action.cgi，写错会 401）
+          3) GET /login.cgi?Action=Digest&userName=..&realm=..&nonce=..&response=..&qop=..&cnonce=..&temp=asr
+        登录成功后同一个 nonce 可以继续用于 xml_action.cgi 的 Digest 认证。
+        """
+        code, _txt, hdrs = self._raw("/login.cgi")
+        www = hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate")
+        if not www:
+            return False
+        info = {}
+        for k in ("realm", "nonce", "qop"):
+            m = re.search(k + r'="([^"]*)"', www)
+            info[k] = m.group(1) if m else None
+        if not info.get("nonce"):
+            return False
+        qop = (info.get("qop") or "auth").split(",")[0]
+        cnonce = _md5(str(time.time()))[:16]
+        ha1 = _md5(f"{self.user}:{info['realm']}:{self.password}")
+        ha2 = _md5("GET:/cgi/protected.cgi")
+        response = _md5(f"{ha1}:{info['nonce']}:00000001:{cnonce}:{qop}:{ha2}")
+        path = (f"/login.cgi?Action=Digest&userName={self.user}&realm={info['realm']}"
+                f"&nonce={info['nonce']}&response={response}&qop={qop}"
+                f"&cnonce={cnonce}&temp=asr")
+        code2, txt2, _ = self._raw(path)
+        if code2 != 200:
+            return False
+        self._nonce = info
+        self._nc = 1              # 登录这一次已经用掉 nc=00000001
+        return True
 
     def _challenge(self):
         unauthorized = False
@@ -65,7 +109,6 @@ class ZteRtaClient:
                 # 设备可达但拒答：正常固件会先回 401 + 挑战；某些状态下它会直接
                 # 回 200 + <login_status>...</login_status>，一个挑战都不给。
                 # 已观测到两种值：UNAUTHORIZED（无有效会话）、KICKOFF（会话被顶掉）。
-                # 这时换驱动/换地址都没用，要把原因说清楚。
                 m = re.search(r"<login_status>([A-Za-z_]+)</login_status>", txt or "")
                 if m:
                     unauthorized = m.group(1)
@@ -79,6 +122,11 @@ class ZteRtaClient:
             self._nonce = info
             self._nc = 0
             return True
+
+        # xml_action 一个挑战都不给（KICKOFF / UNAUTHORIZED）→ 主动用 login.cgi 登录。
+        # 这条通路在会话被踢时依然有效，所以工具不再需要人工去开浏览器登录。
+        if self._login():
+            return True
         if unauthorized:
             hint = {
                 "KICKOFF": "管理员会话被其他登录顶掉了（KICKOFF）",
@@ -86,10 +134,9 @@ class ZteRtaClient:
             }.get(unauthorized, f"设备要求重新登录（login_status={unauthorized}）")
             raise DeviceBusy(
                 f"{hint}，且设备没有发出 Digest 认证挑战。\n"
-                "    这类状态下设备仍然接受 Digest，只是不再主动下发 nonce，\n"
-                "    所以程序自己登录不进去，需要你帮它一次：\n"
-                "    用浏览器打开后台（http://设备IP），用管理员账号登录一次，\n"
-                "    登录成功后回本命令重试即可（实测拔插电源无效）。")
+                "    自动登录（login.cgi）也没成功，通常是设备正忙或密码不是默认的 admin。\n"
+                "    处理：① 确认 --password 与设备后台密码一致；\n"
+                "          ② 用浏览器打开后台登录一次，再重试本命令。")
         return False
 
     def _auth(self, method):
@@ -113,20 +160,39 @@ class ZteRtaClient:
     def get(self, file, retries=2):
         path = f"/xml_action.cgi?method=get&module=duster&file={file}"
         last = (0, "")
-        for _ in range(retries + 1):
-            self._challenge()
-            code, txt, _ = self._raw(path, "GET", None, self._auth("GET"))
+        last_err = None
+        for i in range(retries + 1):
+            try:
+                # 不再每次请求都挑战：设备只允许一个管理员会话，
+                # 每条请求都重新登录会把浏览器（和工具自己）互相踢掉，
+                # 是 KICKOFF 循环的直接来源。_auth() 在缺 nonce 时会自己挑战。
+                code, txt, _ = self._raw(path, "GET", None, self._auth("GET"))
+            except DeviceUnreachable as e:
+                # 设备射频重启期间连不上：退避重试，别把临时故障当永久错误
+                last_err = e
+                time.sleep(2.0 + i * 2)
+                continue
             last = (code, txt)
-            if code == 200 and len(txt) > 40:
+            if code == 200 and len(txt) > 40 and "UNAUTHORIZED" not in txt and "KICKOFF" not in txt:
                 return txt
+            self._nonce = None          # 会话失效，下次重试重新拿 nonce
             time.sleep(1.0)
+        if last_err is not None and last[1] == "":
+            raise last_err
         raise ConnectionError(f"读取 {file} 失败（code={last[0]}）")
 
-    def post(self, file, inner_xml):
+    def post(self, file, inner_xml, retries=2):
         path = f"/xml_action.cgi?method=set&module=duster&file={file}"
         body = ('<?xml version="1.0" encoding="US-ASCII"?><RGW>' + inner_xml + "</RGW>").encode("ascii")
-        self._challenge()
-        return self._raw(path, "POST", body, self._auth("POST"))
+        last_err = None
+        for i in range(retries + 1):
+            try:
+                return self._raw(path, "POST", body, self._auth("POST"))
+            except DeviceUnreachable as e:
+                last_err = e
+                self._nonce = None
+                time.sleep(2.0 + i * 2)
+        raise last_err
 
 
 class ZteRtaDriver(DeviceDriver):

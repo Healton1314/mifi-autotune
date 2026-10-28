@@ -23,6 +23,15 @@ class DeviceBusy(ConnectionError):
     """
 
 
+class DeviceUnreachable(ConnectionError):
+    """设备 HTTP 接口暂时没响应（连接超时 / 被重置）。
+
+    典型场景：正在切频段，设备射频重启，web 服务短暂不响应（5~20 秒）。
+    这类错误是**暂时的**，调用方应该重试或跳过当前步骤，绝不能让它
+    冒到最外层把整个任务中止 —— 否则设备会被留在半途的频段上。
+    """
+
+
 class DeviceDriver(ABC):
     #: 驱动标识，命令行用 --driver 指定
     name = "base"
