@@ -55,11 +55,19 @@
   .gain{color:#1D9E75;font-weight:600}
   .flat{color:#8A8A85}
   .note{font-size:11px;color:#8A8A85;margin-top:8px;line-height:1.5}
+  .banner{background:#FDECEC;border:1px solid #F0C9C9;color:#A32D2D;border-radius:12px;
+          padding:10px 12px;font-size:13px;margin-bottom:12px;line-height:1.55}
+  .banner b{font-weight:600}
+  .banner button{margin-top:9px;width:100%;color:#A32D2D;border-color:#E7B6B6}
+  .jobstat{font-size:12px;margin-top:8px;min-height:16px;color:#185FA5;font-variant-numeric:tabular-nums}
+  .jobstat.done{color:#1D9E75}
+  .jobstat.fail{color:#D64545}
 </style>
 </head>
 <body>
 <h1>随身WiFi 调优</h1>
 <div class="sub" id="conn"><span class="dot"></span>连接中…</div>
+<div class="banner" id="banner" style="display:none"></div>
 
 <div class="grid">
   <div class="card"><div class="k">LTE 频段</div><div class="v" id="band">—</div></div>
@@ -72,10 +80,11 @@
   <button id="btnScan">扫描信道</button>
   <button class="warn" id="btnRestore">恢复默认</button>
   <button class="primary wide" id="btnPreview">体检并预估（约 3 分钟，中途会断网）</button>
+  <div class="jobstat" id="jobStatus"></div>
 </div>
 
 <div class="sec" id="planSec" style="display:none">
-  <h2>体检结论</h2>
+  <h2>体检结论 <span class="note" id="planWhen" style="float:right;margin:0"></span></h2>
   <div id="planBody"></div>
   <button class="primary wide" id="btnApplyPlan" style="margin-top:11px">一键应用这个优化</button>
   <div class="note" id="planHint"></div>
@@ -117,8 +126,10 @@ function setConn(ok, text) {
 async function loadStatus() {
   try {
     const r = await fetch("/api/status", { cache: "no-store" });
+    if (r.status === 401) { setConn(false, "没有访问令牌"); needToken("读取设备状态被拒绝（401）"); return; }
     if (!r.ok) throw new Error((await r.json()).error || r.status);
     const d = await r.json();
+    hideBanner();
     $("band").innerHTML = d.band ? `BAND ${d.band}` : "未锁定<small>自动</small>";
     $("chan").innerHTML = d.channel ? `${d.channel}<small>ch</small>` : "自动";
     const rsrp = d.lte.rsrp ? parseInt(d.lte.rsrp) : null;
@@ -136,11 +147,12 @@ async function scan() {
   $("btnScan").textContent = "扫描中…";
   try {
     const r = await fetch("/api/scan", { cache: "no-store" });
+    if (r.status === 401) { needToken("扫描被拒绝（401）"); throw new AuthError("需要访问令牌"); }
     const d = await r.json();
     if (d.error) throw new Error(d.error);
     renderScan(d);
   } catch (e) {
-    alert("扫描失败：" + e.message);
+    if (!(e instanceof AuthError)) alert("扫描失败：" + e.message);
   } finally {
     $("btnScan").disabled = false;
     $("btnScan").textContent = "扫描信道";
@@ -179,27 +191,89 @@ async function post(url, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  return r.json();
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 401) throw new AuthError(d.error || "需要访问令牌");
+  return d;
 }
 
-async function startJob(url, body) {
+class AuthError extends Error {}
+
+function showBanner(html) {
+  const b = $("banner");
+  b.innerHTML = html;
+  b.style.display = "block";
+  const btn = b.querySelector("button");
+  if (btn) btn.onclick = askToken;
+}
+
+function hideBanner() { $("banner").style.display = "none"; }
+
+function askToken() {
+  const k = prompt("请输入面板访问令牌（终端启动面板时会打印，也保存在项目目录的 .panel-token 里）");
+  if (k) location.href = "/?k=" + encodeURIComponent(k.trim());
+}
+
+function needToken(msg) {
+  showBanner(
+    `<b>没有权限操作</b><br>${msg}<br>` +
+    `常见的两个原因：① 面板重启后令牌变了；② 打开网址时没带 <code>?k=令牌</code>。` +
+    `<button id="btnRetoken">重新输入令牌</button>`);
+}
+
+// ---------- 任务进度 ----------
+
+let ticker = null, jobT0 = 0;
+
+function startTicker(label) {
+  jobT0 = Date.now();
+  const st = $("jobStatus");
+  st.className = "jobstat";
+  clearInterval(ticker);
+  const tick = () => {
+    const s = Math.round((Date.now() - jobT0) / 1000);
+    st.textContent = `${label}进行中… 已 ${s} 秒（约 3~5 分钟，中途会断网，请不要关闭页面）`;
+  };
+  tick();
+  ticker = setInterval(tick, 1000);
+}
+
+function stopTicker(text, cls) {
+  clearInterval(ticker);
+  ticker = null;
+  const st = $("jobStatus");
+  st.className = "jobstat " + (cls || "");
+  st.textContent = text;
+}
+
+async function startJob(url, label, body) {
   if (busy) return;
   busy = true;
+  hideBanner();
   document.querySelectorAll("button").forEach((b) => (b.disabled = true));
-  $("log").classList.add("show");
-  $("log").textContent = "启动中…\n";
+  const el = $("log");
+  el.classList.add("show");
+  el.textContent = "启动中…\n";
+  el.scrollIntoView({ block: "nearest" });
+  startTicker(label);
   try {
     const d = await post(url, body);
     if (!d.ok) {
-      $("log").textContent += "失败：" + (d.msg || d.error) + "\n";
+      stopTicker("启动失败：" + (d.msg || d.error || "未知原因"), "fail");
+      el.textContent += "失败：" + (d.msg || d.error) + "\n";
       stopPolling();
       return;
     }
     pollJob();
     polling = setInterval(pollJob, 1500);
   } catch (e) {
-    $("log").textContent += "请求失败：" + e.message + "\n";
     stopPolling();
+    if (e instanceof AuthError) {
+      stopTicker("没有权限，请求被拒绝（401）", "fail");
+      needToken(e.message);
+    } else {
+      stopTicker("请求失败：" + e.message, "fail");
+    }
+    el.textContent += "失败：" + e.message + "\n";
   }
 }
 
@@ -213,12 +287,17 @@ function stopPolling() {
 async function pollJob() {
   try {
     const r = await fetch("/api/job", { cache: "no-store" });
+    if (r.status === 401) { stopPolling(); needToken("请求被拒绝（401）"); return; }
     const d = await r.json();
     const el = $("log");
     el.textContent = d.lines.join("\n");
     el.scrollTop = el.scrollHeight;
     if (!d.running && d.exit !== null) {
+      const secs = Math.round((Date.now() - jobT0) / 1000);
       stopPolling();
+      stopTicker(
+        d.exit === 0 ? `完成，用时 ${secs} 秒` : `结束（exit=${d.exit}），用时 ${secs} 秒，请查看下方日志`,
+        d.exit === 0 ? "done" : "fail");
       loadStatus();
       if (d.kind === "preview" || d.kind === "apply-plan") loadPlan();
       setTimeout(() => scan(), 800);
@@ -234,6 +313,7 @@ const fmtMbps = (v) => (v === null || v === undefined ? "—" : `${v} Mbps`);
 async function loadPlan() {
   try {
     const r = await fetch("/api/plan", { cache: "no-store" });
+    if (r.status === 401) { needToken("读取体检结论被拒绝（401）"); return; }
     const d = await r.json();
     if (!d.plan) { $("planSec").style.display = "none"; return; }
     renderPlan(d.plan);
@@ -270,10 +350,25 @@ function renderPlan(p) {
 
   $("planBody").innerHTML = rows.join("");
   const changed = bandChanged || (p.wifi && t.channel !== p.wifi.current);
-  $("btnApplyPlan").style.display = changed ? "block" : "none";
-  $("planHint").textContent = changed
-    ? "点上面按钮只切一次，不再重测；换频段时会断网约 30 秒。"
-    : "当前配置已经是这个环境下最优，不需要改动。环境变了可以重新体检一次。";
+  const applied = !!p.applied_at;
+  $("btnApplyPlan").style.display = (changed && !applied) ? "block" : "none";
+
+  // 标出体检时间：结论会过期，不标时间就会拿着旧结论下决定
+  const when = (p.ts || "").replace("T", " ").slice(5, 16);
+  const head = $("planWhen");
+  if (head) head.textContent = when ? `体检于 ${when}` : "";
+
+  const appliedAt = (p.applied_at || "").replace("T", " ").slice(5, 16);
+  if (applied) {
+    $("planHint").innerHTML =
+      `<span class="gain">已于 ${appliedAt} 按此结论应用</span>` +
+      (p.applied_result === "ok" ? "" : "（部分未能生效，详见日志）") +
+      "。当前卡片显示的是这次应用前的对比。";
+  } else {
+    $("planHint").textContent = changed
+      ? "点上面按钮只切一次，不再重测；换频段时会断网约 30 秒。"
+      : "当前配置已经是这个环境下最优，不需要改动。环境变了可以重新体检一次。";
+  }
   $("planSec").style.display = "block";
 }
 
@@ -324,7 +419,8 @@ $("btnWatch").onclick = async () => {
     const d = await post(watchOn ? "/api/watch/stop" : "/api/watch/start", {});
     if (!d.ok) alert(d.msg || "操作失败");
   } catch (e) {
-    alert("请求失败：" + e.message);
+    if (e instanceof AuthError) needToken(e.message);
+    else alert("请求失败：" + e.message);
   }
   loadWatch();
 };
@@ -332,17 +428,17 @@ $("btnWatch").onclick = async () => {
 $("btnScan").onclick = scan;
 $("btnPreview").onclick = () => {
   if (confirm("会逐个切换频段实测，中途断网 2~3 次（约 3 分钟），结束后自动恢复原设置。继续？")) {
-    startJob("/api/preview");
+    startJob("/api/preview", "体检");
   }
 };
 $("btnApplyPlan").onclick = () => {
   if (confirm("按体检结论切换一次，约 30 秒，会短暂断网。继续？")) {
-    startJob("/api/apply-plan");
+    startJob("/api/apply-plan", "应用");
   }
 };
 $("btnRestore").onclick = () => {
   if (confirm("将把频段改回「不锁定」、信道改回「自动」。适合带出门前使用。继续？")) {
-    startJob("/api/restore");
+    startJob("/api/restore", "恢复");
   }
 };
 
@@ -351,6 +447,8 @@ loadPlan();
 loadWatch();
 setInterval(() => { if (!busy) loadStatus(); }, 6000);
 setInterval(loadWatch, 5000);
+// 结论会过期（可能在命令行跑过体检/应用），定期重新拉一次，避免界面拿着旧数据误导
+setInterval(() => { if (!busy) loadPlan(); }, 15000);
 </script>
 </body>
 </html>

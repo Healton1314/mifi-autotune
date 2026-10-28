@@ -59,19 +59,27 @@ def web_dir():
 
 
 def load_token(explicit=None):
+    """决定本次使用的令牌，并把它**持久化**到 .panel-token。
+
+    持久化很重要：如果某次用 --token 指定了别的值却没写回文件，下次不带参数启动
+    就会换一个令牌，浏览器里已经登录的页面全部变成 401——用户只会看到"点了没反应"。
+    """
     if explicit:
-        return explicit
-    env = os.environ.get("MIFI_PANEL_TOKEN")
-    if env:
-        return env
-    if TOKEN_FILE.exists():
-        t = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if t:
-            return t
-    t = secrets.token_urlsafe(12)
+        t = explicit
+    else:
+        env = os.environ.get("MIFI_PANEL_TOKEN")
+        if env:
+            t = env
+        elif TOKEN_FILE.exists():
+            t = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        else:
+            t = ""
+        if not t:
+            t = secrets.token_urlsafe(12)
     try:
-        TOKEN_FILE.write_text(t, encoding="utf-8")
-        os.chmod(TOKEN_FILE, 0o600)
+        if not TOKEN_FILE.exists() or TOKEN_FILE.read_text(encoding="utf-8").strip() != t:
+            TOKEN_FILE.write_text(t, encoding="utf-8")
+            os.chmod(TOKEN_FILE, 0o600)
     except OSError:
         pass
     return t
