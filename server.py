@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -40,6 +41,11 @@ import scanner  # noqa: E402
 
 JOB = {"running": False, "lines": [], "kind": None, "started": None, "exit": None}
 JOB_LOCK = threading.Lock()
+
+# 持续检测（--watch）是常驻进程，跟一次性任务分开管理：
+# 它不会自己结束，必须让用户看得见、并且能一键停掉。
+WATCH = {"proc": None, "lines": [], "since": None, "dry": False}
+WATCH_LOCK = threading.Lock()
 
 TOKEN = ""
 
@@ -114,6 +120,82 @@ def run_job(args, kind):
     return True, "started"
 
 
+# ---------------- 持续检测（可随时关闭的常驻进程） ----------------
+
+def _kill_tree(pid):
+    """杀掉整个进程树：watch 会再起子进程跑重测，只杀父进程会留下孤儿。"""
+    if sys.platform.startswith("win"):
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       capture_output=True, env=_env())
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def watch_status():
+    with WATCH_LOCK:
+        proc = WATCH["proc"]
+        running = proc is not None and proc.poll() is None
+        if proc is not None and not running:
+            WATCH["proc"] = None
+        return {
+            "running": running,
+            "pid": proc.pid if running else None,
+            "since": WATCH["since"],
+            "elapsed": (round(time.time() - WATCH["since"]) if running and WATCH["since"] else None),
+            "dry": WATCH["dry"],
+            "lines": list(WATCH["lines"])[-200:],
+        }
+
+
+def watch_start(dry=False):
+    with WATCH_LOCK:
+        proc = WATCH["proc"]
+        if proc is not None and proc.poll() is None:
+            return False, "已经在运行中"
+        args = [sys.executable, "-u", str(HERE / "autotune.py"), "--watch"]
+        if dry:
+            args.append("--watch-dry-run")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=_env(), bufsize=1,
+                             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                                            if sys.platform.startswith("win") else 0))
+        WATCH.update(proc=p, lines=["$ autotune.py --watch" + (" --watch-dry-run" if dry else "")],
+                     since=time.time(), dry=dry)
+
+    def reader():
+        for raw in iter(p.stdout.readline, b""):
+            line = raw.decode("utf-8", "ignore").rstrip()
+            if line:
+                with WATCH_LOCK:
+                    WATCH["lines"].append(line)
+                    if len(WATCH["lines"]) > 400:
+                        WATCH["lines"] = WATCH["lines"][-400:]
+        with WATCH_LOCK:
+            WATCH["lines"].append("—— 持续检测已停止")
+
+    threading.Thread(target=reader, daemon=True).start()
+    return True, "started"
+
+
+def watch_stop():
+    with WATCH_LOCK:
+        proc = WATCH["proc"]
+        if proc is None or proc.poll() is not None:
+            WATCH["proc"] = None
+            return False, "没有在运行"
+        _kill_tree(proc.pid)
+        try:
+            proc.wait(timeout=8)
+        except Exception:  # noqa: BLE001
+            pass
+        WATCH["proc"] = None
+        WATCH["lines"].append("—— 已手动停止")
+        return True, "stopped"
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=str(web_dir()), **kw)
@@ -184,6 +266,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._json(self.api_status())
                 if path == "/api/scan":
                     return self._json(self.api_scan())
+                if path == "/api/plan":
+                    plan = HERE / "plan.json"
+                    if plan.exists():
+                        try:
+                            return self._json({"plan": json.loads(plan.read_text(encoding="utf-8"))})
+                        except Exception:  # noqa: BLE001
+                            return self._json({"plan": None})
+                    return self._json({"plan": None})
+                if path == "/api/watch":
+                    return self._json(watch_status())
                 if path == "/api/job":
                     with JOB_LOCK:
                         snap = dict(JOB)
@@ -207,6 +299,18 @@ class Handler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}") if length else {}
         try:
+            if path == "/api/watch/start":
+                ok, msg = watch_start(bool(body.get("dry")))
+                return self._json({"ok": ok, "msg": msg}, 200 if ok else 409)
+            if path == "/api/watch/stop":
+                ok, msg = watch_stop()
+                return self._json({"ok": ok, "msg": msg}, 200 if ok else 409)
+            if path == "/api/preview":
+                ok, msg = run_job(["--preview"], "preview")
+                return self._json({"ok": ok, "msg": msg}, 200 if ok else 409)
+            if path == "/api/apply-plan":
+                ok, msg = run_job(["--apply-plan"], "apply-plan")
+                return self._json({"ok": ok, "msg": msg}, 200 if ok else 409)
             if path == "/api/optimize":
                 mode = body.get("mode", "all")
                 args = {"check": [],
@@ -294,6 +398,12 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
+        # 面板退出时不要把常驻的持续检测留在后台
+        try:
+            watch_stop()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

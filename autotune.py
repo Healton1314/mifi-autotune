@@ -37,6 +37,7 @@ CONFIG = HERE / "config.json"
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
+PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
 
 # 守护模式（--watch）的劣化判定阈值。
 # 三段式：min(上限, max(基线×倍数, 下限))
@@ -132,6 +133,242 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
         "loss": max(loss_list) if loss_list else 0,
         "rounds": len(samples),
     }
+
+
+# ---------------- 体检预估 → 一键应用 ----------------
+#
+# 这是主推的使用方式：
+#   1) --preview   实测一遍，输出「现在多少 → 能到多少」的对比表，最后恢复原状
+#   2) --apply-plan 直接按结论改一次，不再重测（只切一次频段，最快）
+#
+# 为什么预览阶段也要切频段：不实测就没法给出可信的提升数字。设备只能上报
+# 当前服务小区的信号，看不到邻区，所以「其它频段能跑多快」只有切过去测才知道。
+# 但预览结束时一定会切回原频段，中间断几次网，最终状态不变。
+
+def _band_label(band):
+    return f"BAND {band}" if band else "自动"
+
+
+def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
+    cur_band, cur_ch = st0["band"], st0["channel"]
+    rounds = max(1, min(args.rounds, 2))
+    plan = {"ts": datetime.now().isoformat(),
+            "device": getattr(dev, "description", dev.name),
+            "current": {"band": cur_band, "channel": cur_ch}}
+
+    # ---- 一、WiFi 信道 ----
+    wifi = None
+    if not args.lte_only:
+        own = args.ssid or cfg.get("own_ssid") or scanner.connected_ssid() or st0.get("ssid")
+        print(f"\n[1/2] 扫描周边 2.4G 信道（{args.scan_rounds} 轮合并）…")
+        aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
+        if aps:
+            rows = scanner.score_channels(aps, caps.get("channels") or range(1, 14))
+            cur_score = next((r["score"] for r in rows if r["ch"] == cur_ch), None)
+            best = rows[0]
+            wifi = {"current": cur_ch, "cur_score": cur_score,
+                    "best": best["ch"], "best_score": best["score"],
+                    "neighbors": len(aps)}
+            print(f"      {len(aps)} 个邻居 AP")
+            print(f"      当前信道 {cur_ch} 干扰分 {cur_score} ｜ 最优 {best['ch']} 干扰分 {best['score']}")
+        else:
+            print("      [!] 没扫到邻居 AP，跳过信道部分（系统语言不支持或无线网卡未启用）")
+
+    # ---- 二、LTE 频段 ----
+    lte = []
+    best_band = None
+    if not args.wifi_only and caps.get("can_lock_band"):
+        cand = cfg.get("candidate_bands") or [3, 40]
+        if args.bands == "all":
+            bands = list(caps["bands"])
+        elif args.bands != "default":
+            bands = [int(x) for x in args.bands.split(",")]
+        else:
+            bands = [b for b in cand if b in caps["bands"]] or list(caps["bands"])[:2]
+
+        print(f"\n[2/2] 逐个实测频段 {bands}（每段 {rounds} 轮，期间会短暂断网，"
+              f"结束后自动切回原频段）…")
+        for b in bands:
+            r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
+            lte.append(r)
+            if r["ok"]:
+                print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
+                      f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
+            else:
+                print(f"      {_band_label(b):<8} 无服务（该频段在当地没有覆盖）")
+
+        # 无论结论如何，先把设备恢复原状，用户不动手也不会被留在别的频段
+        now_band = dev.get_state()["band"]
+        if now_band != cur_band:
+            print(f"\n[还原] 切回 {_band_label(cur_band)} …")
+            dev.set_band(cur_band)
+            time.sleep(SETTLE_SEC)
+
+        usable = [r for r in lte if r["ok"]]
+        if usable:
+            usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
+            best_band = usable[0]["band"]
+
+    # ---- 三、结论 ----
+    cur_res = next((r for r in lte if r["band"] == cur_band), None)
+    best_res = next((r for r in lte if r["band"] == best_band), None)
+    cur_mbps = cur_res["mbps"] if cur_res and cur_res["ok"] else None
+    best_mbps = best_res["mbps"] if best_res else None
+    band_gain = (best_mbps - cur_mbps) if (cur_mbps is not None and best_mbps is not None) else None
+
+    do_band = bool(best_res and best_band != cur_band
+                   and band_gain is not None and band_gain >= MIN_BAND_GAIN_MBPS)
+    do_ch = bool(wifi and caps.get("can_set_channel", True) and wifi["best"] != cur_ch
+                 and wifi["cur_score"] is not None
+                 and wifi["cur_score"] - wifi["best_score"] >= MIN_CHANNEL_GAIN)
+
+    target = {"band": best_band if do_band else cur_band,
+              "channel": wifi["best"] if do_ch else cur_ch}
+    plan.update({
+        "target": target,
+        "lte": lte,
+        "wifi": wifi,
+        "expected": {
+            "band_from": cur_band, "band_to": target["band"],
+            "mbps_now": cur_mbps, "mbps_best": best_mbps,
+            "mbps_gain": round(band_gain, 1) if band_gain is not None else None,
+            "mbps_gain_pct": (round(band_gain / cur_mbps * 100) if cur_mbps else None),
+            "ping_now": cur_res["avg"] if cur_res and cur_res["ok"] else None,
+            "ping_best": best_res["avg"] if best_res else None,
+            "channel_from": cur_ch, "channel_to": target["channel"],
+            "channel_score_from": wifi["cur_score"] if wifi else None,
+            "channel_score_to": wifi["best_score"] if wifi and do_ch else None,
+        },
+        "changes": ([f"频段 {_band_label(cur_band)} → {_band_label(target['band'])}"] if do_band else [])
+                   + ([f"信道 {cur_ch} → {target['channel']}"] if do_ch else []),
+    })
+    PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("\n" + "=" * 56)
+    print("体检结论")
+    print("=" * 56)
+    if cur_mbps is not None or best_mbps is not None:
+        now_s = f"{cur_mbps} Mbps" if cur_mbps is not None else "测不出（当前频段无服务）"
+        best_s = f"{best_mbps} Mbps" if best_mbps is not None else "—"
+        print(f"  频段：{_band_label(cur_band)} {now_s}"
+              f"  →  最优 {_band_label(best_band) if best_band else '—'} {best_s}")
+        if do_band and band_gain is not None:
+            pct = plan["expected"]["mbps_gain_pct"]
+            print(f"        切换后预计 {band_gain:+.1f} Mbps"
+                  f"{f'（{pct:+d}%）' if pct is not None else ''}")
+        elif best_band == cur_band:
+            print("        当前频段已是最优，无需改动")
+        elif band_gain is not None:
+            print(f"        最优只高 {band_gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
+
+    if wifi:
+        print(f"  信道：{cur_ch}（干扰分 {wifi['cur_score']}）"
+              f"  →  最优 {wifi['best']}（干扰分 {wifi['best_score']}）")
+        if do_ch:
+            drop = 0
+            if wifi["cur_score"]:
+                drop = round((wifi["cur_score"] - wifi["best_score"]) / wifi["cur_score"] * 100)
+            print(f"        切换后干扰下降约 {drop}%，主要改善重传和抖动（不承诺带宽提升）")
+        elif wifi["best"] == cur_ch:
+            print("        当前信道已是最优，无需改动")
+        else:
+            print(f"        改善不足阈值 {MIN_CHANNEL_GAIN}，不值得动")
+
+    print("-" * 56)
+    if plan["changes"]:
+        print("可以优化的项：")
+        for c in plan["changes"]:
+            print(f"  · {c}")
+        print(f"\n应用方式：python autotune.py --apply-plan"
+              f"   （只在手机上点一下也行）")
+    else:
+        print("当前配置已经是这个环境下最优，不需要改动。")
+        print("（结论已存 plan.json；环境变了可以重新体检一次）")
+    return 0
+
+
+def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
+    if not PLAN.exists():
+        print("[×] 还没有体检结论。先跑一次：python autotune.py --preview")
+        return 1
+    try:
+        plan = json.loads(PLAN.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        print("[×] plan.json 损坏，请重新体检")
+        return 1
+
+    cur_band, cur_ch = st0["band"], st0["channel"]
+    target = plan.get("target") or {}
+    t_band, t_ch = target.get("band", cur_band), target.get("channel", cur_ch)
+
+    todo = []
+    if t_band != cur_band and caps.get("can_lock_band"):
+        todo.append(("band", t_band))
+    if t_ch != cur_ch and caps.get("can_set_channel", True):
+        todo.append(("channel", t_ch))
+
+    if not todo:
+        print("[√] 当前配置已经和体检结论一致，无需改动。")
+        return 0
+
+    print("按体检结论应用：")
+    for kind, val in todo:
+        if kind == "band":
+            print(f"  · 频段 {_band_label(cur_band)} → {_band_label(val)}")
+        else:
+            print(f"  · 信道 {cur_ch} → {val}")
+
+    save_state({"saved_at": datetime.now().isoformat(),
+                "band": cur_band, "channel": cur_ch})
+
+    failed = False
+    for kind, val in todo:
+        if kind == "band":
+            print(f"\n[应用] 锁定 {_band_label(val)} …")
+            try:
+                dev.set_band(val)
+            except Unsupported as e:
+                print(f"[跳过] {e}")
+                continue
+            time.sleep(SETTLE_SEC)
+            chk = probe.ping_stats(6, ping_host)
+            if chk["avg"] is None:
+                print("[!] 切换后无法上网，自动回滚")
+                dev.set_band(cur_band)
+                time.sleep(SETTLE_SEC)
+                failed = True
+                break
+            print(f"[√] 已生效，延迟 {chk['avg']}ms")
+        else:
+            print(f"\n[应用] 切换 WiFi 信道到 {val} …")
+            try:
+                dev.set_channel(val)
+            except Unsupported as e:
+                print(f"[跳过] {e}")
+                continue
+            time.sleep(5)
+            got = dev.get_state()["channel"]
+            if got != val:
+                print(f"[!] 信道未生效（当前 {got}），恢复原值")
+                dev.set_channel(cur_ch)
+                failed = True
+            else:
+                print("[√] 已生效")
+
+    end = dev.get_state()
+    append_log({"ts": datetime.now().isoformat(), "mode": "apply-plan",
+                "plan": plan.get("expected"), "before": {"band": cur_band, "channel": cur_ch},
+                "after": {"band": end["band"], "channel": end["channel"]}})
+    print(f"\n完成：频段 {_band_label(end['band'])} ｜ 信道 {end['channel'] or '自动'}")
+    if failed:
+        print("（有一项没成功，已回滚到原值，详见上面的 [!] 行）")
+        return 1
+    try:
+        PLAN.unlink()
+    except OSError:
+        pass
+    print(f"原始设置已存 {STATE}，可用 --restore 还原")
+    return 0
 
 
 # ---------------- 守护模式 ----------------
@@ -269,8 +506,12 @@ def main():
     ap.add_argument("--ping-host", default=None, help="延迟探测目标（默认 223.5.5.5）")
     ap.add_argument("--rounds", type=int, default=3, help="每个频段的测量轮数（默认 3，取中位数）")
     ap.add_argument("--scan-rounds", type=int, default=5, help="信道扫描轮数（默认 5，合并并滤除幽灵 AP）")
+    ap.add_argument("--preview", action="store_true",
+                    help="体检并给出「预期提升」，结束时恢复原配置（推荐的第一步）")
+    ap.add_argument("--apply-plan", action="store_true",
+                    help="按上一次 --preview 的结论应用，不再重测（只切一次，最快）")
     ap.add_argument("--watch", action="store_true",
-                    help="守护模式：持续监测，明显劣化时才自动重测并切换")
+                    help="进阶：长期挂在后台，明显劣化时才自动重测并切换")
     ap.add_argument("--watch-interval", type=int, default=300,
                     help="守护模式探测间隔秒数（默认 300）")
     ap.add_argument("--watch-cooldown", type=int, default=900,
@@ -329,6 +570,12 @@ def main():
     if sig.get("rsrp"):
         print(f"信号：RSRP {sig.get('rsrp')} | SINR {sig.get('sinr')} | PCI {sig.get('pci')}")
     print("=" * 56)
+
+    if args.preview:
+        return run_preview(dev, caps, st0, args, cfg, speed_url, ping_host)
+
+    if args.apply_plan:
+        return run_apply_plan(dev, caps, st0, args, cfg, ping_host)
 
     if args.restore:
         try:
