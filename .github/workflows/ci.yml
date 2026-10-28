@@ -11,14 +11,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.8", "3.12"]
+        # 显式列组合，而不是 os × python 全交叉。
+        # 原因：ubuntu-latest 现在是 24.04，actions/setup-python 在上面装不出 3.8
+        # （缺 libssl1.1），会在 setup 步骤就失败、6 秒退出，看起来像代码问题。
+        # 3.8 只在 ubuntu-22.04 上跑，其余组合用较新的 Python。
+        include:
+          - { os: ubuntu-22.04,   python: "3.8" }
+          - { os: ubuntu-latest,  python: "3.12" }
+          - { os: windows-latest, python: "3.8" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: macos-latest,   python: "3.12" }
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+
+      # 防止 setup 静默回落到别的版本，导致「3.8 通过」其实根本没测 3.8
+      - name: 版本自检
+        shell: bash
+        run: |
+          python -c "import sys; v=sys.version.split()[0]; want='${{ matrix.python }}'; print('实际 Python', v); assert v.startswith(want), 'expected %s got %s' % (want, v)"
 
       - name: 语法检查
         run: python -m compileall -q autotune.py server.py scanner.py probe.py drivers
