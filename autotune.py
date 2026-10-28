@@ -395,6 +395,21 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     return 0
 
 
+def _mark_applied(plan, band, channel, result):
+    """把「已应用」写回 plan.json，而不是把它删掉。
+
+    删掉文件会让界面上的结论卡片凭空消失，用户会疑惑"我刚才那份结论去哪了"。
+    保留并标注应用时间，既能回顾，也能让 UI 明确显示"已应用"。
+    """
+    plan["applied_at"] = datetime.now().isoformat()
+    plan["applied_result"] = result
+    plan["after"] = {"band": band, "channel": channel}
+    try:
+        PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     if not PLAN.exists():
         print("[×] 还没有体检结论。先跑一次：python autotune.py --preview")
@@ -417,6 +432,7 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
 
     if not todo:
         print("[√] 当前配置已经和体检结论一致，无需改动。")
+        _mark_applied(plan, cur_band, cur_ch, "nothing_to_do")
         return 0
 
     print("按体检结论应用：")
@@ -470,11 +486,9 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     print(f"\n完成：频段 {_band_label(end['band'])} ｜ 信道 {end['channel'] or '自动'}")
     if failed:
         print("（有一项没成功，已回滚到原值，详见上面的 [!] 行）")
+        _mark_applied(plan, end["band"], end["channel"], "partial_failure")
         return 1
-    try:
-        PLAN.unlink()
-    except OSError:
-        pass
+    _mark_applied(plan, end["band"], end["channel"], "ok")
     print(f"原始设置已存 {STATE}，可用 --restore 还原")
     return 0
 
