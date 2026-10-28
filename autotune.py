@@ -286,7 +286,12 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     print("体检结论")
     print("=" * 56)
     if cur_mbps is not None or best_mbps is not None:
-        now_s = f"{cur_mbps} Mbps" if cur_mbps is not None else "测不出（当前频段无服务）"
+        if cur_mbps is not None:
+            now_s = f"{cur_mbps} Mbps"
+        elif cur_res is None:
+            now_s = "未测（不在本次范围）"
+        else:
+            now_s = "测不出（该频段无服务）"
         best_s = f"{best_mbps} Mbps" if best_mbps is not None else "—"
         print(f"  频段：{_band_label(cur_band)} {now_s}"
               f"  →  最优 {_band_label(best_band) if best_band else '—'} {best_s}")
