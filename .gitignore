@@ -7,6 +7,7 @@ env/
 
 # 运行期产物（含本机原始配置，勿提交）
 state.json
+config.json
 autotune-log.jsonl
 *.log
 
