@@ -47,6 +47,14 @@
   .ap:last-child{border:0}
   .ap b{font-weight:500}
   .ap span{color:#8A8A85;font-variant-numeric:tabular-nums}
+  .pl{display:flex;justify-content:space-between;align-items:baseline;
+      font-size:13px;padding:7px 0;border-bottom:1px solid #F2F2ED}
+  .pl:last-of-type{border:0}
+  .pl .lbl{color:#8A8A85;font-size:12px;min-width:44px}
+  .pl .val{font-variant-numeric:tabular-nums;text-align:right}
+  .gain{color:#1D9E75;font-weight:600}
+  .flat{color:#8A8A85}
+  .note{font-size:11px;color:#8A8A85;margin-top:8px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -62,11 +70,26 @@
 
 <div class="acts">
   <button id="btnScan">扫描信道</button>
-  <button id="btnCheck">体检（不改）</button>
-  <button id="btnWifi">优化 Wi-Fi</button>
-  <button id="btnLte">优化 LTE</button>
-  <button class="primary wide" id="btnAll">全部优化（约 2 分钟，会断网）</button>
-  <button class="warn wide" id="btnRestore">恢复默认（不锁频段 + 自动信道）</button>
+  <button class="warn" id="btnRestore">恢复默认</button>
+  <button class="primary wide" id="btnPreview">体检并预估（约 3 分钟，中途会断网）</button>
+</div>
+
+<div class="sec" id="planSec" style="display:none">
+  <h2>体检结论</h2>
+  <div id="planBody"></div>
+  <button class="primary wide" id="btnApplyPlan" style="margin-top:11px">一键应用这个优化</button>
+  <div class="note" id="planHint"></div>
+</div>
+
+<div class="sec" id="watchSec">
+  <h2>持续检测（可选）</h2>
+  <div class="pl"><span class="lbl">状态</span><span class="val" id="watchState"><span class="dot"></span>未开启</span></div>
+  <button id="btnWatch" style="margin-top:10px;width:100%">开启持续检测</button>
+  <div class="note" id="watchHint">
+    开启后会一直挂在后台：每 5 分钟探一次，明显变慢才自动重测并切换。
+    <b>不用时点上面按钮随时关掉</b>，关掉就是彻底停止，不残留进程。
+  </div>
+  <div class="log" id="watchLog" style="margin-top:10px"></div>
 </div>
 
 <div class="sec" id="chanSec" style="display:none">
@@ -197,18 +220,124 @@ async function pollJob() {
     if (!d.running && d.exit !== null) {
       stopPolling();
       loadStatus();
+      if (d.kind === "preview" || d.kind === "apply-plan") loadPlan();
       setTimeout(() => scan(), 800);
     }
   } catch (e) { /* 忽略瞬时错误 */ }
 }
 
+// ---------- 体检结论卡片 ----------
+
+const fmtBand = (b) => (b ? `BAND ${b}` : "自动");
+const fmtMbps = (v) => (v === null || v === undefined ? "—" : `${v} Mbps`);
+
+async function loadPlan() {
+  try {
+    const r = await fetch("/api/plan", { cache: "no-store" });
+    const d = await r.json();
+    if (!d.plan) { $("planSec").style.display = "none"; return; }
+    renderPlan(d.plan);
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderPlan(p) {
+  const e = p.expected || {}, t = p.target || {}, c = p.current || {};
+  const rows = [];
+
+  const bandChanged = t.band !== c.band;
+  rows.push(
+    `<div class="pl"><span class="lbl">频段</span><span class="val">` +
+    `${fmtBand(c.band)} · ${fmtMbps(e.mbps_now)}` +
+    (bandChanged ? ` <span class="gain">→ ${fmtBand(t.band)} · ${fmtMbps(e.mbps_best)}</span>`
+                 : ` <span class="flat">保持</span>`) +
+    `</span></div>`);
+
+  if (bandChanged && e.mbps_gain) {
+    const pct = e.mbps_gain_pct != null ? `（${e.mbps_gain_pct > 0 ? "+" : ""}${e.mbps_gain_pct}%）` : "";
+    rows.push(`<div class="pl"><span class="lbl"></span><span class="val gain">` +
+      `预计 ${e.mbps_gain > 0 ? "+" : ""}${e.mbps_gain} Mbps${pct}</span></div>`);
+  }
+
+  if (p.wifi) {
+    const w = p.wifi, chChanged = t.channel !== w.current;
+    rows.push(
+      `<div class="pl"><span class="lbl">信道</span><span class="val">` +
+      `${w.current}${w.cur_score != null ? `（干扰 ${w.cur_score}）` : ""}` +
+      (chChanged ? ` <span class="gain">→ ${t.channel}（${w.best_score}）</span>`
+                 : ` <span class="flat">保持</span>`) +
+      `</span></div>`);
+  }
+
+  $("planBody").innerHTML = rows.join("");
+  const changed = bandChanged || (p.wifi && t.channel !== p.wifi.current);
+  $("btnApplyPlan").style.display = changed ? "block" : "none";
+  $("planHint").textContent = changed
+    ? "点上面按钮只切一次，不再重测；换频段时会断网约 30 秒。"
+    : "当前配置已经是这个环境下最优，不需要改动。环境变了可以重新体检一次。";
+  $("planSec").style.display = "block";
+}
+
+// ---------- 持续检测开关 ----------
+
+let watchOn = false;
+
+const fmtDur = (s) => {
+  if (s === null || s === undefined) return "—";
+  const m = Math.floor(s / 60);
+  return m ? `${m} 分 ${s % 60} 秒` : `${s} 秒`;
+};
+
+async function loadWatch() {
+  try {
+    const r = await fetch("/api/watch", { cache: "no-store" });
+    const d = await r.json();
+    watchOn = !!d.running;
+    const el = $("watchState");
+    if (watchOn) {
+      el.innerHTML = `<span class="dot on"></span><span class="gain">运行中 · 已 ${fmtDur(d.elapsed)}</span>`;
+      $("btnWatch").textContent = "停止持续检测";
+      $("btnWatch").classList.add("warn");
+      $("watchLog").classList.add("show");
+      if (d.lines && d.lines.length) {
+        const box = $("watchLog");
+        box.textContent = d.lines.slice(-14).join("\n");
+        box.scrollTop = box.scrollHeight;
+      }
+    } else {
+      el.innerHTML = `<span class="dot"></span>未开启（后台没有常驻进程）`;
+      $("btnWatch").textContent = "开启持续检测";
+      $("btnWatch").classList.remove("warn");
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+$("btnWatch").onclick = async () => {
+  if (!watchOn) {
+    const ok = confirm(
+      "开启后会一直挂在后台运行：\n" +
+      "· 每 5 分钟打一组 ping（几百字节，几乎不占流量）\n" +
+      "· 只有明显变慢时才自动重测并切换频段\n\n" +
+      "随时可以点「停止持续检测」关掉。继续？");
+    if (!ok) return;
+  }
+  try {
+    const d = await post(watchOn ? "/api/watch/stop" : "/api/watch/start", {});
+    if (!d.ok) alert(d.msg || "操作失败");
+  } catch (e) {
+    alert("请求失败：" + e.message);
+  }
+  loadWatch();
+};
+
 $("btnScan").onclick = scan;
-$("btnCheck").onclick = () => startJob("/api/optimize", { mode: "check" });
-$("btnWifi").onclick = () => startJob("/api/optimize", { mode: "wifi" });
-$("btnLte").onclick = () => startJob("/api/optimize", { mode: "lte" });
-$("btnAll").onclick = () => {
-  if (confirm("全部优化会逐个切换 LTE 频段实测，期间断网约 2 分钟。继续？")) {
-    startJob("/api/optimize", { mode: "all" });
+$("btnPreview").onclick = () => {
+  if (confirm("会逐个切换频段实测，中途断网 2~3 次（约 3 分钟），结束后自动恢复原设置。继续？")) {
+    startJob("/api/preview");
+  }
+};
+$("btnApplyPlan").onclick = () => {
+  if (confirm("按体检结论切换一次，约 30 秒，会短暂断网。继续？")) {
+    startJob("/api/apply-plan");
   }
 };
 $("btnRestore").onclick = () => {
@@ -218,7 +347,10 @@ $("btnRestore").onclick = () => {
 };
 
 loadStatus();
+loadPlan();
+loadWatch();
 setInterval(() => { if (!busy) loadStatus(); }, 6000);
+setInterval(loadWatch, 5000);
 </script>
 </body>
 </html>
