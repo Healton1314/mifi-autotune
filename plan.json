@@ -1,0 +1,124 @@
+{
+  "ts": "2026-10-28T17:14:06.598624",
+  "device": "ZTE-RTA 固件（/xml_action.cgi + Digest），如飞猫 FM_M1",
+  "current": {
+    "band": 3,
+    "channel": 13
+  },
+  "target": {
+    "band": 3,
+    "channel": 13
+  },
+  "reliable": true,
+  "caveats": [],
+  "lte": [
+    {
+      "band": 3,
+      "ok": true,
+      "mbps": 25.5,
+      "mbps_all": [
+        21.7,
+        29.3
+      ],
+      "mbps_min": 21.7,
+      "mbps_max": 29.3,
+      "avg": 65,
+      "max": 205,
+      "jitter": 46.7,
+      "loss": 0,
+      "rounds": 2
+    },
+    {
+      "band": 8,
+      "ok": true,
+      "mbps": 16.0,
+      "mbps_all": [
+        16.0
+      ],
+      "mbps_min": 16.0,
+      "mbps_max": 16.0,
+      "avg": 66,
+      "max": 200,
+      "jitter": 44.6,
+      "loss": 0,
+      "rounds": 1
+    },
+    {
+      "band": 38,
+      "ok": false,
+      "mbps": 0,
+      "mbps_all": [],
+      "mbps_min": 0,
+      "mbps_max": 0,
+      "avg": null,
+      "max": null,
+      "jitter": null,
+      "loss": 100,
+      "rounds": 0,
+      "reason": "no_signal",
+      "waited": 15.7
+    },
+    {
+      "band": 39,
+      "ok": true,
+      "mbps": 6.4,
+      "mbps_all": [
+        6.4
+      ],
+      "mbps_min": 6.4,
+      "mbps_max": 6.4,
+      "avg": 149,
+      "max": 866,
+      "jitter": 239.0,
+      "loss": 0,
+      "rounds": 1
+    },
+    {
+      "band": 40,
+      "ok": true,
+      "mbps": 27.1,
+      "mbps_all": [
+        21.7,
+        32.5
+      ],
+      "mbps_min": 21.7,
+      "mbps_max": 32.5,
+      "avg": 93,
+      "max": 399,
+      "jitter": 102.1,
+      "loss": 0,
+      "rounds": 2
+    },
+    {
+      "band": 41,
+      "ok": false,
+      "mbps": 0,
+      "mbps_all": [],
+      "mbps_min": 0,
+      "mbps_max": 0,
+      "avg": null,
+      "max": null,
+      "jitter": null,
+      "loss": 100,
+      "rounds": 0,
+      "reason": "no_signal",
+      "waited": 17.7
+    }
+  ],
+  "wifi": null,
+  "expected": {
+    "band_from": 3,
+    "band_to": 3,
+    "mbps_now": 25.5,
+    "mbps_best": 27.1,
+    "mbps_gain": 1.6,
+    "mbps_gain_pct": 6,
+    "ping_now": 65,
+    "ping_best": 93,
+    "channel_from": 13,
+    "channel_to": 13,
+    "channel_score_from": null,
+    "channel_score_to": null
+  },
+  "changes": []
+}

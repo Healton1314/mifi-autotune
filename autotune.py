@@ -37,6 +37,7 @@ CONFIG = HERE / "config.json"
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
+SPEED_FLOOR_MBPS = 3                # 最优频段都低于这个值，说明网络太差、结论不可信
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
 
 # 守护模式（--watch）的劣化判定阈值。
@@ -154,29 +155,59 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
 
     无服务的频段会在 wait_for_service 阶段就被判定并跳过，
     不再白等固定的 26 秒，也不会去跑根本跑不动的测速。
-    """
-    dev.set_band(band)
-    status, waited = wait_for_service(dev, band)
-    if status != "ok":
-        return {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
-                "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-                "jitter": None, "loss": 100, "rounds": 0,
-                "reason": status, "waited": waited}
 
-    st = probe.ping_stats(6, ping_host)
+    任何一步失败（设备切频段瞬间失联、写频段被拒、测速异常）都只让**这一个
+    频段**判为不可用，绝不允许异常冒出去把整轮体检打断 —— 否则设备会被留在
+    半途的频段上（实测踩过：停在 BAND 8，丢包 60%）。
+    """
+    empty = {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
+             "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
+             "jitter": None, "loss": 100, "rounds": 0}
+
+    try:
+        dev.set_band(band)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return dict(empty, reason="device_error", error=f"{type(e).__name__}: {e}")
+
+    try:
+        status, waited = wait_for_service(dev, band)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return dict(empty, reason="device_error", error=f"{type(e).__name__}: {e}")
+
+    if status != "ok":
+        return dict(empty, reason=status, waited=waited)
+
+    try:
+        st = probe.ping_stats(6, ping_host)
+    except Exception:  # noqa: BLE001
+        st = {"avg": None, "loss": 100}
     if st["avg"] is None or st["loss"] == 100:
-        return {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
-                "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-                "jitter": None, "loss": 100, "rounds": 0,
-                "reason": "no_data", "waited": waited}
+        return dict(empty, reason="no_data", waited=waited)
 
     samples = []
+    # 注册完成不等于数据通道就绪：实测 ping 已经通了、下载还拿不到字节，
+    # 这时候测出来就是 0 Mbps，会被误判成「该频段没有数据能力」。
+    # 给 3 秒缓冲，再开始正式测量。
+    time.sleep(3)
+    candidates = [speed_url] + [u for u in probe.SPEED_CANDIDATES if u != speed_url]
     for i in range(rounds):
-        mbps = probe.throughput(4, 8, speed_url)
+        try:
+            mbps, _used = probe.throughput_any(candidates, 4, 8)
+        except Exception:  # noqa: BLE001
+            mbps = 0.0
         p = probe.ping_stats(10, ping_host)
         samples.append((mbps, p["avg"], p["max"], p["jitter"], p["loss"]))
         if i < rounds - 1:
             time.sleep(1.5)
+
+    # 全部轮次都测不出速度，但 ping 是通的 → 是测速源/出口的问题，不是频段差。
+    # 这种情况必须单独标出来：拿 0 Mbps 去和别的频段比，会得出完全错误的结论。
+    if samples and all(s[0] <= 0 for s in samples):
+        return dict(empty, reason="speed_fail", waited=waited)
 
     mbps_list = [s[0] for s in samples]
     avg_list = [s[1] for s in samples if s[1] is not None]
@@ -210,6 +241,27 @@ def _band_label(band):
     return f"BAND {band}" if band else "自动"
 
 
+def assess_reliability(lte, cur_res, best_res):
+    """这次测量的结论能不能信？返回不可信的原因列表（空 = 可信）。
+
+    为什么要这一层：网络很差或测速源抽风时，单轮波动的幅度会盖过频段之间的
+    真实差异。这时候给出「切过去能快 20Mbps」是假的，用户白断一次网还更差。
+    宁可明确说「测不准」。
+    """
+    caveats = []
+    if cur_res and not cur_res.get("ok") and cur_res.get("reason") == "speed_fail":
+        caveats.append("当前频段测不出速度（测速源不可用，或该频段几乎没有数据能力）")
+    if best_res and best_res.get("mbps") is not None and best_res["mbps"] < SPEED_FLOOR_MBPS:
+        caveats.append(f"最优频段也只有 {best_res['mbps']} Mbps，低于 {SPEED_FLOOR_MBPS} Mbps 参考线")
+    for r in lte:
+        samples = r.get("mbps_all") or []
+        if r.get("ok") and len(samples) >= 2 and min(samples) > 0 \
+                and max(samples) / min(samples) >= 4:
+            caveats.append(f"BAND {r['band']} 多轮结果波动过大（{samples}）")
+            break
+    return caveats
+
+
 def resolve_bands(caps, args, cfg):
     """决定要实测哪些频段。
 
@@ -241,13 +293,20 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
         if aps:
             rows = scanner.score_channels(aps, caps.get("channels") or range(1, 14))
-            cur_score = next((r["score"] for r in rows if r["ch"] == cur_ch), None)
+            ch_auto = not cur_ch            # 0/None = 设备处于「自动信道」
+            cur_score = (None if ch_auto
+                         else next((r["score"] for r in rows if r["ch"] == cur_ch), None))
             best = rows[0]
-            wifi = {"current": cur_ch, "cur_score": cur_score,
+            wifi = {"current": cur_ch, "auto": ch_auto, "cur_score": cur_score,
                     "best": best["ch"], "best_score": best["score"],
                     "neighbors": len(aps)}
             print(f"      {len(aps)} 个邻居 AP")
-            print(f"      当前信道 {cur_ch} 干扰分 {cur_score} ｜ 最优 {best['ch']} 干扰分 {best['score']}")
+            if ch_auto:
+                print("      当前信道：自动（设备自己选，无法比较「现在有多差」）")
+                print(f"      扫描最干净的是 {best['ch']} 号（干扰分 {best['score']}），仅供参考")
+            else:
+                print(f"      当前信道 {cur_ch} 干扰分 {cur_score} ｜ "
+                      f"最优 {best['ch']} 干扰分 {best['score']}")
         else:
             print("      [!] 没扫到邻居 AP，跳过信道部分（系统语言不支持或无线网卡未启用）")
 
@@ -259,53 +318,76 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         if not bands:
             print("\n[2/2] 驱动没有声明可用频段，跳过频段实测。")
         else:
-            per = SETTLE_SEC + rounds * 20 + 6
+            per = SETTLE_SEC + rounds * 20 + 8
             print(f"\n[2/2] 设备声明支持 {len(bands)} 个频段：{bands}")
-            print(f"      逐个实测（每段 {rounds} 轮，快的约 {per} 秒；"
-                  f"没信号的频段会提前跳过，最多约 {per * len(bands) // 60} 分钟）")
+            print(f"      逐个实测（每段 {rounds} 轮，有信号的约 {per} 秒，"
+                  f"没信号的会提前跳过；预计 {per * len(bands) / 60:.0f} 分钟以内）")
             print("      期间会短暂断网，全部测完自动切回原频段…")
-        for b in bands or []:
-            r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
-            lte.append(r)
-            if r["ok"]:
-                print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
-                      f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
-            else:
-                why = {"no_signal": "无信号（当地没这个频段）",
-                       "timeout": "注册超时",
-                       "no_data": "有信号但数据不通"}.get(r.get("reason"), "不可用")
-                print(f"      {_band_label(b):<8} {why}  已跳过（{r.get('waited', '?')}s）")
 
-        usable = [r for r in lte if r["ok"]]
-        # 决赛：全部粗测完后，对「最优」和「当前」各补一轮。
-        # 单轮结果容易被瞬时调度带偏，而这两者的差值正是决策依据，值得多花 90 秒确认。
-        if usable and len(bands) > 2:
-            usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
-            contest = [b for b in dict.fromkeys([usable[0]["band"], cur_band]) if b]
-            print(f"\n[决赛] 对 {[f'BAND {b}' for b in contest]} 各补 1 轮确认…")
-            by_band = {r["band"]: r for r in lte}
-            for b in contest:
-                prev = by_band.get(b)
-                if not prev or not prev["ok"]:
-                    continue
-                extra = measure_band(dev, b, rounds=1,
-                                     speed_url=speed_url, ping_host=ping_host)
-                if extra.get("ok"):
-                    merged = sorted(prev["mbps_all"] + extra["mbps_all"])
-                    prev["mbps"] = round(statistics.median(merged), 1)
-                    prev["mbps_all"] = merged
-                    prev["mbps_min"] = min(merged)
-                    prev["mbps_max"] = max(merged)
-                    prev["rounds"] = len(merged)
-                    print(f"      {_band_label(b):<8} 复测后 {prev['mbps']} Mbps"
-                          f"（{merged}）")
+        t_band0 = time.time()
+        try:
+            for idx, b in enumerate(bands or [], 1):
+                print(f"\n      [{idx}/{len(bands)}] BAND {b} 测试中…")
+                r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
+                lte.append(r)
+                if r["ok"]:
+                    print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
+                          f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
+                else:
+                    why = {"no_signal": "无信号（当地没这个频段）",
+                           "timeout": "注册超时",
+                           "no_data": "有信号但数据不通",
+                           "speed_fail": "有信号但测不出速度（测速源不可用，或该频段几无数据能力）",
+                           "device_error": "设备通信中断"}.get(r.get("reason"), "不可用")
+                    print(f"      {_band_label(b):<8} {why}  已跳过（{r.get('waited', '?')}s）")
+                    if r.get("error"):
+                        print(f"      原因：{r['error']}")
+                left = len(bands) - idx
+                if left:
+                    used = (time.time() - t_band0) / idx
+                    print(f"      （还剩 {left} 个，预计 {used * left / 60:.1f} 分钟）")
 
-        # 无论结论如何，先把设备恢复原状，用户不动手也不会被留在别的频段
-        now_band = dev.get_state()["band"]
-        if now_band != cur_band:
-            print(f"\n[还原] 切回 {_band_label(cur_band)} …")
-            dev.set_band(cur_band)
-            time.sleep(SETTLE_SEC)
+            usable = [r for r in lte if r["ok"]]
+            # 决赛：全部粗测完后，对「最优」和「当前」各补一轮。
+            # 单轮结果容易被瞬时调度带偏，而这两者的差值正是决策依据，值得多花 90 秒确认。
+            if usable and len(bands) > 2:
+                usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
+                contest = [b for b in dict.fromkeys([usable[0]["band"], cur_band]) if b]
+                print(f"\n[决赛] 对 {[f'BAND {b}' for b in contest]} 各补 1 轮确认…")
+                by_band = {r["band"]: r for r in lte}
+                for b in contest:
+                    prev = by_band.get(b)
+                    if not prev or not prev["ok"]:
+                        continue
+                    extra = measure_band(dev, b, rounds=1,
+                                         speed_url=speed_url, ping_host=ping_host)
+                    if extra.get("ok"):
+                        merged = sorted(prev["mbps_all"] + extra["mbps_all"])
+                        prev["mbps"] = round(statistics.median(merged), 1)
+                        prev["mbps_all"] = merged
+                        prev["mbps_min"] = min(merged)
+                        prev["mbps_max"] = max(merged)
+                        prev["rounds"] = len(merged)
+                        print(f"      {_band_label(b):<8} 复测后 {prev['mbps']} Mbps"
+                              f"（{merged}）")
+        except KeyboardInterrupt:
+            print("\n[!] 已中断，马上切回原频段…")
+        finally:
+            # 无论正常结束、抛异常还是 Ctrl+C，都必须还原。
+            # 这条是血的教训：之前在测 BAND 8 时驱动超时崩溃，整个进程退出，
+            # 设备被留在 BAND 8（丢包 60%），用户当场上不了网。
+            try:
+                now_band = dev.get_state()["band"]
+                if now_band != cur_band:
+                    print(f"\n[还原] 切回 {_band_label(cur_band)} …")
+                    dev.set_band(cur_band)
+                    time.sleep(SETTLE_SEC)
+                    print("      已切回")
+                else:
+                    print(f"\n[还原] 设备仍在 {_band_label(cur_band)}，无需切换")
+            except Exception as e:  # noqa: BLE001
+                print(f"      [!] 自动还原失败：{type(e).__name__}: {e}")
+                print(f"          请手动在设备后台把频段改回 BAND {cur_band}")
 
         usable = [r for r in lte if r["ok"]]
         if usable:
@@ -319,7 +401,12 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     best_mbps = best_res["mbps"] if best_res else None
     band_gain = (best_mbps - cur_mbps) if (cur_mbps is not None and best_mbps is not None) else None
 
-    do_band = bool(best_res and best_band != cur_band
+    # 可信度检查：网络很差、或测速源抽风时，单轮波动会盖过频段之间的真实差异。
+    # 这种时候给出「建议切换」是害人 —— 宁可说「测不准」，也不要让人白折腾一次断网。
+    caveats = assess_reliability(lte, cur_res, best_res)
+    reliable = not caveats
+
+    do_band = bool(reliable and best_res and best_band != cur_band
                    and band_gain is not None and band_gain >= MIN_BAND_GAIN_MBPS)
     do_ch = bool(wifi and caps.get("can_set_channel", True) and wifi["best"] != cur_ch
                  and wifi["cur_score"] is not None
@@ -329,6 +416,8 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
               "channel": wifi["best"] if do_ch else cur_ch}
     plan.update({
         "target": target,
+        "reliable": reliable,
+        "caveats": caveats,
         "lte": lte,
         "wifi": wifi,
         "expected": {
@@ -370,19 +459,31 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             print(f"        最优只高 {band_gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
 
     if wifi:
-        print(f"  信道：{cur_ch}（干扰分 {wifi['cur_score']}）"
-              f"  →  最优 {wifi['best']}（干扰分 {wifi['best_score']}）")
-        if do_ch:
-            drop = 0
-            if wifi["cur_score"]:
-                drop = round((wifi["cur_score"] - wifi["best_score"]) / wifi["cur_score"] * 100)
-            print(f"        切换后干扰下降约 {drop}%，主要改善重传和抖动（不承诺带宽提升）")
-        elif wifi["best"] == cur_ch:
-            print("        当前信道已是最优，无需改动")
+        if wifi.get("auto"):
+            print(f"  信道：自动（设备自行选择，当前无固定值）"
+                  f"  →  扫描最干净 {wifi['best']}（干扰分 {wifi['best_score']}）")
+            print("        自动模式通常比自己钉一个信道更稳，本次不建议改动。")
         else:
-            print(f"        改善不足阈值 {MIN_CHANNEL_GAIN}，不值得动")
+            print(f"  信道：{cur_ch}（干扰分 {wifi['cur_score']}）"
+                  f"  →  最优 {wifi['best']}（干扰分 {wifi['best_score']}）")
+            if do_ch:
+                drop = 0
+                if wifi["cur_score"]:
+                    drop = round((wifi["cur_score"] - wifi["best_score"]) / wifi["cur_score"] * 100)
+                print(f"        切换后干扰下降约 {drop}%，主要改善重传和抖动（不承诺带宽提升）")
+            elif wifi["best"] == cur_ch:
+                print("        当前信道已是最优，无需改动")
+            else:
+                print(f"        改善不足阈值 {MIN_CHANNEL_GAIN}，不值得动")
 
     print("-" * 56)
+    if caveats:
+        print("[!] 这次结论不可信，先别照它改：")
+        for c in caveats:
+            print(f"    · {c}")
+        print("    原因通常是当前信号太差（看 RSRP/SINR）或测速源不可用。")
+        print("    建议：换个测速源（--speed-url）或等信号好转后再测一次。")
+        print("-" * 56)
     if plan["changes"]:
         print("可以优化的项：")
         for c in plan["changes"]:
@@ -446,40 +547,57 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
                 "band": cur_band, "channel": cur_ch})
 
     failed = False
-    for kind, val in todo:
-        if kind == "band":
-            print(f"\n[应用] 锁定 {_band_label(val)} …")
-            try:
-                dev.set_band(val)
-            except Unsupported as e:
-                print(f"[跳过] {e}")
-                continue
-            time.sleep(SETTLE_SEC)
-            chk = probe.ping_stats(6, ping_host)
-            if chk["avg"] is None:
-                print("[!] 切换后无法上网，自动回滚")
-                dev.set_band(cur_band)
+    try:
+        for kind, val in todo:
+            if kind == "band":
+                print(f"\n[应用] 锁定 {_band_label(val)} …")
+                try:
+                    dev.set_band(val)
+                except Unsupported as e:
+                    print(f"[跳过] {e}")
+                    continue
                 time.sleep(SETTLE_SEC)
-                failed = True
-                break
-            print(f"[√] 已生效，延迟 {chk['avg']}ms")
-        else:
-            print(f"\n[应用] 切换 WiFi 信道到 {val} …")
-            try:
-                dev.set_channel(val)
-            except Unsupported as e:
-                print(f"[跳过] {e}")
-                continue
-            time.sleep(5)
-            got = dev.get_state()["channel"]
-            if got != val:
-                print(f"[!] 信道未生效（当前 {got}），恢复原值")
-                dev.set_channel(cur_ch)
-                failed = True
+                chk = probe.ping_stats(6, ping_host)
+                if chk["avg"] is None:
+                    print("[!] 切换后无法上网，自动回滚")
+                    dev.set_band(cur_band)
+                    time.sleep(SETTLE_SEC)
+                    failed = True
+                    break
+                print(f"[√] 已生效，延迟 {chk['avg']}ms")
             else:
-                print("[√] 已生效")
+                print(f"\n[应用] 切换 WiFi 信道到 {val} …")
+                try:
+                    dev.set_channel(val)
+                except Unsupported as e:
+                    print(f"[跳过] {e}")
+                    continue
+                time.sleep(5)
+                got = dev.get_state()["channel"]
+                if got != val:
+                    print(f"[!] 信道未生效（当前 {got}），恢复原值")
+                    dev.set_channel(cur_ch)
+                    failed = True
+                else:
+                    print("[√] 已生效")
+    except KeyboardInterrupt:
+        print("\n[!] 已中断")
+        failed = True
+    except Exception as e:  # noqa: BLE001
+        # 设备在切换瞬间失联时，写到一半就断了：说清楚当前可能的状态，
+        # 别甩一段 traceback 让人无从下手。
+        print(f"\n[×] 应用过程中设备无响应：{type(e).__name__}: {e}")
+        print("    设备可能已经切换成功，也可能还停在原频段。")
+        print("    等 30 秒后重跑 `python autotune.py` 看当前状态；"
+              "要强制回原样用 `python autotune.py --restore`。")
+        failed = True
 
-    end = dev.get_state()
+    try:
+        end = dev.get_state()
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[×] 改动已发出，但读不回设备状态（{type(e).__name__}）。")
+        print("    等 30 秒后跑 `python autotune.py` 确认实际状态。")
+        return 1
     append_log({"ts": datetime.now().isoformat(), "mode": "apply-plan",
                 "plan": plan.get("expected"), "before": {"band": cur_band, "channel": cur_ch},
                 "after": {"band": end["band"], "channel": end["channel"]}})
@@ -660,6 +778,12 @@ def main():
         cfg["ping_host"] = args.ping_host
         save_config(cfg)
 
+    # 动手测之前先确认「测速源真的下得动」。
+    # 实测踩过：整条链路 HTTPS 到 CDN 全失败（HTTP 正常），于是每个频段都测出
+    # 0 Mbps，工具据此推荐了错误的频段。先选源能把这类假结论挡在源头。
+    if not (args.watch or args.restore or args.apply_plan or args.list_drivers):
+        speed_url = probe.resolve_speed_url(speed_url)
+
     if args.watch:
         return watch(args, cfg)
 
@@ -785,7 +909,8 @@ def main():
                 results.append(r)
                 state = "可用" if r["ok"] else {
                     "no_signal": "无信号", "timeout": "注册超时",
-                    "no_data": "数据不通"}.get(r.get("reason"), "无服务")
+                    "no_data": "数据不通",
+                    "speed_fail": "测速失败"}.get(r.get("reason"), "无服务")
                 spread = (f"[{r['mbps_min']}~{r['mbps_max']}]"
                           if r["ok"] and r.get("rounds") else "")
                 print(f"      BAND {b:<2} {state:<5} {r['mbps']:>5} Mbps {spread:<12} "

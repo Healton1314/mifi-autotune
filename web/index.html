@@ -54,6 +54,9 @@
   .pl .val{font-variant-numeric:tabular-nums;text-align:right}
   .gain{color:#1D9E75;font-weight:600}
   .flat{color:#8A8A85}
+  .warnbox{margin-top:10px;padding:10px 12px;border-radius:10px;background:#FFF6E5;
+    border:1px solid #F0D9A8;color:#7A5B12;font-size:12px;line-height:1.6}
+  .warnbox .dim{color:#9A8455;margin-top:4px}
   .note{font-size:11px;color:#8A8A85;margin-top:8px;line-height:1.5}
   .banner{background:#FDECEC;border:1px solid #F0C9C9;color:#A32D2D;border-radius:12px;
           padding:10px 12px;font-size:13px;margin-bottom:12px;line-height:1.55}
@@ -340,16 +343,24 @@ function renderPlan(p) {
 
   if (p.wifi) {
     const w = p.wifi, chChanged = t.channel !== w.current;
+    const nowCh = w.auto || !w.current ? "自动" : `${w.current}${w.cur_score != null ? `（干扰 ${w.cur_score}）` : ""}`;
     rows.push(
       `<div class="pl"><span class="lbl">信道</span><span class="val">` +
-      `${w.current}${w.cur_score != null ? `（干扰 ${w.cur_score}）` : ""}` +
+      `${nowCh}` +
       (chChanged ? ` <span class="gain">→ ${t.channel}（${w.best_score}）</span>`
                  : ` <span class="flat">保持</span>`) +
       `</span></div>`);
   }
 
+  // 测不准时要说清楚，不能拿一个假数字让人去断网重连
+  if (p.reliable === false && (p.caveats || []).length) {
+    rows.push(`<div class="warnbox"><b>这次结论不可信，先别照它改</b>` +
+      (p.caveats || []).map((c) => `<div>· ${c}</div>`).join("") +
+      `<div class="dim">通常是信号太差或测速源不可用，等信号好转再测一次。</div></div>`);
+  }
+
   $("planBody").innerHTML = rows.join("");
-  const changed = bandChanged || (p.wifi && t.channel !== p.wifi.current);
+  const changed = (p.reliable !== false) && (bandChanged || (p.wifi && t.channel !== p.wifi.current));
   const applied = !!p.applied_at;
   $("btnApplyPlan").style.display = (changed && !applied) ? "block" : "none";
 
