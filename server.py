@@ -25,6 +25,8 @@ WEB = HERE / "web"
 sys.path.insert(0, str(HERE))
 from drivers import detect  # noqa: E402
 import autotune  # noqa: E402
+import probe  # noqa: E402
+import scanner  # noqa: E402
 
 JOB = {"running": False, "lines": [], "kind": None, "started": None, "exit": None}
 JOB_LOCK = threading.Lock()
@@ -135,10 +137,11 @@ class Handler(SimpleHTTPRequestHandler):
     # ---------- API 实现 ----------
 
     def api_status(self):
+        cfg = autotune.load_config()
         dev = detect()
         st = dev.get_state()
         caps = dev.capabilities()
-        ping = autotune.ping_stats(6)
+        ping = probe.ping_stats(6, cfg["ping_host"])
         return {
             "driver": dev.name,
             "vendor": caps.get("vendor"),
@@ -154,10 +157,16 @@ class Handler(SimpleHTTPRequestHandler):
         }
 
     def api_scan(self):
-        aps = autotune.scan_2g(rounds=5, delay=3)
-        rows = autotune.score_channels(aps)
-        cur = detect().get_state()["channel"]
-        return {"current": cur, "best": rows[0]["ch"], "aps": aps, "scores": rows}
+        cfg = autotune.load_config()
+        dev = detect()
+        st = dev.get_state()
+        own = cfg.get("own_ssid") or scanner.connected_ssid() or st.get("ssid")
+        aps = scanner.scan_2g(rounds=5, delay=3, own_ssid=own)
+        if not aps:
+            return {"current": st["channel"], "best": None, "aps": [],
+                    "scores": [], "error": "没有扫到邻居 AP（系统语言不支持或无线网卡未启用）"}
+        rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
+        return {"current": st["channel"], "best": rows[0]["ch"], "aps": aps, "scores": rows}
 
 
 def lan_ip():

@@ -1,0 +1,140 @@
+"""跨平台测速 / 延迟探测层。
+
+设计要点：
+  1. 不解析本地化的摘要文字（"平均 = 12ms" / "Average = 12ms" / "rtt min/avg/max"），
+     改为数「有多少条回显行」，丢包率 = (发送 - 回显) / 发送。这样与系统语言无关。
+  2. 延迟值只从回显行的 time/时间 字段取；回显行靠 TTL 识别（TTL 是协议字段，
+     任何语言都不翻译）。
+  3. 测速剥掉代理环境变量，否则测到的是本地代理的带宽（此坑实测踩过）。
+"""
+
+import os
+import re
+import subprocess
+import sys
+import threading
+import urllib.request
+
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
+DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+DEFAULT_PING_HOST = "223.5.5.5"
+
+
+def _env():
+    return {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+
+
+def sh(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_env())
+    except Exception:  # noqa: BLE001
+        return ""
+    for enc in ("oem", "utf-8", "gbk", "latin-1"):
+        try:
+            return p.stdout.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return p.stdout.decode("utf-8", "ignore")
+
+
+def _ping_cmd(n, host):
+    if IS_WIN:
+        return ["ping", "-n", str(n), "-w", "2000", host]
+    if IS_MAC:
+        return ["ping", "-c", str(n), host]
+    return ["ping", "-c", str(n), "-W", "2", host]
+
+
+_RTT = re.compile(r"(?:time|时间|tiempo|temps|zeit|زمان)[=<]\s*([\d.,]+)\s*ms", re.I)
+_ANY_MS = re.compile(r"([\d.,]+)\s*ms", re.I)
+
+
+def ping_stats(n=10, host=DEFAULT_PING_HOST):
+    """返回 {avg, min, max, jitter, loss, sent, recv}；全部无回显时 avg=None。"""
+    out = sh(_ping_cmd(n, host), timeout=60 + n * 2)
+    rtts = []
+    for line in out.splitlines():
+        if "ttl" not in line.lower():
+            continue
+        m = _RTT.search(line) or _ANY_MS.search(line)
+        if m:
+            try:
+                rtts.append(float(m.group(1).replace(",", ".")))
+            except ValueError:
+                pass
+
+    recv = len(rtts)
+    loss = round(100.0 * (n - recv) / n) if n else 100
+    if not rtts:
+        return {"avg": None, "min": None, "max": None, "jitter": None,
+                "loss": 100, "sent": n, "recv": 0}
+    mean = sum(rtts) / len(rtts)
+    var = sum((x - mean) ** 2 for x in rtts) / len(rtts)
+    return {
+        "avg": int(round(mean)),
+        "min": int(round(min(rtts))),
+        "max": int(round(max(rtts))),
+        "jitter": round(var ** 0.5, 1),
+        "loss": loss,
+        "sent": n,
+        "recv": recv,
+    }
+
+
+# ---------------------------------------------------------------- 带宽
+
+
+def _curl():
+    from shutil import which
+    return which("curl")
+
+
+def _one_curl(url, secs):
+    import shutil as _s
+    p = subprocess.Popen(
+        [_curl(), "--noproxy", "*", "-L", "-s", "-o", _s.os.devnull,
+         "--max-time", str(secs), "-A", "Mozilla/5.0",
+         "-w", "%{size_download}", url],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_env())
+    try:
+        out, _ = p.communicate(timeout=secs + 15)
+        return int((out or b"0").decode("utf-8", "ignore").strip() or 0)
+    except Exception:  # noqa: BLE001
+        p.kill()
+        return 0
+
+
+def _one_urllib(url, secs):
+    """没有 curl 时的兜底（Windows 10+ / 主流 Linux 都自带 curl，很少走到这里）。"""
+    total = 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=secs) as r:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+    except Exception:  # noqa: BLE001
+        pass
+    return total
+
+
+def throughput(conn=4, secs=8, url=DEFAULT_SPEED_URL):
+    """多路并发下载，返回 Mbps。单线程测不出移动网络的上限，必须并发。"""
+    if not url:
+        return 0.0
+    if not _curl():
+        total = sum(_one_urllib(url, secs) for _ in range(conn))
+        return round(total * 8 / secs / 1e6, 1)
+
+    results, threads = [0] * conn, []
+    for i in range(conn):
+        t = threading.Thread(target=lambda idx: results.__setitem__(idx, _one_curl(url, secs)), args=(i,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return round(sum(results) * 8 / secs / 1e6, 1)

@@ -15,142 +15,58 @@
 
 import argparse
 import json
-import os
 import re
-import shutil
 import statistics
-import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+import probe
+import scanner
 from drivers import detect, list_drivers
 from drivers.base import Unsupported
 
 HERE = Path(__file__).resolve().parent
 STATE = HERE / "state.json"
 LOG = HERE / "autotune-log.jsonl"
+CONFIG = HERE / "config.json"
 
-OWN_SSID = "月亮糖"
-SPEED_URL = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
-PING_HOST = "223.5.5.5"
-
-ALL_BANDS = [3, 8, 38, 39, 40, 41]
-CANDIDATE_BANDS = [3, 40]          # 默认只测这两个（已验证可用，且覆盖多数场景）
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
 
-
-# ---------------- 基础工具 ----------------
-
-def _env():
-    return {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
-
-
-def sh(cmd, timeout=60):
-    try:
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_env())
-        for enc in ("utf-8", "gbk", "cp936"):
-            try:
-                return p.stdout.decode(enc)
-            except UnicodeDecodeError:
-                continue
-        return p.stdout.decode("utf-8", "ignore")
-    except Exception:
-        return ""
+DEFAULT_CONFIG = {
+    "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
+    "speed_url": probe.DEFAULT_SPEED_URL,
+    "ping_host": probe.DEFAULT_PING_HOST,
+    "candidate_bands": [3, 40],     # 默认只测这两个，--bands all 才全测
+}
 
 
-CURL = shutil.which("curl") or "curl"
+# ---------------- 配置 ----------------
 
-
-def ping_stats(n=10):
-    out = sh(["ping", "-n", str(n), PING_HOST], timeout=60)
-    avg = re.search(r"(?:平均|Average)\s*=\s*(\d+)ms", out)
-    loss = re.search(r"\((\d+)%", out)
-    mx = re.search(r"(?:最长|Maximum)\s*=\s*(\d+)ms", out)
-    return {
-        "avg": int(avg.group(1)) if avg else None,
-        "max": int(mx.group(1)) if mx else None,
-        "loss": int(loss.group(1)) if loss else (100 if not avg else None),
-    }
-
-
-def throughput(conn=4, secs=8):
-    """多路并发下载，返回 Mbps。"""
-    procs = []
-    for _ in range(conn):
-        procs.append(subprocess.Popen(
-            [CURL, "--noproxy", "*", "-L", "-s", "-o", "NUL",
-             "--max-time", str(secs), "-A", "Mozilla/5.0",
-             "-w", "%{size_download}", SPEED_URL],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_env()))
-    total = 0
-    for p in procs:
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG.exists():
         try:
-            out, _ = p.communicate(timeout=secs + 15)
-            total += int((out or b"0").decode("utf-8", "ignore").strip() or 0)
-        except Exception:
-            p.kill()
-    return round(total * 8 / secs / 1e6, 1)
+            cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            pass
+    return cfg
 
 
-# ---------------- 2.4G 信道 ----------------
-
-def scan_2g(rounds=5, delay=3, min_hits=2):
-    """多轮扫描合并。单次 netsh 扫描是缓存式的、必然漏 AP，所以：
-    - 每轮独立扫描，同一 AP 取多轮信号强度的中位数
-    - 只在 >= min_hits 轮里出现的 AP 才计入（滤掉一闪而过的幽灵 AP）
-    """
-    samples = {}
-    for i in range(rounds):
-        if i:
-            time.sleep(delay)
-        out = sh(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=60)
-        ssid = band = sig = None
-        for line in out.splitlines():
-            s = line.strip()
-            m = re.match(r"^SSID\s+\d+\s*:\s*(.*)$", s)
-            if m:
-                ssid, band, sig = m.group(1).strip(), None, None
-                continue
-            if re.match(r"^信号\s*:", s):
-                sig = int(re.sub(r"[^\d]", "", s.split(":", 1)[1]) or 0)
-            elif re.match(r"^波段\s*:", s):
-                band = s.split(":", 1)[1].strip()
-            elif re.match(r"^(频道|信道)\s*:", s):
-                v = re.sub(r"[^\d]", "", s.split(":", 1)[1])
-                if ssid and band and v and "2.4" in band and ssid != OWN_SSID:
-                    samples.setdefault((ssid, int(v)), []).append(sig or 0)
-                sig = band = None
-    aps = []
-    for (ssid, ch), sigs in samples.items():
-        if len(sigs) < min_hits:
-            continue
-        aps.append({"ssid": ssid, "ch": ch,
-                    "sig": int(statistics.median(sigs)), "hits": len(sigs)})
-    return aps
+def save_config(cfg):
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def freq(ch):
-    return 2412 + (ch - 1) * 5
+def save_state(payload):
+    STATE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def score_channels(aps):
-    rows = []
-    for ch in range(1, 14):
-        total, detail = 0.0, []
-        for ap in aps:
-            gap = abs(freq(ap["ch"]) - freq(ch))
-            ov = 20 if gap == 0 else max(0, 20 - gap)
-            if ov <= 0:
-                continue
-            total += (ap["sig"] / 100.0) ** 2 * (ov / 20.0)
-            detail.append((ap["ssid"], ap["ch"], ap["sig"], ov))
-        rows.append({"ch": ch, "score": round(total, 2), "detail": detail})
-    rows.sort(key=lambda r: r["score"])
-    return rows
+def append_log(entry):
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # ---------------- LTE 频段 ----------------
@@ -159,10 +75,10 @@ def set_and_settle(dev, band):
     """锁定频段并等待重新注册。"""
     dev.set_band(band)
     time.sleep(SETTLE_SEC)
-    return ping_stats(6)
+    return probe.ping_stats(6)
 
 
-def measure_band(dev, band, rounds=3):
+def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """单频段多轮实测，取中位数，同时保留离散度用于判断可信程度。
 
     单轮容易撞上瞬时限速或基站调度抖动，所以至少 3 轮；
@@ -172,20 +88,21 @@ def measure_band(dev, band, rounds=3):
     if st["avg"] is None or st["loss"] == 100:
         return {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
                 "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-                "loss": 100, "rounds": 0}
+                "jitter": None, "loss": 100, "rounds": 0}
 
     samples = []
     for i in range(rounds):
-        mbps = throughput(4, 8)
-        p = ping_stats(10)
-        samples.append((mbps, p["avg"], p["max"], p["loss"]))
+        mbps = probe.throughput(4, 8, speed_url)
+        p = probe.ping_stats(10, ping_host)
+        samples.append((mbps, p["avg"], p["max"], p["jitter"], p["loss"]))
         if i < rounds - 1:
             time.sleep(1.5)
 
     mbps_list = [s[0] for s in samples]
     avg_list = [s[1] for s in samples if s[1] is not None]
     max_list = [s[2] for s in samples if s[2] is not None]
-    loss_list = [s[3] for s in samples if s[3] is not None]
+    jit_list = [s[3] for s in samples if s[3] is not None]
+    loss_list = [s[4] for s in samples if s[4] is not None]
     return {
         "band": band, "ok": True,
         "mbps": round(statistics.median(mbps_list), 1),
@@ -193,44 +110,34 @@ def measure_band(dev, band, rounds=3):
         "mbps_min": min(mbps_list), "mbps_max": max(mbps_list),
         "avg": int(statistics.median(avg_list)) if avg_list else None,
         "max": max(max_list) if max_list else None,
+        "jitter": statistics.median(jit_list) if jit_list else None,
         "loss": max(loss_list) if loss_list else 0,
         "rounds": len(samples),
     }
 
 
-# ---------------- 状态保存 ----------------
-
-def save_state(payload):
-    STATE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_state():
-    if STATE.exists():
-        return json.loads(STATE.read_text(encoding="utf-8"))
-    return None
-
-
-def append_log(entry):
-    with LOG.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="随身WiFi 自动调优")
+    cfg = load_config()
+
+    ap = argparse.ArgumentParser(description="随身WiFi 自动调优（跨平台）")
     ap.add_argument("--apply", action="store_true", help="实际应用最优设置（默认只检测）")
     ap.add_argument("--wifi-only", action="store_true", help="只优化 WiFi 信道")
     ap.add_argument("--lte-only", action="store_true", help="只优化 LTE 频段")
     ap.add_argument("--bands", default="default", help="default / all / 逗号分隔，如 3,40,41")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
     ap.add_argument("--host", default="192.168.0.1", help="设备管理地址")
-    ap.add_argument("--rounds", type=int, default=3, help="每个频段的测量轮数（默认 3，取中位数）")
-    ap.add_argument("--scan-rounds", type=int, default=5, help="信道扫描轮数（默认 5，合并并滤除幽灵 AP）")
     ap.add_argument("--user", default="admin", help="后台账号")
     ap.add_argument("--password", default="admin", help="后台密码")
     ap.add_argument("--driver", default=None, help="指定驱动名（默认自动探测）")
     ap.add_argument("--list-drivers", action="store_true", help="列出已登记的驱动")
+    ap.add_argument("--ssid", default=None,
+                    help="自己设备的 WiFi 名称，扫描时排除（默认自动识别，识别不到则不过滤）")
+    ap.add_argument("--speed-url", default=None, help="测速下载地址（默认 Cloudflare，国内可换国内镜像）")
+    ap.add_argument("--ping-host", default=None, help="延迟探测目标（默认 223.5.5.5）")
+    ap.add_argument("--rounds", type=int, default=3, help="每个频段的测量轮数（默认 3，取中位数）")
+    ap.add_argument("--scan-rounds", type=int, default=5, help="信道扫描轮数（默认 5，合并并滤除幽灵 AP）")
     args = ap.parse_args()
 
     if args.list_drivers:
@@ -239,6 +146,15 @@ def main():
             print(f"  {d['name']:<12} {d['description']}")
         print("\n新增机型：参考 drivers/template.py，在 drivers/__init__.py 里登记一行。")
         return 0
+
+    speed_url = args.speed_url or cfg["speed_url"]
+    ping_host = args.ping_host or cfg["ping_host"]
+    if args.speed_url:
+        cfg["speed_url"] = args.speed_url
+        save_config(cfg)
+    if args.ping_host:
+        cfg["ping_host"] = args.ping_host
+        save_config(cfg)
 
     try:
         dev = detect(args.host, args.user, args.password, name=args.driver)
@@ -290,75 +206,102 @@ def main():
     # --- WiFi ---
     best_ch = None
     if not args.lte_only:
-        print(f"\n[1/2] 扫描周边 2.4G 信道（{args.scan_rounds} 轮合并，滤除出现不足 2 轮的幽灵 AP）…")
-        aps = scan_2g(rounds=args.scan_rounds)
-        print(f"      发现 {len(aps)} 个邻居 AP")
-        rows = score_channels(aps)
-        cur_score = next((r["score"] for r in rows if r["ch"] == cur_ch), None)
-        best = rows[0]
-        best_ch = best["ch"]
-        print(f"      当前信道 {cur_ch} 评分 {cur_score} ｜ 最优信道 {best_ch} 评分 {best['score']}")
-        if best["detail"]:
-            print("      最优信道的重叠源：" + "；".join(
-                f"{n}(ch{c},{s}%,重叠{o}MHz)" for n, c, s, o in best["detail"]))
+        own = args.ssid or cfg.get("own_ssid") or scanner.connected_ssid() or st0.get("ssid")
+        if own and own != cfg.get("own_ssid"):
+            cfg["own_ssid"] = own
+            save_config(cfg)
+        print(f"\n[1/2] 扫描周边 2.4G 信道（{args.scan_rounds} 轮合并，"
+              f"出现不足 2 轮的 AP 视为幽灵丢弃）…")
+        aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
+        if own:
+            print(f"      已排除自己的 AP「{own}」")
+        elif aps:
+            # 没连自己的 WiFi（例如走 USB）时无法直接识别，退化为「信号最强的那台大概率是自己」
+            guess = aps.pop(0)
+            print(f"      未指定自己的 SSID，按信号最强猜为「{guess['ssid']}」并已排除")
+            print(f"      猜错会明显影响结论，建议固定：--ssid {guess['ssid']}")
+
+        if not aps:
+            print("      [!] 没有扫到任何邻居 AP。")
+            print("          可能是系统语言不在支持列表里，或无线网卡被占用/未启用。")
+            print("          本次跳过信道优化（宁可不改，也不能拿空数据乱改）。")
+            report["wifi"] = {"supported": False, "reason": "no_ap_found"}
         else:
-            print("      最优信道无重叠")
-        report["wifi"] = {"current": cur_ch, "cur_score": cur_score,
-                          "best": best_ch, "best_score": best["score"],
-                          "neighbors": aps}
+            print(f"      发现 {len(aps)} 个邻居 AP")
+            chs = caps.get("channels") or list(range(1, 14))
+            rows = scanner.score_channels(aps, chs)
+            cur_score = next((r["score"] for r in rows if r["ch"] == cur_ch), None)
+            best = rows[0]
+            best_ch = best["ch"]
+            print(f"      当前信道 {cur_ch} 评分 {cur_score} ｜ 最优信道 {best_ch} 评分 {best['score']}")
+            if best["detail"]:
+                print("      最优信道的重叠源：" + "；".join(
+                    f"{n}(ch{c},{s}%,重叠{o}MHz)" for n, c, s, o in best["detail"]))
+            else:
+                print("      最优信道无重叠")
+            report["wifi"] = {"current": cur_ch, "cur_score": cur_score,
+                              "best": best_ch, "best_score": best["score"],
+                              "neighbors": aps}
 
     # --- LTE ---
     best_band = None
     if not args.wifi_only:
         if not args.apply:
-            st = ping_stats(8)
+            st = probe.ping_stats(8, ping_host)
             print(f"\n[2/2] LTE 当前频段：{'未锁定' if cur_band == 0 else 'BAND ' + str(cur_band)}"
-                  f"  延迟 {st['avg']}ms  丢包 {st['loss']}%")
+                  f"  延迟 {st['avg']}ms  抖动 {st['jitter']}ms  丢包 {st['loss']}%")
             print("      （频段实测需要逐个切换，会断网，因此只在 --apply 时执行）")
             report["lte"] = {"current": cur_band, "probed": False}
+        elif not caps.get("can_lock_band"):
+            print("\n[2/2] 该机型不支持锁定频段，跳过（只优化 WiFi）。")
+            report["lte"] = {"supported": False}
         else:
-            if not caps.get("can_lock_band"):
-                print("\n[2/2] 该机型不支持锁定频段，跳过（只优化 WiFi）。")
-                report["lte"] = {"supported": False}
+            cand = cfg.get("candidate_bands") or [3, 40]
+            if args.bands == "all":
+                bands = list(caps["bands"])
+            elif args.bands != "default":
+                bands = [int(x) for x in args.bands.split(",")]
             else:
-                bands = (caps["bands"] if args.bands == "all"
-                         else [int(x) for x in args.bands.split(",")] if args.bands != "default"
-                         else [b for b in CANDIDATE_BANDS if b in caps["bands"]] or caps["bands"][:2])
-                per = SETTLE_SEC + args.rounds * 18 + 5
-                print(f"\n[2/2] 实测 LTE 频段 {bands}（每频段 {args.rounds} 轮取中位数，"
-                      f"约 {per} 秒/个，期间会短暂断网）…")
-                results = []
-                for b in bands:
-                    r = measure_band(dev, b, rounds=args.rounds)
-                    results.append(r)
-                    state = "可用" if r["ok"] else "无服务"
-                    spread = (f"[{r['mbps_min']}~{r['mbps_max']}]"
-                              if r["ok"] and r.get("rounds") else "")
-                    print(f"      BAND {b:<2} {state:<5} {r['mbps']:>5} Mbps {spread:<12} "
-                          f"延迟 {r['avg']}ms  峰值 {r['max']}ms  丢包 {r['loss']}%")
-                usable = [r for r in results if r["ok"]]
-                report["lte"] = results
-                if usable:
-                    usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
-                    best_res = usable[0]
-                    best_band = best_res["band"]
-                    print(f"\n      最优频段：BAND {best_band}"
-                          f"（中位 {best_res['mbps']} Mbps，单轮 {best_res['mbps_all']}）")
-                    cur_res = next((r for r in results if r["band"] == cur_band), None)
-                    if (cur_res and cur_res["ok"] and best_band != cur_band
-                            and best_res["mbps"] - cur_res["mbps"] < MIN_BAND_GAIN_MBPS):
-                        print(f"      但相比当前 BAND {cur_band}（{cur_res['mbps']} Mbps）"
-                              f"提升不足 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
-                        best_band = cur_band
-                else:
-                    print("\n      [!] 所有频段都不通，回滚到未锁定")
-                    best_band = 0
+                bands = [b for b in cand if b in caps["bands"]] or list(caps["bands"])[:2]
+            per = SETTLE_SEC + args.rounds * 18 + 5
+            print(f"\n[2/2] 实测 LTE 频段 {bands}（每频段 {args.rounds} 轮取中位数，"
+                  f"约 {per} 秒/个，期间会短暂断网）…")
+            results = []
+            for b in bands:
+                r = measure_band(dev, b, rounds=args.rounds,
+                                 speed_url=speed_url, ping_host=ping_host)
+                results.append(r)
+                state = "可用" if r["ok"] else "无服务"
+                spread = (f"[{r['mbps_min']}~{r['mbps_max']}]"
+                          if r["ok"] and r.get("rounds") else "")
+                print(f"      BAND {b:<2} {state:<5} {r['mbps']:>5} Mbps {spread:<12} "
+                      f"延迟 {r['avg']}ms  峰值 {r['max']}ms  丢包 {r['loss']}%")
+            usable = [r for r in results if r["ok"]]
+            report["lte"] = results
+            if usable:
+                usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
+                best_res = usable[0]
+                best_band = best_res["band"]
+                print(f"\n      最优频段：BAND {best_band}"
+                      f"（中位 {best_res['mbps']} Mbps，单轮 {best_res['mbps_all']}）")
+                cur_res = next((r for r in results if r["band"] == cur_band), None)
+                if (cur_res and cur_res["ok"] and best_band != cur_band
+                        and best_res["mbps"] - cur_res["mbps"] < MIN_BAND_GAIN_MBPS):
+                    print(f"      但相比当前 BAND {cur_band}（{cur_res['mbps']} Mbps）"
+                          f"提升不足 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
+                    best_band = cur_band
+            else:
+                print("\n      [!] 所有频段都不通，回滚到未锁定")
+                best_band = 0
 
     # --- 决策 ---
     print("\n" + "-" * 56)
-    do_ch = (caps.get("can_set_channel", True) and best_ch is not None and best_ch != cur_ch and
-             report["wifi"]["cur_score"] - report["wifi"]["best_score"] >= MIN_CHANNEL_GAIN)
-    do_band = (best_band is not None and best_band != cur_band)
+    do_ch = bool(
+        caps.get("can_set_channel", True) and best_ch is not None and best_ch != cur_ch
+        and report.get("wifi", {}).get("cur_score") is not None
+        and report["wifi"]["cur_score"] - report["wifi"]["best_score"] >= MIN_CHANNEL_GAIN
+    )
+    do_band = best_band is not None and best_band != cur_band
     print(f"建议：信道 {cur_ch} -> {best_ch if do_ch else '保持'} ｜ "
           f"频段 {'未锁定' if cur_band == 0 else 'BAND ' + str(cur_band)} -> "
           f"{('BAND ' + str(best_band)) if do_band else '保持'}")
@@ -376,7 +319,7 @@ def main():
         print(f"\n[应用] 锁定 BAND {best_band} …")
         dev.set_band(best_band)
         time.sleep(SETTLE_SEC)
-        chk = ping_stats(6)
+        chk = probe.ping_stats(6, ping_host)
         if chk["avg"] is None:
             print("[!] 切换后无法上网，回滚到原频段")
             dev.set_band(cur_band)
