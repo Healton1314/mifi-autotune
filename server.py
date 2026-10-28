@@ -58,6 +58,38 @@ def web_dir():
     raise SystemExit("找不到面板静态文件 web/，请从源码目录运行，或重新安装本包。")
 
 
+# ---------- 手机独立运行的安装包 ----------
+#
+# 一次性把代码送到手机上，之后手机自己跑（Termux），不再依赖这台电脑。
+# 为什么不走 git clone：实测这条链路上 HTTPS 到 GitHub 会被 reset，
+# 而同一局域网内的 HTTP 下载稳定可用。
+PHONE_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "env", "dist", "build",
+                   ".idea", ".vscode", "tests"}
+PHONE_SKIP_FILES = {"state.json", "config.json", "plan.json", "autotune-log.jsonl",
+                    ".panel-token"}
+
+
+def build_phone_package():
+    """把当前代码打成 zip（排除运行期产物与本机配置）。"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(HERE.rglob("*")):
+            rel = p.relative_to(HERE)
+            if set(rel.parts) & PHONE_SKIP_DIRS:
+                continue
+            if any(part.endswith(".egg-info") for part in rel.parts):
+                continue
+            if p.is_dir() or p.name in PHONE_SKIP_FILES:
+                continue
+            if p.suffix in (".pyc", ".zip"):
+                continue
+            z.write(p, str(Path("mifi-autotune") / rel))
+    return buf.getvalue()
+
+
 def load_token(explicit=None):
     """决定本次使用的令牌，并把它**持久化**到 .panel-token。
 
@@ -266,6 +298,21 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
+        # 手机安装包：不打令牌校验，因为拿到它的目的就是「在手机上装一个独立副本」，
+        # 而 Termux 里没有浏览器的 Cookie。里面只有源码（和 GitHub 上那份一样），
+        # 不含 config.json / plan.json / .panel-token 等本机数据。
+        if path == "/api/phone-package":
+            data = build_phone_package()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="mifi-autotune-phone.zip"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if path.startswith("/api/"):
             if not self._authorized():
                 return self._deny()
@@ -291,6 +338,17 @@ class Handler(SimpleHTTPRequestHandler):
                         snap["elapsed"] = (round(time.time() - JOB["started"])
                                            if JOB["started"] and JOB["running"] else None)
                     return self._json(snap)
+                if path == "/api/phone-package":
+                    data = build_phone_package()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Disposition",
+                                     'attachment; filename="mifi-autotune-phone.zip"')
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
             except (LookupError, OSError) as e:
                 return self._json({"error": str(e)}, 503)
             except Exception as e:  # noqa: BLE001

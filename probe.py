@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
@@ -64,6 +65,27 @@ _RTT = re.compile(r"(?:time|时间|tiempo|temps|zeit|زمان)[=<]\s*([\d.,]+)\s
 _ANY_MS = re.compile(r"([\d.,]+)\s*ms", re.I)
 
 
+def _tcp_latency(n, host, port=53, timeout=2.0):
+    """用 TCP 连接握手耗时当延迟，替代 ping。
+
+    为什么必须有这条路：Android 上普通进程拿不到 ICMP（需要 root），
+    Termux 里也未必装了 iputils 的 ping。没有它，手机上所有频段都会被判成
+    「有信号但数据不通」，工具等于废掉。
+    TCP 握手耗时与 RTT 基本一致，对「能不能上、稳不稳」的判断足够用。
+    """
+    import socket
+    rtts = []
+    for _ in range(n):
+        t0 = time.time()
+        try:
+            s = socket.create_connection((host, port), timeout=timeout)
+            s.close()
+            rtts.append((time.time() - t0) * 1000)
+        except OSError:
+            pass
+    return rtts
+
+
 def ping_stats(n=10, host=DEFAULT_PING_HOST):
     """返回 {avg, min, max, jitter, loss, sent, recv}；全部无回显时 avg=None。"""
     out = sh(_ping_cmd(n, host), timeout=60 + n * 2)
@@ -78,11 +100,17 @@ def ping_stats(n=10, host=DEFAULT_PING_HOST):
             except ValueError:
                 pass
 
+    method = "icmp"
+    if not rtts:
+        # ICMP 用不了（Android/权限受限/没装 ping）→ 退回 TCP 握手测延迟
+        rtts = _tcp_latency(n, host, port=53)
+        method = "tcp"
+
     recv = len(rtts)
     loss = round(100.0 * (n - recv) / n) if n else 100
     if not rtts:
         return {"avg": None, "min": None, "max": None, "jitter": None,
-                "loss": 100, "sent": n, "recv": 0}
+                "loss": 100, "sent": n, "recv": 0, "method": method}
     mean = sum(rtts) / len(rtts)
     var = sum((x - mean) ** 2 for x in rtts) / len(rtts)
     return {
@@ -93,6 +121,7 @@ def ping_stats(n=10, host=DEFAULT_PING_HOST):
         "loss": loss,
         "sent": n,
         "recv": recv,
+        "method": method,
     }
 
 
