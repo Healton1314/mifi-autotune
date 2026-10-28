@@ -1,0 +1,6 @@
+# shell 脚本必须是 LF：CRLF 会让 Termux/Linux 上的 shebang 变成
+# "/data/data/.../bash\r: bad interpreter"
+*.sh text eol=lf
+*.bat text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
