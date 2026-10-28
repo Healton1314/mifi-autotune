@@ -410,14 +410,15 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 # 1. 装 Termux（F-Droid 或应用商店搜，选 F-Droid 版更省心）
 
 # 2. 让手机拿到代码。两种来源任选：
-#    a) 电脑上的面板还没关：打开面板，点「下载手机安装包」，或在 Termux 里直接
-curl -o p.zip http://<电脑局域网IP>:8787/api/phone-package
+#    a) 电脑上的面板还没关：用它现成的安装包（推荐，这条路不依赖外网）
+python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('http://<电脑局域网IP>:8787/api/phone-package').read())"
 #    b) 能从 GitHub 下载的话
 #       curl -L -o p.zip https://github.com/Healton1314/mifi-autotune/archive/refs/heads/main.zip
 
-# 3. 在 Termux 里装
+# 3. 在 Termux 里装（不需要 curl，python 自带解压）
 pkg install -y python
-python -m zipfile -e p.zip ~/ && bash ~/mifi-autotune/phone/install.sh
+python -m zipfile -e p.zip ~
+bash ~/mifi-autotune/phone/install.sh
 ```
 
 `install.sh` 会做三件事：装 Python、把代码放到 `~/mifi-autotune`、创建 `mifi` 命令。

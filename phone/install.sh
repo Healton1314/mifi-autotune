@@ -42,17 +42,33 @@ if ! command -v termux-wifi-scaninfo >/dev/null 2>&1; then
 fi
 
 # ---- 2. 取安装包 ----
-say "[2/4] 从 $PANEL 取安装包…"
-if [ -f "./mifi-autotune-phone.zip" ]; then
-  cp "./mifi-autotune-phone.zip" "$TMP" && say "      用当前目录的安装包"
+# 优先级：脚本参数指定的 zip > 当前目录 > ~/p.zip > 从面板下载
+# 为什么要支持本地 zip：手机上 curl 未必装好，而 python -m zipfile 一定有，
+# 所以「先下载再解包再装」这条路不需要 curl。
+say "[2/4] 准备安装包…"
+PKG="${1:-}"
+if [ -z "$PKG" ]; then
+  for cand in "./mifi-autotune-phone.zip" "$HOME/p.zip" "$HOME/mifi-autotune-phone.zip"; do
+    [ -f "$cand" ] && PKG="$cand" && break
+  done
+fi
+
+if [ -n "$PKG" ] && [ -f "$PKG" ]; then
+  cp "$PKG" "$TMP" && say "      用本地的包：$PKG"
 else
-  # 优先用 python 下载（Termux 里 curl 未必装，python 一定在）
+  say "      从 $PANEL 下载…"
+  # python 一定在（第一步刚装好），比 curl 可靠
   python - "$PANEL/api/phone-package" "$TMP" <<'PY' || die "[×] 下载失败：确认手机连着随身WiFi，且电脑上的面板开着。"
 import sys, urllib.request
 url, out = sys.argv[1], sys.argv[2]
-with urllib.request.urlopen(url, timeout=20) as r, open(out, "wb") as f:
-    f.write(r.read())
-print("      已下载", out)
+with urllib.request.urlopen(url, timeout=30) as r, open(out, "wb") as f:
+    n = 0
+    while True:
+        chunk = r.read(65536)
+        if not chunk:
+            break
+        f.write(chunk); n += len(chunk)
+print("      已下载 %d 字节" % n)
 PY
 fi
 
