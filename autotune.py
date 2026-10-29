@@ -188,6 +188,51 @@ def _signal_usable(st):
     return int(m.group()) < 0          # RSRP 一定是负值，0/正数都代表无效
 
 
+SIG_RSRP_WEAK = -110     # 低于这个：基本没法用（覆盖不足）
+SIG_RSRP_OK = -100       # 高于这个：覆盖够用
+SIG_SINR_BAD = 3         # 低于等于这个：干扰很重
+SIG_SINR_OK = 10         # 高于等于这个：信号干净
+
+
+def _num(v):
+    m = re.search(r"-?\d+(?:\.\d+)?", str(v or ""))
+    return float(m.group()) if m else None
+
+
+def diagnose_signal(sig):
+    """按 RSRP / SINR 判断「换频段到底有没有用」。
+
+    为什么要单独诊断：用户看到「本次不改动」时无从判断是「工具测不准」
+    还是「环境真没救」。实测（2026-10-29）同一位置隔一小时，RSRP 从 -118dBm
+    回到 -94dBm，两种情形下换频段的收益完全不同，必须区分：
+
+      · 覆盖不足（RSRP ≤ -110）  → 所有频段都不会好，换频段救不了，挪位置才行
+      · 干扰主导（SINR ≤ 3）     → 覆盖够但信号脏，换频段成功率高
+      · 两者都好                 → 环境本来不差，切换收益有限
+
+    返回 None 表示设备没报出可解析的信号值（不能猜）。
+    """
+    rsrp = _num((sig or {}).get("rsrp"))
+    if rsrp is None or rsrp >= 0:       # 0 / 正数都是"无服务"的写法
+        return None
+    sinr = _num((sig or {}).get("sinr"))
+    head = f"RSRP {rsrp:g}dBm" + (f"、SINR {sinr:g}dB" if sinr is not None else "")
+
+    if rsrp <= SIG_RSRP_WEAK:
+        return {"level": "weak", "text": f"{head} —— 覆盖不足",
+                "advice": "这个强度换频段救不了（哪个频段都会很差）。"
+                          "把设备挪到窗边、抬高、避开金属和承重墙，比任何软件调优都有效。"}
+    if sinr is not None and sinr <= SIG_SINR_BAD:
+        return {"level": "noisy", "text": f"{head} —— 覆盖够但干扰重",
+                "advice": "属于「干扰主导」：这类环境下换频段收益通常明显，"
+                          "如果下面给出了切换建议，值得照做。"}
+    if rsrp >= SIG_RSRP_OK and (sinr is None or sinr >= SIG_SINR_OK):
+        return {"level": "good", "text": f"{head} —— 信号良好",
+                "advice": "环境本来就不差，切换频段的收益有限，别指望大幅提速。"}
+    return {"level": "ok", "text": head,
+            "advice": "信号中等，切换效果取决于目标频段当时的负载。"}
+
+
 def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
     """等设备在目标频段重新注册，并尽快识别"这个频段根本没信号"。
 
@@ -866,6 +911,8 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
 
     target = {"band": picked["band"] if picked else cur_band,
               "channel": wifi["best"] if do_ch else cur_ch}
+    # 信号诊断：既写进 plan.json（面板要显示），也决定「不改动」时该怎么解释。
+    diag = diagnose_signal(st0.get("signal") or {})
     plan.update({
         "target": target,
         "strategy": strategy,
@@ -875,6 +922,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         "caveats": caveats,
         "lte": lte,
         "wifi": wifi,
+        "signal": diag,
         "expected": {
             "band_from": cmp_band, "band_locked": cur_band, "band_to": target["band"],
             "mbps_now": cur_mbps, "mbps_best": best_mbps,
@@ -900,6 +948,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     print("\n" + "=" * 56)
     print("体检结论")
     print("=" * 56)
+    # 先给信号诊断：用户看到「不改动」时，需要知道是「环境真没救」还是「工具没测准」。
+    if diag:
+        print(f"  信号：{diag['text']}")
+        print(f"        {diag['advice']}")
     if cur_mbps is not None or best_mbps is not None:
         if cur_mbps is not None:
             now_s = f"{cur_mbps} Mbps"
@@ -1564,6 +1616,10 @@ def main():
             print("网络：测不到回应（可能正在注册或没有数据通路）")
         else:
             print(f"网络：延迟 {p['avg']}ms ｜ 抖动 {p['jitter']}ms ｜ 丢包 {p['loss']}%")
+        diag = diagnose_signal(st0.get("signal") or {})
+        if diag:
+            print(f"\n信号判读：{diag['text']}")
+            print(f"          {diag['advice']}")
         print("\n想看「能提升多少」就跑：mifi        （体检约 3~6 分钟）")
         if not probe.is_termux():
             # 只在电脑上提示：手机端没有 ICMP 权限，这项在手机上做不了。
