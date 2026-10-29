@@ -51,7 +51,10 @@ class TestPhonePackage(unittest.TestCase):
         if not bat:
             self.skipTest("包内没有 .bat")
         for name in bat:
-            src = ROOT / name.removeprefix("mifi-autotune/")
+            # 不能用 str.removeprefix（3.9+），CI 要跑 3.8 —— 会直接
+            # AttributeError: 'str' object has no attribute 'removeprefix'。
+            rel = name[len("mifi-autotune/"):] if name.startswith("mifi-autotune/") else name
+            src = ROOT / rel
             self.assertEqual(self.zip.read(name), src.read_bytes(),
                              f"{name} 被打包过程改动了")
 

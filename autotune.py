@@ -1538,9 +1538,15 @@ def main():
             print(f"（已排除自己的 AP：{own}）")
         rows = scanner.score_channels(aps)
         print(f"\n扫到 {len(aps)} 个 AP。各信道干扰分（0 最好，越低越干净）：")
-        for r in rows[:5]:
+        shown = rows[:5]
+        for r in shown:
             print(f"  信道 {r['ch']:>2}   干扰分 {r['score']}")
         best = rows[0]
+        # 最干净的信道经常不在上面几条里（那正是它干净的原因）。
+        # 不说明的话，用户会以为「7 号没扫到」或「工具算错了」——实机反馈过。
+        if best["ch"] not in {r["ch"] for r in shown}:
+            print(f"  …只列干扰最高的 5 个；最干净的 {best['ch']} 号不在其中，"
+                  f"正因为附近没人用")
         print(f"\n最干净：信道 {best['ch']}（干扰分 {best['score']}）")
         print("这里只扫描，不会改设备。想连频段一起优化就跑 `mifi`。")
         return 0
