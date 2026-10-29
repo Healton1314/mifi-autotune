@@ -164,7 +164,51 @@ def freq_to_channel(freq):
     return None
 
 
-_LAST_TERMUX = {"stdout": "", "stderr": "", "code": None}
+_LAST_TERMUX = {"stdout": "", "stderr": "", "code": None, "timeout": False, "ts": 0.0}
+
+
+def _termux_recent(max_age=180):
+    """拿最近一次 termux-wifi-scaninfo 的结果；没有新鲜的就现跑一次。
+
+    「失败提示」和「原始信息」各自都要这份结果。手机卡死时一次调用要等满
+    60 秒，不复用就等于让用户白等两分钟才看到同一句话。
+    """
+    if _LAST_TERMUX["ts"] and time.time() - _LAST_TERMUX["ts"] < max_age:
+        return _LAST_TERMUX["stdout"], _LAST_TERMUX["stderr"], _LAST_TERMUX["code"]
+    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=60)
+    _LAST_TERMUX.update(stdout=out, stderr=err, code=code,
+                        timeout="timed out" in (err or "").lower(),
+                        ts=time.time())
+    return out, err, code
+
+
+_BRIDGE_CACHE = {"ok": None, "ts": 0.0}
+
+
+def _api_bridge_ok(timeout=8):
+    """探一下 Termux:API 这座「桥」本身通不通。
+
+    手机上 termux-wifi-scaninfo 卡死（超时）有两种完全不同的原因，两者的
+    修法也完全不同，只看扫描的报错分不出来：
+
+      · Termux:API 这个 App 没装 / 被系统冻结 → 任何 API 命令都会卡住
+      · App 是活的，但没给定位权限         → 扫描会立刻返回空或报 permission
+
+    所以先用最轻的 termux-battery-status 敲一下门：
+      True  = 桥通了，扫描失败是扫描自己的问题（多半是权限）
+      False = 桥不通（命令卡住/报错），先修 App
+      None  = 连命令都没有，判断不了
+
+    结果缓存 60 秒：失败提示和原始信息会各问一次，不必真敲两遍门。
+    """
+    if _BRIDGE_CACHE["ts"] and time.time() - _BRIDGE_CACHE["ts"] < 60:
+        return _BRIDGE_CACHE["ok"]
+    if not shutil.which("termux-battery-status"):
+        return None
+    out, _err, _code = run_detail(["termux-battery-status"], timeout=timeout)
+    ok = bool((out or "").strip())
+    _BRIDGE_CACHE.update(ok=ok, ts=time.time())
+    return ok
 
 
 def _scan_termux():
@@ -172,11 +216,19 @@ def _scan_termux():
 
     需要：装 Termux:API 应用 + `pkg install termux-api` + 授予定位权限
     （Android 10+ 把 WiFi 扫描算作位置信息，没权限会返回空数组）。
+
+    超时给 60 秒：第一次调用要先唤起 Termux:API 的进程，冷启动 + 一次真实
+    扫描在慢机型上可以跑到 20~40 秒，原来 45 秒偶尔还是不够；而卡死的情况
+    无论如何都要等满，所以不如给足，再用「桥探测」快速判断到底哪里坏了。
     """
     if not shutil.which("termux-wifi-scaninfo"):
         return []
-    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=45)
-    _LAST_TERMUX.update(stdout=out, stderr=err, code=code)
+    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=60)
+    _LAST_TERMUX.update(
+        stdout=out, stderr=err, code=code,
+        timeout="timed out" in (err or "").lower(),
+        ts=time.time(),
+    )
     try:
         data = json.loads(out)
     except Exception:  # noqa: BLE001
@@ -294,7 +346,11 @@ def scan_diagnose():
     which = shutil.which("termux-wifi-scaninfo")
     lines.append(f"termux-wifi-scaninfo：{which or '未安装（pkg install termux-api）'}")
     if which:
-        out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=25)
+        bridge = _api_bridge_ok()
+        bridge_txt = {True: "通（App 在跑）", False: "不通（卡住/报错）",
+                      None: "没装 termux-battery-status，无法判断"}[bridge]
+        lines.append(f"Termux:API 桥探测（termux-battery-status）：{bridge_txt}")
+        out, err, code = _termux_recent()
         lines.append(f"退出码：{code}")
         lines.append(f"stdout：{(out or '(空)').strip()[:200]}")
         lines.append(f"stderr：{(err or '(空)').strip()[:200]}")
@@ -316,9 +372,23 @@ def scan_failure_hint():
             return ("手机上没装 termux-api 包：在 Termux 里执行 `pkg install termux-api`。"
                     "（只是跳过信道优化，频段不受影响）")
 
-        out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=25)
+        out, err, code = _termux_recent()
         err_l = (err or "").lower()
         body = (out or "").strip()
+
+        # 「卡住直到超时」是最常见的一种，而原来的处理只是把
+        # "TimeoutExpired: Command '[...]' timed out after 25 seconds" 原样丢给用户，
+        # 等于什么都没说。这里用桥探测区分两种病因，各自给对应动作。
+        if "timed out" in err_l or "timeoutexpired" in err_l:
+            bridge = _api_bridge_ok()
+            if bridge is False or bridge is None:
+                return ("termux-wifi-scaninfo 卡住直到超时 —— 这是 **Termux:API 这个 App "
+                        "没装、或没在运行** 的典型表现。去 F-Droid 装 Termux:API（必须和 "
+                        "Termux 同一来源），装完回 Termux 再跑 `mifi --scan`。"
+                        "（只是跳过信道优化，频段不受影响）")
+            return ("termux-wifi-scaninfo 超时，但 Termux:API 是活的 —— 多半是「定位」权限"
+                    "没给，系统干脆不给结果。去设置里给 Termux:API 开定位（安卓 12+ 可能"
+                    "还要「附近的设备」），或直接在 Termux 里跑 `termux-wifi-scaninfo` 看它的报错。")
 
         # 只有 Termux:API 这个 **App** 才能真的去调系统扫描。包装了这个 App 没装，
         # 命令会存在但拿不到数据 —— 这是最常见的一种，光看 stdout 会误判成「没权限」。
@@ -370,7 +440,12 @@ def scan_2g(rounds=5, delay=3, min_hits=2, own_ssid=None):
     for i in range(rounds):
         if i:
             time.sleep(delay)
-        for ap in scan_once():
+        batch = scan_once()
+        if not batch and i == 0:
+            # 第一轮一个都没扫到，说明不是「漏扫」而是根本扫不了（命令卡死/没权限）。
+            # 原来还会接着跑完剩下 4 轮，手机上就是干等两分钟才看到同一句报错。
+            break
+        for ap in batch:
             ch = ap.get("ch")
             if not ch or ch > 14:          # 5G 直接跳过
                 continue
