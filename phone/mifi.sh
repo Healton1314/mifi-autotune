@@ -5,6 +5,7 @@
 #   mifi --status   只看当前状态（几秒，不测量）
 #   mifi --scan     只扫周边信道（几秒，验证手机能不能扫）
 #   mifi --restore  还原成「不锁频段 + 自动信道」
+#   mifi --clean    清掉历史记录与缓存（只留最近一次运行结果、配置和令牌）
 #   mifi --web      起本地面板（可选；需要一直留着这个窗口）
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
 #   mifi --help     显示上面这段；mifi --help --all 看全部参数

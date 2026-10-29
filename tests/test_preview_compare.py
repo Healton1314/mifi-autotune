@@ -204,9 +204,24 @@ class ConclusionWording(unittest.TestCase):
         a = band_result(3, 30.0)
         b = band_result(40, 31.0)                    # 只高 1 Mbps，低于阈值
         text = self._run([a, b])
-        self.assertIn("不到 3 Mbps 阈值", text)
+        self.assertIn("两个门槛", text)               # 说清是「两个门槛都不满足」
         self.assertIn("本次不改动", text)
         self.assertNotIn("数据不足以下结论", text)
+
+    def test_low_speed_ratio_boost_counts(self):
+        """截图实况：2.6 → 5.1 Mbps，绝对差 2.5 不到 3，但保底翻了近一倍。
+
+        修之前「自动」判「强太多，切」而「按速度」判「不到阈值」，
+        同一份数据两个结论并排印出来 —— 用户只会觉得工具在胡说。
+        """
+        slow = band_result(3, 2.6)
+        slow["mbps_all"] = [2.6, 2.6]
+        fast = band_result(8, 5.1)
+        fast["mbps_all"] = [4.6, 5.6]
+        text = self._run([slow, fast])
+        # 两条线必须都指向 BAND 8，且都不能说「不到阈值」
+        self.assertIn("保底从 2.6 提到 4.6", text)
+        self.assertNotIn("都不满足", text)
 
 
 class ContestStartsFromHealthyState(unittest.TestCase):
@@ -247,6 +262,70 @@ class ContestStartsFromHealthyState(unittest.TestCase):
         self.assertGreater(last, dead)
         self.assertIn(("set_band", 3), events[dead:last],
                       "决赛前没有把设备切回原频段，复测会偏低")
+
+
+class ContestWording(unittest.TestCase):
+    """决赛名单里「当前频段」必须标成对照，不能说成参评。
+
+    现场（2026-10-29 手机截图）：BAND 3 延迟 1088ms 被判「质量不可接受，
+    不参与最优评选」，下一屏却出现「决赛：对 ['BAND 8', 'BAND 3'] 各补 1 轮确认」。
+    用户当场质问：说好不参评，怎么又进决赛了？
+    事实是它确实会被复测一次（给「提升多少」当基准），但文案没说清。
+    """
+
+    def _run(self, results_by_band, finalist_band):
+        dev = FakeDev(band=3)
+        seen = []
+
+        def fake_measure(d, band, **kw):
+            seen.append(band)
+            return results_by_band[band]
+
+        out = io.StringIO()
+        with mock.patch.object(autotune, "measure_band", fake_measure), \
+                mock.patch.object(autotune.time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(out):
+            autotune.measure_all_bands(dev, [3, 8, 41], 1, 3, "BAND 3", contest_band=3)
+        return out.getvalue()
+
+    def test_current_band_marked_as_control(self):
+        slow = band_result(3, 2.6, avg=1088)
+        slow["mbps_all"] = [2.6, 2.6]
+        good = band_result(8, 5.1)
+        good["mbps_all"] = [4.6, 5.6]
+        dead = {"band": 41, "ok": False, "mbps": 0, "mbps_all": [],
+                "reason": "no_signal", "waited": 15}
+        text = self._run({3: slow, 8: good, 41: dead}, 8)
+
+        self.assertIn("不会被选为最优", text)
+        self.assertIn("当前·只作对照，不参评", text)      # 说清它为什么还在名单里
+        self.assertNotIn("各补 1 轮确认", text)           # 旧文案把两者混为一谈
+
+    def test_rematch_failure_is_reported(self):
+        """复测没测成必须说出来，不能名单里列了、结果里没有。"""
+        slow = band_result(3, 2.6, avg=1088)
+        good = band_result(8, 5.1)
+        good["mbps_all"] = [4.6, 5.6]
+        dead = {"band": 41, "ok": False, "mbps": 0, "mbps_all": [],
+                "reason": "no_signal", "waited": 15}
+
+        state = {"n": 0}
+
+        def fake_measure(d, band, **kw):
+            if band == 3:
+                state["n"] += 1
+                if state["n"] > 1:          # 决赛复测：这次测不出来
+                    return {"band": 3, "ok": False, "mbps": 0, "mbps_all": [],
+                            "reason": "speed_fail", "waited": 20}
+            return {3: slow, 8: good, 41: dead}[band]
+
+        out = io.StringIO()
+        with mock.patch.object(autotune, "measure_band", fake_measure), \
+                mock.patch.object(autotune.time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(out):
+            autotune.measure_all_bands(FakeDev(band=3), [3, 8, 41], 1, 3, "BAND 3",
+                                       contest_band=3)
+        self.assertIn("复测没测成", out.getvalue())
 
 
 class ServingBandParse(unittest.TestCase):

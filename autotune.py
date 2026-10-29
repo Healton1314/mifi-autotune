@@ -15,7 +15,9 @@
 
 import argparse
 import json
+import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -70,11 +72,14 @@ WATCH_JITTER_MIN_MS = 25            # 抖动下限
 WATCH_JITTER_CAP_MS = 80            # 抖动上限
 WATCH_JITTER_COLD_MS = 40           # 冷启动抖动阈值
 
+LOG_KEEP = 1                        # 运行记录默认只留最近一次（0 = 写完就删）
+
 DEFAULT_CONFIG = {
     "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
     "speed_url": probe.DEFAULT_SPEED_URL,
     "ping_host": probe.DEFAULT_PING_HOST,
     "candidate_bands": [3, 40],     # 仅 --bands preferred 时用来缩小范围
+    "log_keep": LOG_KEEP,           # 想留更多历史就改成 5、10；0 = 不保存
 }
 
 
@@ -98,9 +103,73 @@ def save_state(payload):
     STATE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _log_keep():
+    """运行记录保留几条：环境变量 > config.json > 默认 1。"""
+    raw = os.environ.get("MIFI_LOG_KEEP")
+    if raw is None or str(raw).strip() == "":
+        raw = load_config().get("log_keep", LOG_KEEP)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return LOG_KEEP
+
+
 def append_log(entry):
-    with LOG.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    """写一条运行记录，并只保留最近 log_keep 条（默认 1 条 = 上一次）。
+
+    为什么不是纯追加：手机上每跑一次体检就多一份完整报告，跑十次就是十份
+    堆在那儿；用户要的是「保留最近一次」，不是一本流水账。
+    裁剪用「写临时文件 + 原子替换」，避免写到一半断电把仅有的记录也弄坏。
+    """
+    keep = _log_keep()
+    if keep <= 0:
+        try:
+            LOG.unlink()
+        except OSError:
+            pass
+        return
+
+    lines = []
+    if LOG.exists():
+        try:
+            lines = [ln for ln in LOG.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except OSError:
+            lines = []
+    lines.append(json.dumps(entry, ensure_ascii=False))
+    if len(lines) > keep:
+        lines = lines[-keep:]
+
+    tmp = LOG.with_name(LOG.name + ".tmp")
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, LOG)
+    except OSError:
+        # 裁剪失败不能让体检白跑：退回普通追加
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def clean_run_files():
+    """清掉运行产物（保留 config.json 和面板令牌）。
+
+    手机上只想留「上一次」，历史残留（旧报告、缓存）留着只会占地方、
+    还会让 `ls` 里一堆 .pyc 看着很乱。
+    """
+    removed = []
+    for p in (PLAN, STATE, LOG):
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(p.name)
+        except OSError:
+            pass
+    for cache in HERE.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache)
+            removed.append(str(cache.relative_to(HERE)))
+        except OSError:
+            pass
+    return removed
 
 
 # ---------------- LTE 频段 ----------------
@@ -383,6 +452,24 @@ def _cons_mbps(res):
     return res.get("mbps")
 
 
+def _gain_enough(cur_res, cand):
+    """提升够不够大：绝对差 ≥3 Mbps，或者保底（最差一轮）快 1.5 倍以上。
+
+    为什么不能只看绝对差：实测（2026-10-29 手机，信号很差那一轮）BAND 3 只有
+    2.6 Mbps，BAND 8 是 5.1 —— 慢了近一倍，可绝对差只有 2.5 Mbps，卡在 3 Mbps
+    阈值下面。于是「按速度」说「不到阈值，不值得切」，而「自动裁决」同一份数据
+    说「强太多，切」—— 两个结论并排印出来，用户只会觉得这工具在胡说。
+    现在三条线共用这一个判定。相对口径一律用最差一轮比，不拿峰值吹牛。
+    """
+    gain = (cand.get("mbps") or 0) - (cur_res.get("mbps") or 0)
+    if gain >= MIN_BAND_GAIN_MBPS:
+        return True, "abs"
+    cur_cons, cand_cons = _cons_mbps(cur_res), _cons_mbps(cand)
+    if cur_cons and cand_cons and cand_cons / cur_cons >= SPEED_DECISIVE_RATIO:
+        return True, "ratio"
+    return False, "none"
+
+
 def decide_band(cur_res, candidates, cmp_band):
     """自动裁决换哪个频段。返回 (option 或 None, 不换的原因)。
 
@@ -424,7 +511,8 @@ def decide_band(cur_res, candidates, cmp_band):
     both_steady = ((cur_ratio is None or cur_ratio <= STABILITY_BEST_RATIO)
                    and (w_ratio is None or w_ratio <= STABILITY_BEST_RATIO))
     gain = (w.get("mbps") or 0) - cur_med
-    if both_steady and gain >= MIN_BAND_GAIN_MBPS:
+    enough, _basis = _gain_enough(cur_res, w)
+    if both_steady and enough:
         return {"band": w["band"], "kind": "speed",
                 "reason": f"稳定性差不多（波动 {cur_ratio or 1:.1f} 倍 vs {w_ratio or 1:.1f} 倍），"
                           f"但它快 {gain:.1f} Mbps",
@@ -433,10 +521,10 @@ def decide_band(cur_res, candidates, cmp_band):
 
 
 def speed_option(cur_res, best_res, cmp_band, caveats):
-    """「按速度换」的建议：只有数据可信、且快得够多，才给。
+    """「按速度换」的建议：只有数据可信、且提升够大，才给。
 
-    这是项目一直以来的默认策略，也是保守的那条：波动大就不出建议，
-    宁可让人再测一次，也不拿一个假数字哄人断网。
+    这里和「自动裁决」共用 _gain_enough —— 两条线对「够不够大」必须是同一个
+    标准，否则会出现「A 说不到阈值、自动却切了」的自相矛盾输出。
     """
     if caveats or not best_res or best_res.get("band") is None:
         return None
@@ -444,10 +532,12 @@ def speed_option(cur_res, best_res, cmp_band, caveats):
         return None
     if not cur_res or not cur_res.get("ok"):
         return None
-    gain = best_res["mbps"] - cur_res["mbps"]
-    if gain < MIN_BAND_GAIN_MBPS:
+    enough, basis = _gain_enough(cur_res, best_res)
+    if not enough:
         return None
-    return {"band": best_res["band"], "gain": round(gain, 1),
+    gain = best_res["mbps"] - cur_res["mbps"]
+    return {"band": best_res["band"], "gain": round(gain, 1), "basis": basis,
+            "cons_now": _cons_mbps(cur_res), "cons_best": _cons_mbps(best_res),
             "gain_pct": (round(gain / cur_res["mbps"] * 100) if cur_res.get("mbps") else None)}
 
 
@@ -578,7 +668,8 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
                       f"延迟 {r['avg']}ms  抖动 {jit}  丢包 {r['loss']}%")
                 bad = quality_issue(r)
                 if bad:
-                    print(f"       [!] {bad} —— 质量不可接受，不参与「最优」的评选")
+                    print(f"       [!] {bad} —— 质量不可接受，不会被选为最优"
+                          f"（决赛时只当对照，用来算「提升多少」）")
             else:
                 why = {"no_signal": "无信号（当地没这个频段）",
                        "timeout": "注册超时",
@@ -622,23 +713,38 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
                 print("      [!] 没切回去，复测结果可能偏低")
 
             usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
-            contest = [b for b in dict.fromkeys([usable[0]["band"], contest_band]) if b]
-            print(f"\n[决赛] 对 {[f'BAND {b}' for b in contest]} 各补 1 轮确认…")
+            # 候选和「当前」要分开说。之前把两者塞进一个列表打印「各补 1 轮确认」，
+            # 而当前频段刚被上面判过「质量不可接受、不参与最优评选」——
+            # 用户当场就问：说好不参评，怎么又进决赛了？（2026-10-29 实机截图）
+            # 真相是：它确实还会被复测一次，但它不参评，只是给「提升多少」当基准。
+            pairs = [(usable[0]["band"], "候选")]
+            if contest_band is not None and str(contest_band) != str(usable[0]["band"]):
+                pairs.append((contest_band, "当前·只作对照，不参评"))
+            print("\n[决赛] 补 1 轮确认：" +
+                  "、".join(f"BAND {b}（{role}）" for b, role in pairs))
             by_band = {r["band"]: r for r in results}
-            for b in contest:
+            for b, role in pairs:
                 prev = by_band.get(b)
                 if not prev or not prev["ok"]:
                     continue
                 extra = measure_band(dev, b, rounds=1, speed_url=speed_url, ping_host=ping_host)
-                if extra.get("ok"):
-                    merged = sorted(prev["mbps_all"] + extra["mbps_all"])
-                    prev["mbps"] = round(statistics.median(merged), 1)
-                    prev["mbps_all"] = merged
-                    prev["mbps_min"] = min(merged)
-                    prev["mbps_max"] = max(merged)
-                    prev["rounds"] = len(merged)
-                    print(f"      {_band_label(b):<8} 复测后 {prev['mbps']} Mbps"
-                          f"（{merged}）")
+                if not extra.get("ok"):
+                    # 复测失败必须说出来。原来这里没有 else，名单里列了它、
+                    # 后面一行结果都没有 —— 用户会以为「测了但没变化」，实际是没测成。
+                    why = {"no_data": "数据不通", "speed_fail": "测不出速度",
+                           "timeout": "注册超时", "no_signal": "无信号",
+                           "device_error": "设备通信中断"}.get(extra.get("reason"), "不可用")
+                    print(f"      {_band_label(b):<8} 复测没测成（{why}），"
+                          f"仍用粗测的 {prev['mbps']} Mbps")
+                    continue
+                merged = sorted(prev["mbps_all"] + extra["mbps_all"])
+                prev["mbps"] = round(statistics.median(merged), 1)
+                prev["mbps_all"] = merged
+                prev["mbps_min"] = min(merged)
+                prev["mbps_max"] = max(merged)
+                prev["rounds"] = len(merged)
+                print(f"      {_band_label(b):<8} 复测后 {prev['mbps']} Mbps"
+                      f"（{merged}）")
     except KeyboardInterrupt:
         print("\n[!] 已中断，马上切回原频段…")
     finally:
@@ -874,6 +980,12 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
 
 def _describe_speed(opt, caveats, best_band, cmp_band, gain):
     if opt:
+        # 信号差的时候绝对提升很小、但相对翻倍，「+2.5 Mbps」会让人以为没啥用，
+        # 所以这种情形改说「保底从多少到多少」，数字对得上用户的实际体感。
+        if opt.get("basis") == "ratio" and opt.get("cons_now") and opt.get("cons_best"):
+            up = opt["cons_best"] / opt["cons_now"] - 1
+            return (f"BAND {opt['band']}，保底从 {opt['cons_now']:g} 提到 "
+                    f"{opt['cons_best']:g} Mbps（{up:+.0%}）")
         return (f"BAND {opt['band']}，预计 {opt['gain']:+.1f} Mbps"
                 + (f"（{opt['gain_pct']:+d}%）" if opt.get("gain_pct") is not None else ""))
     if caveats:
@@ -881,7 +993,9 @@ def _describe_speed(opt, caveats, best_band, cmp_band, gain):
     if best_band is None or str(best_band) == str(cmp_band):
         return "现在这个频段就是最快的"
     if gain is not None:
-        return f"最快也只高 {gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps 阈值"
+        return (f"最快也只高 {gain:.1f} Mbps，且最差一轮没到 {SPEED_DECISIVE_RATIO:g} 倍"
+                f"（两个门槛：快 {MIN_BAND_GAIN_MBPS} Mbps 或 保底翻 "
+                f"{SPEED_DECISIVE_RATIO:g} 倍，都不满足）")
     return "没有可比的数据"
 
 
@@ -1243,6 +1357,8 @@ def main():
     ap.add_argument("--bands", default="default",
                     help="default=设备声明的全部频段 / preferred=配置里的子集 / 逗号分隔如 3,40")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
+    ap.add_argument("--clean", action="store_true",
+                    help="清掉历史运行记录与缓存（保留 config.json 和面板令牌）")
     ap.add_argument("--host", default="192.168.0.1", help="设备管理地址")
     ap.add_argument("--user", default="admin", help="后台账号")
     ap.add_argument("--password", default="admin", help="后台密码")
@@ -1312,6 +1428,19 @@ def main():
         for d in list_drivers():
             print(f"  {d['name']:<12} {d['description']}")
         print("\n新增机型：参考 drivers/template.py，在 drivers/__init__.py 里登记一行。")
+        return 0
+
+    if args.clean:
+        removed = clean_run_files()
+        if removed:
+            print("已清理：")
+            for name in removed:
+                print(f"  · {name}")
+        else:
+            print("没有需要清理的文件。")
+        print(f"\n保留：config.json（配置）、.panel-token（面板令牌）")
+        print(f"运行记录：每跑一次只留最近 {_log_keep()} 条"
+              f"（改 config.json 的 log_keep 可调整，0 = 不保存）")
         return 0
 
     speed_url = args.speed_url or cfg["speed_url"]
@@ -1490,7 +1619,7 @@ def main():
             for r in results:
                 if r.get("ok") and quality_issue(r):
                     print(f"      [!] BAND {r['band']} {quality_issue(r)}"
-                          f" —— 质量不可接受，不参与「最优」的评选")
+                          f" —— 质量不可接受，不会被选为最优")
             if usable:
                 print(f"\n      最优频段：BAND {best_res['band']}"
                       f"（中位 {best_res['mbps']} Mbps，单轮 {best_res['mbps_all']}）")
