@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1062,6 +1062,52 @@ def _mark_applied(plan, band, channel, result):
         pass
 
 
+def run_mtu_check(st0, ping_host):
+    """只读检测：这条线路的真实路径 MTU 和设备的设置值对不对得上。
+
+    为什么值得单列一项：MTU 设得比路径 MTU 大时，症状是「网页能开、下载大
+    文件卡死、视频一直缓冲」。这种「半通不通」最容易被当成信号差，然后开始
+    反复切频段 —— 而切频段根本治不了它。
+
+    只报告不自动改：改 MTU 要重新拨号，断网 30~60 秒，而且属于网络层设置，
+    改错了连设备后台都可能进不去，不适合跟着体检自动做。
+    """
+    set_mtu = int(st0.get("mtu") or 0)
+    print("=" * 56)
+    print("路径 MTU 检测（不分片 ping，只读，不改设备）")
+    print("=" * 56)
+    print(f"设备当前设置：{set_mtu or '—'} 字节")
+
+    if probe.is_termux():
+        print("\n[跳过] 手机端没有 ICMP 权限，这项只能在电脑上测。")
+        print("       （和频段优化无关，手机上体检不受影响）")
+        return 0
+
+    print(f"正在二分探测到 {ping_host} 能整包通过的最大尺寸（约 10~20 秒）…")
+    path_mtu, note = probe.detect_path_mtu(ping_host)
+
+    if path_mtu is None:
+        print(f"\n[?] 测不出来：{note}")
+        return 0
+
+    print(f"路径 MTU：{note}")
+
+    if not set_mtu:
+        print("\n设备没报 MTU 值，无从比较。")
+        return 0
+    if path_mtu >= set_mtu:
+        print(f"\n[√] 设置值 {set_mtu} 不超过路径 MTU {path_mtu}，大包不会被丢，不用动。")
+        return 0
+
+    print(f"\n[!] 设置值 {set_mtu} 大于路径 MTU {path_mtu}。")
+    print("    症状会是：网页能开、大文件下载卡住、视频一直缓冲。")
+    print("    这种「半通不通」最容易被误判成信号差，然后反复切频段（治不了）。")
+    print(f"    建议把 MTU 调到 {path_mtu}（要更保险就用 {max(576, path_mtu - 8)}）。")
+    print("\n    这一步我没有替你改：改 MTU 要重新拨号，会断网 30~60 秒，")
+    print("    而且改错了连设备后台都可能进不去。真要改说一声，我把写入和回滚一起做。")
+    return 0
+
+
 def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     if not PLAN.exists():
         print("[×] 还没有体检结论。先跑一次：python autotune.py --preview")
@@ -1375,6 +1421,8 @@ def main():
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
     ap.add_argument("--clean", action="store_true",
                     help="清掉历史运行记录与缓存（保留 config.json 和面板令牌）")
+    ap.add_argument("--mtu", action="store_true",
+                    help="探测这条线路的真实路径 MTU（只读，不改设备；手机端做不到）")
     ap.add_argument("--host", default="192.168.0.1", help="设备管理地址")
     ap.add_argument("--user", default="admin", help="后台账号")
     ap.add_argument("--password", default="admin", help="后台密码")
@@ -1517,7 +1565,13 @@ def main():
         else:
             print(f"网络：延迟 {p['avg']}ms ｜ 抖动 {p['jitter']}ms ｜ 丢包 {p['loss']}%")
         print("\n想看「能提升多少」就跑：mifi        （体检约 3~6 分钟）")
+        if not probe.is_termux():
+            # 只在电脑上提示：手机端没有 ICMP 权限，这项在手机上做不了。
+            print("遇到「网页能开、大文件下载卡死」可查 MTU：mifi --mtu（只读，20 秒）")
         return 0
+
+    if args.mtu:
+        return run_mtu_check(st0, ping_host)
 
     if args.interactive:
         return _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host)
