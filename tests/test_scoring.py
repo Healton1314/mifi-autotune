@@ -75,5 +75,35 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(scanner._num(""))
 
 
+class PickBestChannel(unittest.TestCase):
+    """干扰分接近时优先标准信道（1/6/11）。
+
+    起因（2026-10-29 用户实机）：工具推荐「信道 7（干扰分 0.36）」，
+    而设备本来就在 13 号（0.46）。7 号夹在 6 和 8 中间、跟哪个标准信道
+    都不对齐，分低只是眼下没人用，邻居一起来必然抖。差 0.1 就搬家不值。
+    """
+
+    @staticmethod
+    def rows(pairs):
+        # 模拟 score_channels 的输出：已按分数升序
+        return [{"ch": c, "score": s, "detail": []}
+                for c, s in sorted(pairs, key=lambda x: x[1])]
+
+    def test_standard_channel_wins_when_close(self):
+        r = self.rows([(7, 0.36), (6, 0.45), (13, 0.46)])
+        self.assertEqual(scanner.pick_best_channel(r)["ch"], 6)
+
+    def test_keeps_lowest_when_gap_is_real(self):
+        r = self.rows([(7, 0.36), (6, 0.60)])      # 差 0.24 > 0.15
+        self.assertEqual(scanner.pick_best_channel(r)["ch"], 7)
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(scanner.pick_best_channel([]))
+
+    def test_lowest_already_standard(self):
+        r = self.rows([(1, 0.10), (6, 0.80)])
+        self.assertEqual(scanner.pick_best_channel(r)["ch"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -598,3 +598,30 @@ def score_channels(aps, channels=None, width_mhz=20):
         rows.append({"ch": ch, "score": round(total, 2), "detail": detail})
     rows.sort(key=lambda r: r["score"])
     return rows
+
+
+STANDARD_2G_CHANNELS = (1, 6, 11)   # 2.4G 真正互不重叠的三个
+CHANNEL_PREF_MARGIN = 0.15          # 干扰分差在这个范围内时，标准信道优先
+
+
+def pick_best_channel(rows):
+    """挑最干净的信道，但分差很小时优先标准信道（1/6/11）。
+
+    为什么加这条：评分只看干扰分，会推荐 7 号这种「夹在 6 和 8 中间」的信道。
+    那里眼下分低，只是因为还没人用；一旦邻居起来它同时被两条信道压，
+    而它自己又不和任何标准信道对齐。
+    实测（2026-10-29 手机）：工具推荐 7 号（0.36），设备本来在 13 号（0.46），
+    只差 0.1 —— 为这点差距搬到一个夹缝信道不划算。
+
+    返回被挑中的那一行；rows 必须是 score_channels 的输出（已按分数升序）。
+    """
+    if not rows:
+        return None
+    best = rows[0]
+    if best["ch"] in STANDARD_2G_CHANNELS:
+        return best
+    for ch in STANDARD_2G_CHANNELS:          # rows 有序，第一个命中的就是最干净的
+        for r in rows:
+            if r["ch"] == ch and r["score"] <= best["score"] + CHANNEL_PREF_MARGIN:
+                return r
+    return best
