@@ -241,5 +241,40 @@ class TestUnmeasuredBands(unittest.TestCase):
         self.assertEqual(autotune.describe_unmeasured(lte), "")
 
 
+class TestQualityGate(unittest.TestCase):
+    """带宽好看不等于能用。
+
+    2026-10-29 手机实测：BAND 39 丢包 90%、延迟 1068ms，却测出 13.4 Mbps。
+    那天它带宽不最高所以没被选上；只要高一点点就会被推荐成「最优」。
+    """
+
+    def test_high_loss_is_rejected(self):
+        r = {"band": 39, "ok": True, "mbps": 13.4, "loss": 90, "avg": 1068}
+        self.assertIn("丢包", autotune.quality_issue(r))
+
+    def test_huge_latency_is_rejected(self):
+        r = {"band": 39, "ok": True, "mbps": 30.0, "loss": 0, "avg": 1200}
+        self.assertIn("延迟", autotune.quality_issue(r))
+
+    def test_healthy_band_passes(self):
+        r = {"band": 3, "ok": True, "mbps": 45.8, "loss": 0, "avg": 62}
+        self.assertEqual(autotune.quality_issue(r), "")
+
+    def test_unmeasured_band_is_not_judged(self):
+        r = {"band": 38, "ok": False, "reason": "no_signal"}
+        self.assertEqual(autotune.quality_issue(r), "")
+
+    def test_bad_quality_band_excluded_from_best(self):
+        lte = [{"band": 3, "ok": True, "mbps": 21.3, "loss": 0, "avg": 62},
+               {"band": 39, "ok": True, "mbps": 99.0, "loss": 90, "avg": 1068}]
+        picked = autotune.bands_worth_comparing(lte)
+        self.assertEqual([r["band"] for r in picked], [3])   # 99 Mbps 也不能选
+
+    def test_falls_back_when_all_are_bad(self):
+        lte = [{"band": 3, "ok": True, "mbps": 2.0, "loss": 60, "avg": 900}]
+        picked = autotune.bands_worth_comparing(lte)
+        self.assertEqual(len(picked), 1)      # 不能返回空清单
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -275,15 +275,17 @@ def scan_failure_hint():
     is_termux = "com.termux" in os.environ.get("PREFIX", "") or bool(shutil.which("termux-info"))
     if is_termux:
         if not shutil.which("termux-wifi-scaninfo"):
-            return ("手机上没装 termux-api：`pkg install termux-api` 并安装 Termux:API 应用。"
-                    "（只是跳过信道优化，频段不受影响）")
+            return ("手机上没装 termux-api。需要两样东西：① Termux 里 `pkg install termux-api`；"
+                    "② 装 Termux:API 这个应用（F-Droid 搜 Termux:API）。"
+                    "只有 ① 没 ② 一样扫不到。频段优化不受影响。")
         try:
             out = sh(["termux-wifi-scaninfo"], timeout=25).strip()
         except Exception:  # noqa: BLE001
             return "Termux:API 调用失败，检查 Termux:API 应用是否安装、是否允许后台运行"
         if out in ("", "[]"):
-            return ("Termux:API 返回了空列表，通常是没给「定位」权限"
-                    "（安卓 10+ 把 WiFi 扫描算作位置信息）。频段优化不受影响。")
+            return ("Termux:API 返回了空列表 → 缺权限。到系统设置里给 Termux:API 开"
+                    "「定位」权限（安卓 10+ 把 WiFi 扫描算作位置信息），"
+                    "安卓 12+ 可能还要开「附近的设备」。频段优化不受影响。")
         return "拿到了扫描结果但解析不出可用 AP，可能是 5G-only 或格式不同"
     if sys.platform.startswith("win"):
         return "netsh 没抓到 BSSID：系统语言可能不在支持列表，或无线网卡被禁用"
