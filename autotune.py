@@ -913,15 +913,20 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
 
     # 自动裁决放第一行（默认就按它走），两条单线列在旁边当参考/强制用。
     # 只显示其中一条会让人以为工具「没建议」。
-    if options["auto"]:
-        print(f"  [自动] 切到 BAND {options['auto']['band']} —— {options['auto']['reason']}")
+    # 但没测频段时（--wifi-only）这三行必须省掉：那时它会印出
+    # 「按速度：现在这个频段就是最快的」这种根本没测过的话（实测踩到）。
+    if not lte:
+        print("  （这次没测频段，所以没有频段建议 —— 只跑了信道）")
     else:
-        print(f"  [自动] 保持现状 —— {auto_why}")
-    print("        规则：速度强太多选快的；速度差不多选稳的；稳定性差不多选快的")
-    print(f"  [A] 按速度：{_describe_speed(options['speed'], caveats, best_band, cmp_band, band_gain)}")
-    print(f"  [B] 按稳定：{_describe_stability(options['stability'], cur_res)}")
-    print(f"  当前策略：{'自动' if strategy == 'auto' else ('按速度' if strategy == 'speed' else '按稳定')}"
-          f"（可用 --strategy speed / stability 强制单条）")
+        if options["auto"]:
+            print(f"  [自动] 切到 BAND {options['auto']['band']} —— {options['auto']['reason']}")
+        else:
+            print(f"  [自动] 保持现状 —— {auto_why}")
+        print("        规则：速度强太多选快的；速度差不多选稳的；稳定性差不多选快的")
+        print(f"  [A] 按速度：{_describe_speed(options['speed'], caveats, best_band, cmp_band, band_gain)}")
+        print(f"  [B] 按稳定：{_describe_stability(options['stability'], cur_res)}")
+        print(f"  当前策略：{'自动' if strategy == 'auto' else ('按速度' if strategy == 'speed' else '按稳定')}"
+              f"（可用 --strategy speed / stability 强制单条）")
 
     # 有些频段是「有信号但这次没测出结果」，它不等于「比当前慢」。
     # 不点出来，用户会以为已经比过了所有频段 —— 实际是没比成。
@@ -940,17 +945,24 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                    if wifi["cur_score"] is not None else None)
             pct = (round(gap / wifi["cur_score"] * 100)
                    if gap is not None and wifi["cur_score"] else None)
+            # gap == 0 时「最优」其实是并列 —— 直接印「最优 10」会让人以为 10 比 13 好，
+            # 实际两个信道都是 0 干扰。实测（2026-10-29 电脑）就这么印过。
+            tail = ("（干扰分与当前相同，属并列）" if gap == 0
+                    else f"（干扰分 {wifi['best_score']}）")
             print(f"  信道：{cur_ch}（干扰分 {wifi['cur_score']}）"
-                  f"  →  最优 {wifi['best']}（干扰分 {wifi['best_score']}）")
+                  f"  →  最优 {wifi['best']}{tail}")
             if do_ch:
-                print(f"        切换后干扰下降 {gap}（约 {pct}%），"
+                print(f"        切换后干扰下降 {gap}"
+                      f"{f'（约 {pct}%）' if pct is not None else ''}，"
                       f"主要改善重传和抖动（不承诺带宽提升）")
-            elif wifi["best"] == cur_ch:
-                print("        当前信道已是最优，无需改动")
+            elif wifi["best"] == cur_ch or gap == 0:
+                print("        当前信道已经很干净，没有更优的选择，不动")
             else:
                 # 原来只写「改善不足阈值 0.3」，看不出差多少 —— 用户以为没算。
-                # 把差值和降幅都写出来，才能判断「是真的差不多」还是「工具没测」。
-                print(f"        只降 {gap}（约 {pct}%），不到阈值 {MIN_CHANNEL_GAIN}，不值得动")
+                # 但 cur_score 可能是 0（这个信道本来就没人抢），这时算不出百分比，
+                # 印「约 None%」比不说更糟（实测出现过）。
+                pct_s = f"（约 {pct}%）" if pct is not None else ""
+                print(f"        只降 {gap}{pct_s}，不到阈值 {MIN_CHANNEL_GAIN}，不值得动")
     elif not args.lte_only:
         # 扫描失败时整段会消失，用户看到的就是「这次没有信道结果」。
         # 必须在这里明写一句，否则看起来像功能坏了。
@@ -973,7 +985,11 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
               + ("" if strategy == "auto" else f" --strategy {strategy}"))
         print("           （只想看会改什么、不真改：再加 --dry-run）")
     else:
-        print(_no_change_reason(strategy, options, auto_why))
+        if not lte and wifi:
+            # 只测信道时不能印「当前频段没有可用数据」—— 那是没测，不是没有。
+            print("本次不改动：只测了信道，信道也没有更优的选择。")
+        else:
+            print(_no_change_reason(strategy, options, auto_why))
         print("（结论已存 plan.json；环境变了可以重新体检一次）")
     return 0
 
