@@ -404,10 +404,23 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 
 设备地址是 `192.168.0.1`，只有连在这台随身WiFi 上的设备才够得着。手机本来就一直连着它，所以手机是最合适的运行环境。
 
+### 第 0 步：装 Termux 和 Termux:API
+
+应用商店里经常搜不到 Termux。两个安装包的固定下载地址放在本仓库的 Release 里，另有官方长期地址和国内镜像：
+
+**→ [docs/termux-apk.md](docs/termux-apk.md)（含下载链接、校验值、安装顺序）**
+
+Release 直达：<https://github.com/Healton1314/mifi-autotune/releases/tag/termux-apk-2025.10>
+
+两个要点：
+
+- **Termux 和 Termux:API 必须来自同一来源**（签名一致），混装会表现为「命令没反应 / 一直超时」——`mifi --scan` 扫不到信道、`termux-battery-status` 卡住都可能源于此。
+- 先装 Termux，打开一次，再装 Termux:API 并给它「定位」权限。
+
 ### 一次性安装（约 5 分钟，之后永久独立）
 
 ```bash
-# 1. 装 Termux（F-Droid 或应用商店搜，选 F-Droid 版更省心）
+# 1. 装 Termux（见上一步；F-Droid 版最省心）
 
 # 2. 在 Termux 里装 Python
 pkg install -y python
