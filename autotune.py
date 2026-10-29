@@ -36,11 +36,19 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
+STABILITY_BEST_RATIO = 1.6          # 候选频段「最大/最小」≤1.6 倍才算稳
+
+# 「自动裁决」的取向（2026-10-29 用户定的规则）：
+#   速度强太多 → 选快的；速度差不多 → 选稳的；稳定性差不多 → 选快的
+SPEED_DECISIVE_RATIO = 1.5          # 用「最差一轮」比，快 50% 以上算强太多
+SPEED_SIMILAR_RATIO = 0.9           # 中位数 ≥ 当前的 90% 视为「速度差不多」
+STABILITY_DECISIVE_RATIO = 1.4      # 波动倍数好 40% 以上算「明显更稳」
+STABILITY_SIMILAR_RATIO = 1.25      # 波动倍数差 25% 以内算「稳定性差不多」
 SPEED_FLOOR_MBPS = 3                # 最优频段都低于这个值，说明网络太差、结论不可信
 MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也不能选
 MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
@@ -358,6 +366,134 @@ def bands_worth_comparing(lte):
     return clean or ok
 
 
+def _sample_ratio(res):
+    """多轮「最大/最小」= 波动倍数。样本不足 2 条时返回 None（无法判断稳不稳）。"""
+    vs = [x for x in (res.get("mbps_all") or []) if x > 0]
+    return (max(vs) / min(vs)) if len(vs) >= 2 else None
+
+
+def _cons_mbps(res):
+    """保守值：多轮取最小（最差那一轮），只有一轮就用它本身。
+
+    判断「谁更强」不能拿峰值比 —— 峰值是运气，最差那一轮才是你真正会遇到的速度。
+    """
+    vs = [x for x in (res.get("mbps_all") or []) if x > 0]
+    if len(vs) >= 2:
+        return min(vs)
+    return res.get("mbps")
+
+
+def decide_band(cur_res, candidates, cmp_band):
+    """自动裁决换哪个频段。返回 (option 或 None, 不换的原因)。
+
+    规则（用户 2026-10-29 定的）：
+      1) 一方速度强太多   → 选快的（哪怕它稍微不稳）
+      2) 速度差不多       → 选更稳的
+      3) 稳定性差不多     → 选更快的
+    第 1 条刻意用「最差一轮」比较：拿峰值去说「强太多」是在骗人。
+    """
+    if not cur_res or not cur_res.get("ok"):
+        return None, "当前频段没有可用数据"
+    cands = [r for r in (candidates or [])
+             if r and r.get("ok") and str(r.get("band")) != str(cmp_band)]
+    if not cands:
+        return None, "没有可比的其他频段"
+
+    cur_med = cur_res.get("mbps") or 0
+    cur_cons = _cons_mbps(cur_res)
+    cur_ratio = _sample_ratio(cur_res)
+
+    # 1) 速度强太多：比最差一轮
+    strong = [r for r in cands
+              if cur_cons and _cons_mbps(r) and _cons_mbps(r) / cur_cons >= SPEED_DECISIVE_RATIO]
+    if strong:
+        w = max(strong, key=lambda r: r.get("mbps") or 0)
+        return {"band": w["band"], "kind": "speed",
+                "reason": f"速度强太多 —— 它最差一轮 {_cons_mbps(w)} Mbps，"
+                          f"现在最差一轮 {cur_cons} Mbps",
+                "gain": round((w.get("mbps") or 0) - cur_med, 1)}, ""
+
+    # 2) 速度差不多 → 选明显更稳的（与「按稳定」那条线共用同一份判定）
+    st = stability_option(cur_res, cands, cmp_band)
+    if st:
+        return st, ""
+
+    # 3) 稳定性差不多（双方都不乱跳）→ 选更快的，仍要过阈值
+    w = max(cands, key=lambda r: r.get("mbps") or 0)
+    w_ratio = _sample_ratio(w)
+    both_steady = ((cur_ratio is None or cur_ratio <= STABILITY_BEST_RATIO)
+                   and (w_ratio is None or w_ratio <= STABILITY_BEST_RATIO))
+    gain = (w.get("mbps") or 0) - cur_med
+    if both_steady and gain >= MIN_BAND_GAIN_MBPS:
+        return {"band": w["band"], "kind": "speed",
+                "reason": f"稳定性差不多（波动 {cur_ratio or 1:.1f} 倍 vs {w_ratio or 1:.1f} 倍），"
+                          f"但它快 {gain:.1f} Mbps",
+                "gain": round(gain, 1)}, ""
+    return None, "速度和稳定性都差不多，不值得为它断一次网"
+
+
+def speed_option(cur_res, best_res, cmp_band, caveats):
+    """「按速度换」的建议：只有数据可信、且快得够多，才给。
+
+    这是项目一直以来的默认策略，也是保守的那条：波动大就不出建议，
+    宁可让人再测一次，也不拿一个假数字哄人断网。
+    """
+    if caveats or not best_res or best_res.get("band") is None:
+        return None
+    if str(best_res["band"]) == str(cmp_band):
+        return None
+    if not cur_res or not cur_res.get("ok"):
+        return None
+    gain = best_res["mbps"] - cur_res["mbps"]
+    if gain < MIN_BAND_GAIN_MBPS:
+        return None
+    return {"band": best_res["band"], "gain": round(gain, 1),
+            "gain_pct": (round(gain / cur_res["mbps"] * 100) if cur_res.get("mbps") else None)}
+
+
+def stability_option(cur_res, candidates, cmp_band):
+    """「按稳定换」的建议：速度差不多、但另一个频段明显更稳时给。
+
+    为什么需要这条：实测（2026-10-29 本机）BAND 3 是 28.0~49.7（1.78 倍），
+    BAND 40 是 33.7~41.1（1.22 倍），中位数只差 4%。按速度那条线会说「现在最快」、
+    什么都不做；但对实际体验来说，一个会在 28~50 之间来回的链路，比稳在 37 的差得多。
+    所以：只承诺稳定，不承诺更快，也不给提速百分比。
+
+    candidates 传**所有**可用频段（不是只有最快的那个）：最快的不一定最稳。
+    """
+    if not cur_res or not cur_res.get("ok"):
+        return None
+    cur_ratio = _sample_ratio(cur_res)
+    if cur_ratio is None:
+        return None                     # 当前只测了一轮，不谈稳不稳
+    cur_med = cur_res.get("mbps") or 0
+
+    best = None
+    for r in candidates or []:
+        if not r or not r.get("ok") or str(r.get("band")) == str(cmp_band):
+            continue
+        if (r.get("mbps") or 0) < cur_med * SPEED_SIMILAR_RATIO:
+            continue                    # 明显更慢，换过去是降速
+        rr = _sample_ratio(r)
+        if rr is None or rr > STABILITY_BEST_RATIO:
+            continue                    # 样本不够 / 候选自己也乱跳
+        if cur_ratio / rr < STABILITY_DECISIVE_RATIO:
+            continue                    # 稳定性差得不够明显，不值得为它断网
+        if best is None or (r.get("mbps") or 0) > (best.get("mbps") or 0):
+            best = r
+    if best is None:
+        return None
+    bs = [x for x in best["mbps_all"] if x > 0]
+    cs = [x for x in cur_res["mbps_all"] if x > 0]
+    return {"band": best["band"], "kind": "stability",
+            "reason": f"速度差不多（{best.get('mbps')} vs {cur_med} Mbps），"
+                      f"但它稳得多（{bs} vs 现在 {cs}）",
+            "cur_range": cs, "best_range": bs,
+            "cur_ratio": round(cur_ratio, 1),
+            "best_ratio": round(max(bs) / min(bs), 1),
+            "delta": round((best.get("mbps") or 0) - cur_med, 1)}
+
+
 def describe_unmeasured(lte):
     """「有信号但这次没测出结果」的频段，用一句话说清楚。
 
@@ -537,6 +673,14 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         own = args.ssid or cfg.get("own_ssid") or scanner.connected_ssid() or st0.get("ssid")
         print(f"\n[1/2] 扫描周边 2.4G 信道（{args.scan_rounds} 轮合并）…")
         aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
+        if not aps:
+            # 一次空结果不等于「扫不了」：netsh/nmcli 的结果是缓存的，刚开机、
+            # 网卡刚切过信道、或系统正在后台扫描时都可能一轮全空（本机实测遇到过）。
+            # 直接跳过整个信道部分，用户看到的就是「这次没有信道结果」——
+            # 所以先重试，还不行就把原始诊断摊开，而不是猜一句「语言不支持」。
+            print("      [!] 这一轮一个都没扫到，等 3 秒重试一次…")
+            time.sleep(3)
+            aps = scanner.scan_2g(rounds=max(3, args.scan_rounds - 2), own_ssid=own)
         if aps:
             rows = scanner.score_channels(aps, caps.get("channels") or range(1, 14))
             ch_auto = not cur_ch            # 0/None = 设备处于「自动信道」
@@ -554,7 +698,9 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 print(f"      当前信道 {cur_ch} 干扰分 {cur_score} ｜ "
                       f"最优 {best['ch']} 干扰分 {best['score']}")
         else:
-            print(f"      [!] 没扫到邻居 AP，跳过信道部分：{scanner.scan_failure_hint()}")
+            print(f"      [!] 重试也扫不到，本次跳过信道部分：{scanner.scan_failure_hint()}")
+            print("          原始信息（排查用，复制这一段就能定位问题）：")
+            print(scanner.scan_diagnose())
 
     # ---- 二、LTE 频段 ----
     lte = []
@@ -590,19 +736,35 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     caveats = assess_reliability(lte, cur_res, best_res)
     reliable = not caveats
 
-    # 「最优」必须真的比现在驻留的频段快，才值得锁。若设备本来就没锁频段、
-    # 而最优恰好就是它当前驻留的那个，把它锁死只会失去自动切换，纯亏。
-    do_band = bool(reliable and best_res and best_band is not None
-                   and str(best_band) != str(cmp_band)
-                   and band_gain is not None and band_gain >= MIN_BAND_GAIN_MBPS)
+    # 两条独立的建议线，用户自己选走哪条：
+    #   speed     —— 只认「更快」，数据不可信时不出建议（保守）
+    #   stability —— 只认「更稳」，当前频段自己在乱跳、另有一个稳定且不慢的频段时给建议
+    # 两者通常互斥（乱跳本身就会让速度结论不可信），所以不是二选一之后再二选一。
+    # 三条建议：自动裁决（默认）+ 两条手动强制的单线
+    cands = bands_worth_comparing(lte)
+    auto, auto_why = decide_band(cur_res, cands, cmp_band)
+    options = {
+        "auto": auto,
+        "speed": speed_option(cur_res, best_res, cmp_band, caveats),
+        "stability": stability_option(cur_res, cands, cmp_band),
+    }
+    strategy = getattr(args, "strategy", None) or "auto"
+    picked = options.get(strategy)
+    # 「按稳定换」和「自动裁决定的稳定」都不承诺带宽，界面不能把它当提速卖点
+    promise_gain = bool(picked and reliable and picked.get("kind") == "speed")
+
+    do_band = bool(picked)
     do_ch = bool(wifi and caps.get("can_set_channel", True) and wifi["best"] != cur_ch
                  and wifi["cur_score"] is not None
                  and wifi["cur_score"] - wifi["best_score"] >= MIN_CHANNEL_GAIN)
 
-    target = {"band": best_band if do_band else cur_band,
+    target = {"band": picked["band"] if picked else cur_band,
               "channel": wifi["best"] if do_ch else cur_ch}
     plan.update({
         "target": target,
+        "strategy": strategy,
+        "options": options,
+        "auto_reason": (picked.get("reason") if picked else auto_why),
         "reliable": reliable,
         "caveats": caveats,
         "lte": lte,
@@ -610,15 +772,21 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         "expected": {
             "band_from": cmp_band, "band_locked": cur_band, "band_to": target["band"],
             "mbps_now": cur_mbps, "mbps_best": best_mbps,
-            "mbps_gain": round(band_gain, 1) if band_gain is not None else None,
-            "mbps_gain_pct": (round(band_gain / cur_mbps * 100) if cur_mbps else None),
+            # 只在「确定更快」时才给提速数字；换稳定性、或数据不可信时一律不给，
+            # 免得界面把「更稳」说成「更快」。
+            "mbps_gain": (round(band_gain, 1)
+                          if (promise_gain and band_gain is not None) else None),
+            "mbps_gain_pct": (round(band_gain / cur_mbps * 100)
+                              if (promise_gain and cur_mbps) else None),
             "ping_now": cur_res["avg"] if cur_res and cur_res["ok"] else None,
             "ping_best": best_res["avg"] if best_res else None,
             "channel_from": cur_ch, "channel_to": target["channel"],
             "channel_score_from": wifi["cur_score"] if wifi else None,
             "channel_score_to": wifi["best_score"] if wifi and do_ch else None,
         },
-        "changes": ([f"频段 {cur_label} → {_band_label(target['band'])}"] if do_band else [])
+        "changes": ([] if not do_band else
+                    [f"频段 {cur_label} → {_band_label(picked['band'])}"
+                     + ("（换稳定性）" if picked.get("kind") == "stability" else "")])
                    + ([f"信道 {cur_ch} → {target['channel']}"] if do_ch else []),
     })
     PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -636,19 +804,18 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         best_s = f"{best_mbps} Mbps" if best_mbps is not None else "—"
         print(f"  频段：{cur_label} {now_s}"
               f"  →  最优 {_band_label(best_band) if best_band else '—'} {best_s}")
-        if do_band and band_gain is not None:
-            pct = plan["expected"]["mbps_gain_pct"]
-            print(f"        切换后预计 {band_gain:+.1f} Mbps"
-                  f"{f'（{pct:+d}%）' if pct is not None else ''}")
-        elif str(best_band) == str(cmp_band):
-            print("        当前频段已是最优，无需改动")
-        elif not reliable:
-            # 这里的「不切换」是数据不可信导致的，跟阈值无关。
-            # 曾经写成「只高 X Mbps，不到 3 Mbps」—— 实测出现过
-            # 「只高 11.8 Mbps，不到 3 Mbps」这种自相矛盾的句子，用户当然看不懂。
-            print("        这次波动太大，先不判断该不该切（原因见下方 [!]）")
-        elif band_gain is not None:
-            print(f"        最优只高 {band_gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
+
+    # 自动裁决放第一行（默认就按它走），两条单线列在旁边当参考/强制用。
+    # 只显示其中一条会让人以为工具「没建议」。
+    if options["auto"]:
+        print(f"  [自动] 切到 BAND {options['auto']['band']} —— {options['auto']['reason']}")
+    else:
+        print(f"  [自动] 保持现状 —— {auto_why}")
+    print("        规则：速度强太多选快的；速度差不多选稳的；稳定性差不多选快的")
+    print(f"  [A] 按速度：{_describe_speed(options['speed'], caveats, best_band, cmp_band, band_gain)}")
+    print(f"  [B] 按稳定：{_describe_stability(options['stability'], cur_res)}")
+    print(f"  当前策略：{'自动' if strategy == 'auto' else ('按速度' if strategy == 'speed' else '按稳定')}"
+          f"（可用 --strategy speed / stability 强制单条）")
 
     # 有些频段是「有信号但这次没测出结果」，它不等于「比当前慢」。
     # 不点出来，用户会以为已经比过了所有频段 —— 实际是没比成。
@@ -663,48 +830,91 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                   f"  →  扫描最干净 {wifi['best']}（干扰分 {wifi['best_score']}）")
             print("        自动模式通常比自己钉一个信道更稳，本次不建议改动。")
         else:
+            gap = (round(wifi["cur_score"] - wifi["best_score"], 2)
+                   if wifi["cur_score"] is not None else None)
+            pct = (round(gap / wifi["cur_score"] * 100)
+                   if gap is not None and wifi["cur_score"] else None)
             print(f"  信道：{cur_ch}（干扰分 {wifi['cur_score']}）"
                   f"  →  最优 {wifi['best']}（干扰分 {wifi['best_score']}）")
             if do_ch:
-                drop = 0
-                if wifi["cur_score"]:
-                    drop = round((wifi["cur_score"] - wifi["best_score"]) / wifi["cur_score"] * 100)
-                print(f"        切换后干扰下降约 {drop}%，主要改善重传和抖动（不承诺带宽提升）")
+                print(f"        切换后干扰下降 {gap}（约 {pct}%），"
+                      f"主要改善重传和抖动（不承诺带宽提升）")
             elif wifi["best"] == cur_ch:
                 print("        当前信道已是最优，无需改动")
             else:
-                print(f"        改善不足阈值 {MIN_CHANNEL_GAIN}，不值得动")
+                # 原来只写「改善不足阈值 0.3」，看不出差多少 —— 用户以为没算。
+                # 把差值和降幅都写出来，才能判断「是真的差不多」还是「工具没测」。
+                print(f"        只降 {gap}（约 {pct}%），不到阈值 {MIN_CHANNEL_GAIN}，不值得动")
+    elif not args.lte_only:
+        # 扫描失败时整段会消失，用户看到的就是「这次没有信道结果」。
+        # 必须在这里明写一句，否则看起来像功能坏了。
+        print("  信道：这次没扫到周边 AP，未参与判断（扫描本身的原因见上面 [!] 行）")
 
     print("-" * 56)
     if caveats:
-        print("[!] 这次结论不可信，先别照它改：")
+        print("[!] 按速度这条线，数据不足以下结论：")
         for c in caveats:
             print(f"    · {c}")
         print("    原因通常是当前信号太差（看 RSRP/SINR）或测速源不可用。")
         print("    建议：换个测速源（--speed-url）、加轮次（--rounds 3）或等信号好转后再测一次。")
         print("-" * 56)
     if plan["changes"]:
-        print("可以优化的项：")
+        label = {"auto": "自动裁决", "speed": "速度", "stability": "稳定"}.get(strategy, strategy)
+        print(f"按「{label}」可以做的改动：")
         for c in plan["changes"]:
             print(f"  · {c}")
         print(f"\n应用方式：python autotune.py --apply-plan"
-              f"   （只在手机上点一下也行）")
-    elif not reliable and band_gain is not None:
-        # 不切换的真实原因是「数据不可信」，不能写成「差距小、不值得」——
-        # 两者对用户的含义完全不同：前者是「再测一次」，后者是「以后都不用管」。
-        print("本次不做任何改动：数据波动太大，切换的依据不成立。")
-        print("（结论已存 plan.json；等信号好转再体检一次）")
-    elif do_band is False and best_band and str(best_band) != str(cmp_band) \
-            and band_gain is not None:
-        # 有别的频段略好，但差距在阈值内 —— 不能写成「当前已是最优」，
-        # 那跟上面那句「最优只高 0.1 Mbps」自相矛盾。
-        print(f"不建议切换：BAND {best_band} 只比现在高 {band_gain:.1f} Mbps，"
-              f"在正常波动范围内，不值得为它断一次网。")
-        print("（结论已存 plan.json；环境变了可以重新体检一次）")
+              + ("" if strategy == "auto" else f" --strategy {strategy}"))
+        print("           （只想看会改什么、不真改：再加 --dry-run）")
     else:
-        print("当前配置已经是这个环境下最优，不需要改动。")
+        print(_no_change_reason(strategy, options, auto_why))
         print("（结论已存 plan.json；环境变了可以重新体检一次）")
     return 0
+
+
+def _describe_speed(opt, caveats, best_band, cmp_band, gain):
+    if opt:
+        return (f"BAND {opt['band']}，预计 {opt['gain']:+.1f} Mbps"
+                + (f"（{opt['gain_pct']:+d}%）" if opt.get("gain_pct") is not None else ""))
+    if caveats:
+        return "数据波动/不可信，这条线不敢给建议"
+    if best_band is None or str(best_band) == str(cmp_band):
+        return "现在这个频段就是最快的"
+    if gain is not None:
+        return f"最快也只高 {gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps 阈值"
+    return "没有可比的数据"
+
+
+def _describe_stability(opt, cur_res):
+    if opt:
+        return (f"BAND {opt['band']} —— 现在 {opt['cur_range'][0]}~{opt['cur_range'][1]}"
+                f"（{opt['cur_ratio']} 倍），它 {opt['best_range'][0]}~{opt['best_range'][1]}"
+                f"（{opt['best_ratio']} 倍）")
+    if not cur_res or not cur_res.get("ok"):
+        return "当前频段没有可用数据，比不出稳不稳"
+    cur_ratio = _sample_ratio(cur_res)
+    if cur_ratio is None:
+        return "当前频段只测了一轮，判断不了稳不稳（换 --rounds 3 再测）"
+    if cur_ratio <= STABILITY_BEST_RATIO:
+        return f"当前频段本来就稳（波动 {cur_ratio:.1f} 倍），不需要为了稳去换"
+    return "没找到「既稳又不会更慢」的替代频段"
+    return "有频段在乱跳，但没找到既稳又不比它慢的替代"
+
+
+def _no_change_reason(strategy, options, auto_why):
+    """没建议时把「为什么不改」说清楚，并指出别的策略是否还有路可走。"""
+    if strategy == "auto":
+        head = f"本次不改动：{auto_why}。"
+        extra = [k for k in ("speed", "stability") if options.get(k)]
+        if extra:
+            tip = "、".join("按速度" if k == "speed" else "按稳定" for k in extra)
+            return head + f"\n但{tip}这条线还有建议，想强制的话加 --strategy {extra[0]}。"
+        return head + "\n保持现状就好。"
+    head = f"按「{'速度' if strategy == 'speed' else '稳定'}」本次不改动。"
+    other = "stability" if strategy == "speed" else "speed"
+    if options.get(other):
+        return head + f"\n但另一条线有建议，加 --strategy {other}（或用默认的自动裁决）。"
+    return head + "\n另一条线同样没有更好的选择，保持现状就好。"
 
 
 def _mark_applied(plan, band, channel, result):
@@ -736,6 +946,23 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     target = plan.get("target") or {}
     t_band, t_ch = target.get("band", cur_band), target.get("channel", cur_ch)
 
+    # 策略：命令行显式指定 > 体检时用的 > 默认按速度
+    strategy = getattr(args, "strategy", None) or plan.get("strategy") or "speed"
+    options = plan.get("options") or {}
+    if getattr(args, "strategy", None) and options:
+        # 用户换了策略：改用那条线的目标。那条线没建议就如实说，不能悄悄套用另一条。
+        opt = options.get(strategy)
+        if not opt:
+            name = "速度" if strategy == "speed" else "稳定"
+            print(f"[×] 这份结论里「按{name}」没有可用的建议。")
+            other = "stability" if strategy == "speed" else "speed"
+            if options.get(other):
+                print(f"    另一条线有建议：加 --strategy {other}")
+            else:
+                print("    两条线都没有更好的选择，保持现状即可。")
+            return 0
+        t_band = opt.get("band", t_band)
+
     todo = []
     if t_band != cur_band and caps.get("can_lock_band"):
         todo.append(("band", t_band))
@@ -747,12 +974,17 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
         _mark_applied(plan, cur_band, cur_ch, "nothing_to_do")
         return 0
 
-    print("按体检结论应用：")
+    print(f"按体检结论应用（策略：{'速度' if strategy == 'speed' else '稳定'}）：")
     for kind, val in todo:
         if kind == "band":
             print(f"  · 频段 {_band_label(cur_band)} → {_band_label(val)}")
         else:
             print(f"  · 信道 {cur_ch} → {val}")
+
+    if getattr(args, "dry_run", False):
+        print("\n[演练] 以上是「将会做」的改动；加了 --dry-run 所以没有碰设备。")
+        print("       去掉 --dry-run 就会真的切过去（约 30~60 秒，中途断网一次）。")
+        return 0
 
     save_state({"saved_at": datetime.now().isoformat(),
                 "band": cur_band, "channel": cur_ch})
@@ -957,18 +1189,24 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
         print("\n[!] 没能读到本次结论，请重跑一次。")
         return 1
 
-    if plan.get("caveats"):
-        print("\n[!] 本次数据不足以支撑改动，已停在这里（原因见上面的 [!] 行）。")
-        return 0
-
-    changes = plan.get("changes") or []
-    if not changes:
-        print("\n[√] 不用改。你的设备现在就是这个环境下最好的配置。")
+    # 默认走自动裁决；只有用户想强制某一条时才需要输入字母。
+    options = plan.get("options") or {}
+    avail = [k for k in ("auto", "speed", "stability") if options.get(k)]
+    if not avail:
+        print("\n[√] 没有更好的选择，不用改。")
         return 0
 
     print("\n" + "=" * 56)
-    print("要现在就应用吗？直接回车 = 应用；输入 n = 不改，保持原样")
-    print("（应用只切一次，约 30~60 秒，会短暂断网）")
+    if options.get("auto"):
+        a = options["auto"]
+        print(f"要现在就应用吗？回车 = 按自动建议切到 BAND {a['band']}（{a['reason']}）")
+    else:
+        print("要现在就应用吗？回车 = 应用上面的建议")
+    if options.get("speed"):
+        print("  a = 只看速度那条线")
+    if options.get("stability"):
+        print("  b = 只看稳定那条线")
+    print("  n = 不改，保持原样（应用只切一次，约 30~60 秒，会短暂断网）")
     try:
         ans = input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -978,6 +1216,14 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
     if ans in ("n", "no", "q", "quit", "不", "否", "取消"):
         print("已跳过，设备保持原样。下次想应用直接跑：python autotune.py --apply-plan")
         return 0
+    if ans.startswith("a") and options.get("speed"):
+        args.strategy = "speed"
+    elif ans.startswith("b") and options.get("stability"):
+        args.strategy = "stability"
+    else:
+        args.strategy = "auto" if options.get("auto") else avail[0]
+    if args.strategy not in [k for k in avail]:
+        args.strategy = avail[0]
 
     try:
         cur = dev.get_state()
@@ -1019,6 +1265,11 @@ def main():
                     help="只看当前状态（频段/信道/信号），不测量、不改动")
     ap.add_argument("--scan", action="store_true",
                     help="只扫周边 2.4G 信道（几秒，不碰设备）——用来验证手机能不能扫")
+    ap.add_argument("--strategy", "-s", choices=("auto", "speed", "stability"), default=None,
+                    help="换频段的裁决方式：auto=自动（默认，速度强太多选快的、速度差不多选稳的、"
+                         "稳定性差不多选快的）/ speed=只按速度 / stability=只按稳定")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="演练：把要做的改动打出来但不碰设备（配合 --apply / --apply-plan）")
     ap.add_argument("--version", action="version",
                     version=f"mifi-autotune {__version__}")
     ap.add_argument("--watch", action="store_true",
@@ -1236,27 +1487,29 @@ def main():
             cur_res = next((r for r in results if r["band"] == cmp_band), None)
             best_res = usable[0] if usable else None
             caveats = assess_reliability(results, cur_res, best_res)
+            for r in results:
+                if r.get("ok") and quality_issue(r):
+                    print(f"      [!] BAND {r['band']} {quality_issue(r)}"
+                          f" —— 质量不可接受，不参与「最优」的评选")
             if usable:
-                best_band = best_res["band"]
-                for r in results:
-                    if r.get("ok") and quality_issue(r):
-                        print(f"      [!] BAND {r['band']} {quality_issue(r)}"
-                              f" —— 质量不可接受，不参与「最优」的评选")
-                print(f"\n      最优频段：BAND {best_band}"
+                print(f"\n      最优频段：BAND {best_res['band']}"
                       f"（中位 {best_res['mbps']} Mbps，单轮 {best_res['mbps_all']}）")
-                if caveats:
-                    print("      [!] 这次数据不足以支撑切换，先不改：")
-                    for c in caveats:
-                        print(f"          · {c}")
-                    best_band = cur_band
-                elif str(best_band) == str(cmp_band):
-                    print("      当前就驻留在这个频段，无需锁定")
-                    best_band = cur_band
-                elif (cur_res and cur_res.get("ok")
-                        and best_res["mbps"] - cur_res["mbps"] < MIN_BAND_GAIN_MBPS):
-                    print(f"      但相比当前 {cur_label}（{cur_res['mbps']} Mbps）"
-                          f"提升不足 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
-                    best_band = cur_band
+            # 与 --preview 同一套裁决（自动 + 两条单线），否则 --watch 和手动跑会给出不同结论
+            opts = {"auto": decide_band(cur_res, usable, cmp_band)[0],
+                    "speed": speed_option(cur_res, best_res, cmp_band, caveats),
+                    "stability": stability_option(cur_res, usable, cmp_band)}
+            strat = getattr(args, "strategy", None) or "auto"
+            report["options"] = opts
+            report["strategy"] = strat
+            picked = opts.get(strat)
+            if picked:
+                best_band = picked["band"]
+                label = {"auto": "自动", "speed": "速度", "stability": "稳定"}[strat]
+                print(f"      按「{label}」建议：BAND {cur_label} → BAND {best_band}"
+                      f"（{picked.get('reason')}）")
+            elif usable:
+                print(f"      按「{strat}」这次不给建议，保持现状")
+                best_band = cur_band
             else:
                 print("\n      [!] 所有频段都不通，回滚到未锁定")
                 best_band = 0
@@ -1268,7 +1521,7 @@ def main():
         and report.get("wifi", {}).get("cur_score") is not None
         and report["wifi"]["cur_score"] - report["wifi"]["best_score"] >= MIN_CHANNEL_GAIN
     )
-    do_band = (best_band is not None and str(best_band) != str(cur_band) and not caveats)
+    do_band = (best_band is not None and str(best_band) != str(cur_band))
     print(f"建议：信道 {cur_ch} -> {best_ch if do_ch else '保持'} ｜ "
           f"频段 {cur_label} -> "
           f"{('BAND ' + str(best_band)) if do_band else '保持'}")

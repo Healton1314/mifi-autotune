@@ -194,17 +194,19 @@ class ConclusionWording(unittest.TestCase):
         unstable["mbps_all"] = [9.9, 46.6]          # 4.7 倍波动
         faster = band_result(40, 40.0)
         text = self._run([unstable, faster])
-        self.assertIn("不可信", text)
-        self.assertIn("数据波动太大", text)
-        self.assertNotIn("不到 3 Mbps", text)        # 不复述矛盾的阈值语句
-        self.assertNotIn("不值得为它断一次网", text)
+        # 真实原因是「数据不可信」，必须这么写；不能套用「差距小、不值得」的说法
+        self.assertIn("数据波动", text)
+        self.assertIn("数据不足以下结论", text)
+        self.assertNotIn("不到 3 Mbps", text)
+        self.assertNotIn("值得为它断一次网", text)
 
     def test_healthy_gap_below_threshold_says_not_worth(self):
         a = band_result(3, 30.0)
         b = band_result(40, 31.0)                    # 只高 1 Mbps，低于阈值
         text = self._run([a, b])
-        self.assertIn("不值得切换", text)
-        self.assertNotIn("不可信", text)
+        self.assertIn("不到 3 Mbps 阈值", text)
+        self.assertIn("本次不改动", text)
+        self.assertNotIn("数据不足以下结论", text)
 
 
 class ContestStartsFromHealthyState(unittest.TestCase):
