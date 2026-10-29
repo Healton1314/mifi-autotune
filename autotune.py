@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -223,9 +223,14 @@ def diagnose_signal(sig):
                 "advice": "这个强度换频段救不了（哪个频段都会很差）。"
                           "把设备挪到窗边、抬高、避开金属和承重墙，比任何软件调优都有效。"}
     if sinr is not None and sinr <= SIG_SINR_BAD:
-        return {"level": "noisy", "text": f"{head} —— 覆盖够但干扰重",
-                "advice": "属于「干扰主导」：这类环境下换频段收益通常明显，"
-                          "如果下面给出了切换建议，值得照做。"}
+        # RSRP -103dBm 这种「偏弱」不能说成「覆盖够」—— 实跑出现过
+        # 「RSRP -103dBm、SINR -1dB —— 覆盖够但干扰重」，与数值不符。
+        weak_cover = rsrp < SIG_RSRP_OK
+        return {"level": "noisy",
+                "text": f"{head} —— {'覆盖偏弱' if weak_cover else '覆盖够'}但干扰重",
+                "advice": ("属于「干扰主导」：这类环境下换频段收益通常明显，"
+                           "如果下面给出了切换建议，值得照做。"
+                           + ("另外覆盖本身也偏弱，位置能改善就一起改善。" if weak_cover else ""))}
     if rsrp >= SIG_RSRP_OK and (sinr is None or sinr >= SIG_SINR_OK):
         return {"level": "good", "text": f"{head} —— 信号良好",
                 "advice": "环境本来就不差，切换频段的收益有限，别指望大幅提速。"}
@@ -1421,7 +1426,8 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
     options = plan.get("options") or {}
     avail = [k for k in ("auto", "speed", "stability") if options.get(k)]
     if not avail:
-        print("\n[√] 没有更好的选择，不用改。")
+        # 上面的体检结论刚说过「为什么不用改」，这里再说一遍就是啰嗦
+        # （实跑截图的末尾出现过「…不值得为它断一次网」紧跟「没有更好的选择」）。
         return 0
 
     print("\n" + "=" * 56)

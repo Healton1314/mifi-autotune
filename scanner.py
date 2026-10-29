@@ -238,13 +238,20 @@ def _scan_termux():
     aps = []
     for ap in data:
         ssid = (ap.get("ssid") or "").strip()
-        freq = ap.get("frequency")
+        # 字段名有两套，必须都认：
+        #   旧版 Termux:API → frequency / level
+        #   新版（Android 10+ 直接转 WifiScanner 的 ScanResult）→ frequency_mhz / rssi
+        # 只读 frequency 的话，新版机器上每个 AP 都会被当成「没有频率」扔掉 ——
+        # 表现就是「明明扫到了，工具却说一个都没扫到」（2026-10-29 用户实机踩到）。
+        freq = ap.get("frequency_mhz") or ap.get("frequency")
         if not ssid or not freq:
             continue
         ch = freq_to_channel(int(freq))
         if not ch:
             continue
-        lvl = ap.get("level")
+        lvl = ap.get("rssi")
+        if lvl is None:
+            lvl = ap.get("level")
         # Termux 给 dBm，和 Windows 的百分比统一到 0~100
         sig = max(0, min(100, 2 * (int(lvl) + 100))) if lvl is not None else 0
         aps.append({"ssid": ssid, "bssid": ap.get("bssid", ""),
@@ -357,6 +364,65 @@ def scan_diagnose():
     return "\n".join("      " + ln for ln in lines)
 
 
+def _describe_termux_records():
+    """有数据却用不上时，说清「系统到底给了什么」。
+
+    实测（2026-10-29 用户实机）：退出码 0、API 桥也通，但只返回 1 条
+    5200MHz、SSID 空、timestamp 是 2022-12-04 的记录 —— 那是系统缓存，
+    不是这次扫描的结果。原来那句「可能只返回了当前连接的那个」与证据不符
+    （当时连的是 2.4G，这条是 5GHz），等于把人往错的方向引。
+    返回 None 表示解析不了，交给上层的兜底文案。
+    """
+    try:
+        data = json.loads(_LAST_TERMUX.get("stdout") or "[]")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+
+    now_ms = time.time() * 1000
+    freqs, hidden, ages = [], 0, []
+    for ap in data:
+        f = ap.get("frequency_mhz") or ap.get("frequency")
+        if f:
+            try:
+                freqs.append(int(f))
+            except (TypeError, ValueError):
+                pass
+        if not (ap.get("ssid") or "").strip():
+            hidden += 1
+        ts = ap.get("timestamp")
+        if ts:
+            try:
+                ages.append((now_ms - float(ts)) / 3600000)
+            except (TypeError, ValueError):
+                pass
+
+    bits = [f"系统返回 {len(data)} 条记录"]
+    if freqs:
+        g5 = sum(1 for f in freqs if f > 3000)
+        g24 = len(freqs) - g5
+        bands = "、".join(x for x in ((f"2.4G {g24} 条" if g24 else ""),
+                                      (f"5G {g5} 条" if g5 else "")) if x)
+        bits.append(bands)
+    if hidden:
+        bits.append(f"其中 {hidden} 条没名字（隐藏网络）")
+    head = "，".join(bits)
+
+    if ages and min(ages) > 1:
+        return (f"{head}；最新那条也是 {min(ages):.0f} 小时前的 —— "
+                f"这是系统的**缓存**，不是这次扫描的结果。"
+                f"打开手机「位置信息」总开关（光给权限不够），把 Termux:API 的定位"
+                f"改成「始终允许」；Android 13+ 再开「附近的设备」。")
+
+    if freqs and all(f > 3000 for f in freqs):
+        return (f"{head} —— 只扫到 5GHz，2.4G 一个都没有。"
+                f"要么周边确实没有 2.4G 热点，要么系统没把 2.4G 结果交出来。"
+                f"信道部分跳过，频段优化不受影响。")
+
+    return f"{head}，但没有一条能参与信道评分（名字或频率缺失）。"
+
+
 def scan_failure_hint():
     """扫描返回空时，指出具体缺哪一步。
 
@@ -409,8 +475,12 @@ def scan_failure_hint():
         if body in ("", "[]"):
             return ("Termux:API 返回空列表 —— 十有八九是没给 **Termux:API** 的「定位」权限。"
                     "安卓 10+ 把 WiFi 扫描算作位置信息，没权限就只能拿到空结果。"
+                    "注意还要打开手机的「位置信息」总开关，只给权限是不够的。"
                     "频段优化不受影响。")
 
+        detail = _describe_termux_records()
+        if detail:
+            return detail
         return "拿到了扫描结果但解析不出可用 AP（可能只返回了当前连接的那个）"
     if sys.platform.startswith("win"):
         return "netsh 没抓到 BSSID：系统语言可能不在支持列表，或无线网卡被禁用"

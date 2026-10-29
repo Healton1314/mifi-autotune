@@ -10,6 +10,7 @@
 
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -121,6 +122,67 @@ class TestScanRounds(unittest.TestCase):
             aps = scanner.scan_2g(rounds=3, min_hits=2)
         self.assertEqual(calls["n"], 3)
         self.assertEqual(aps[0]["ssid"], "a")
+
+
+class TermuxFieldNames(unittest.TestCase):
+    """Termux:API 有两个版本的 JSON 字段名，必须都认。
+
+    2026-10-29 用户实机：退出码 0、API 桥通，但工具说「一个都没扫到」。
+    真因是代码只读 `frequency` / `level`，而这台机器返回的是
+    `frequency_mhz` / `rssi` —— 每条记录都被当成「没有频率」丢掉了。
+    这个 bug 的表现和「没权限」一模一样，所以必须用真实返回锁住。
+    """
+
+    def _parse(self, payload):
+        import json
+        with mock.patch.object(scanner, "run_detail",
+                               lambda *a, **k: (json.dumps(payload), "", 0)), \
+                mock.patch.object(scanner.shutil, "which", lambda n: "/usr/bin/" + n):
+            return scanner._scan_termux()
+
+    def test_new_style_fields(self):
+        now = time.time() * 1000
+        aps = self._parse([
+            {"bssid": "aa:bb", "ssid": "月亮糖", "frequency_mhz": 2437,
+             "rssi": -55, "timestamp": now},
+            {"bssid": "cc:dd", "ssid": "邻居", "frequency_mhz": 2462,
+             "rssi": -70, "timestamp": now},
+        ])
+        self.assertEqual(len(aps), 2)
+        self.assertEqual(aps[0]["ch"], 6)
+        self.assertEqual(aps[1]["ch"], 11)
+        self.assertGreater(aps[0]["sig"], aps[1]["sig"])   # -55dBm 强于 -70dBm
+
+    def test_old_style_fields_still_work(self):
+        now = time.time() * 1000
+        aps = self._parse([{"bssid": "ee:ff", "ssid": "老格式", "frequency": 2412,
+                            "level": -60, "timestamp": now}])
+        self.assertEqual(len(aps), 1)
+        self.assertEqual(aps[0]["ch"], 1)
+
+
+class StaleCacheHint(unittest.TestCase):
+    """只有缓存时的提示必须点名「缓存」，不能猜成「只返回当前连接的」。"""
+
+    def _hint(self, payload):
+        import json
+        scanner._LAST_TERMUX.update(stdout=json.dumps(payload), stderr="", code=0,
+                                    ts=time.time())
+        return scanner._describe_termux_records()
+
+    def test_2022_record_is_called_cache(self):
+        # 用户截图里的原样数据
+        text = self._hint([{"bssid": "ec.b9:70:dd:c6:13", "frequency_mhz": 5200,
+                            "rssi": -83, "ssid": "", "timestamp": 1670139781770,
+                            "channel_bandwidth_mhz": "40"}])
+        self.assertIn("缓存", text)
+        self.assertIn("位置信息", text)
+
+    def test_fresh_5g_only_points_at_band(self):
+        text = self._hint([{"bssid": "aa", "frequency_mhz": 5200, "rssi": -60,
+                            "ssid": "5G网", "timestamp": time.time() * 1000}])
+        self.assertIn("只扫到 5GHz", text)
+        self.assertNotIn("缓存", text)
 
 
 if __name__ == "__main__":

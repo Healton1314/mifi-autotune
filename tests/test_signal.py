@@ -31,6 +31,12 @@ class DiagnoseSignal(unittest.TestCase):
         self.assertIn("如果下面给出了切换建议", d["advice"])
         self.assertNotIn("换频段救不了", d["advice"])
 
+    def test_weak_rsrp_with_bad_sinr_says_weak_not_enough(self):
+        """-103dBm 说成「覆盖够」与数值不符（实跑输出过）。"""
+        d = self.diag("-103dBm", "-1dB")
+        self.assertIn("覆盖偏弱", d["text"])
+        self.assertNotIn("覆盖够", d["text"])
+
     def test_good_signal_manages_expectations(self):
         d = self.diag("-85dBm", "15dB")
         self.assertEqual(d["level"], "good")
