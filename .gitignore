@@ -13,6 +13,10 @@ plan.json
 autotune-log.jsonl
 *.log
 
+# 一次性的本地试验输出
+_msg.txt
+preview-run*.txt
+
 # 打包产物
 dist/
 build/

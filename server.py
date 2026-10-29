@@ -423,11 +423,13 @@ class Handler(SimpleHTTPRequestHandler):
         own = cfg.get("own_ssid") or scanner.connected_ssid() or st.get("ssid")
         aps = scanner.scan_2g(rounds=5, delay=3, own_ssid=own)
         if not aps:
+            # 面板这里以前写死成「系统语言不支持或无线网卡未启用」—— 手机上那句话
+            # 是错的（真正原因通常是没装 Termux:API 或没给定位权限）。统一走
+            # 扫描层那套病因判断，面板和命令行不能给两套互相矛盾的说法。
             return {"current": st["channel"], "best": None, "aps": [],
-                    "scores": [], "error": "没有扫到邻居 AP（系统语言不支持或无线网卡未启用）"}
+                    "scores": [], "error": scanner.scan_failure_hint()}
         rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
         return {"current": st["channel"], "best": rows[0]["ch"], "aps": aps, "scores": rows}
-
 
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

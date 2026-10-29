@@ -65,24 +65,42 @@ _RTT = re.compile(r"(?:time|时间|tiempo|temps|zeit|زمان)[=<]\s*([\d.,]+)\s
 _ANY_MS = re.compile(r"([\d.,]+)\s*ms", re.I)
 
 
-def _tcp_latency(n, host, port=53, timeout=2.0):
+_TCP_PORTS = (53, 443, 80)
+
+
+def _tcp_latency(n, host, port=None, timeout=1.5):
     """用 TCP 连接握手耗时当延迟，替代 ping。
 
     为什么必须有这条路：Android 上普通进程拿不到 ICMP（需要 root），
     Termux 里也未必装了 iputils 的 ping。没有它，手机上所有频段都会被判成
     「有信号但数据不通」，工具等于废掉。
     TCP 握手耗时与 RTT 基本一致，对「能不能上、稳不稳」的判断足够用。
+
+    为什么不止一个端口：手机上到 223.5.5.5 的 TCP/53 经常被运营商丢包或限速，
+    只试 53 会把「这个端口不通」误判成「整条链路不通」，然后所有频段都被判
+    「数据不通」——用户看到的就是「测了 6 个频段全是无服务」。
+    所以按 53 → 443 → 80 依次敲，哪个通了就优先用它；连续失败的端口直接放弃，
+    避免全断网时 10 次探测 × 3 端口 × 超时 把一次测量拖成 45 秒。
     """
     import socket
+    ports = [port] if port else list(_TCP_PORTS)
+    fails = {p: 0 for p in ports}
     rtts = []
     for _ in range(n):
-        t0 = time.time()
-        try:
-            s = socket.create_connection((host, port), timeout=timeout)
-            s.close()
+        for p in list(ports):
+            if fails.get(p, 0) >= 2:
+                continue
+            t0 = time.time()
+            try:
+                s = socket.create_connection((host, p), timeout=timeout)
+                s.close()
+            except OSError:
+                fails[p] = fails.get(p, 0) + 1
+                continue
             rtts.append((time.time() - t0) * 1000)
-        except OSError:
-            pass
+            fails[p] = 0
+            ports = [p] + [x for x in ports if x != p]      # 记住能通的，下次先试
+            break
     return rtts
 
 

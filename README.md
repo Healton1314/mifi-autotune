@@ -227,6 +227,8 @@ python autotune.py --preview
 
 这条是事故驱动的：早期版本在测 BAND 8 时驱动超时崩溃，进程直接退出，设备被留在 BAND 8（丢包 60%），用户当场上不了网。
 
+> 这个保护只有一份实现（`measure_all_bands`），`--preview` 和 `--apply`（也就是 `--watch` 触发的那条路）共用它。以前两处各写一遍，`--apply` 那份漏了 `try/finally`——同一份代码写两遍，迟早只修一处。
+
 ### 附：设备会话会自动重建（不用手动开浏览器）
 
 部分 ZTE-RTA 固件在切换频段后会把管理会话踢掉（`login_status=KICKOFF`），而这时 `xml_action.cgi` 不再下发 Digest 挑战。工具会自动走设备自己的 `login.cgi` 重新登录：
