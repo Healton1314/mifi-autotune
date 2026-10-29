@@ -513,10 +513,13 @@ mifi
 mifi --status     # 只看当前状态（几秒，不测量）
 mifi --scan       # 只扫周边信道，验证手机能不能扫（不碰设备、不影响频段）
 mifi --restore    # 还原成「不锁频段 + 自动信道」
+mifi --clean      # 清掉历史记录和缓存（只留最近一次结果）
 mifi --web        # 还想要图形界面时用（需要留着那个窗口）
 mifi --update     # 更新到最新代码
 mifi --help       # 这一版支持的全部用法（mifi --help --all 看完整参数表）
 ```
+
+**运行记录只留最近一次**：每跑完一次，`autotune-log.jsonl` 里的上一条会被替换掉（不是无限追加），`plan.json` / `state.json` 本来就是覆盖写。想多留几份历史就改 `config.json` 里的 `"log_keep": 5`；设成 `0` 就完全不保存。`mifi --clean` 会把这些连同 `__pycache__` 一起清掉，但**保留 `config.json` 和面板令牌**。
 
 **三个手机上特有的点**：
 
