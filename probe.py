@@ -10,6 +10,7 @@
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -59,6 +60,70 @@ def _ping_cmd(n, host):
     if IS_MAC:
         return ["ping", "-c", str(n), host]
     return ["ping", "-c", str(n), "-W", "2", host]
+
+
+# ---- 路径 MTU 探测（电脑端专用）------------------------------------------
+#
+# 只在电脑上做。原因不是懒：Android 不给普通应用 ICMP 权限，Termux 里
+# ping 也常常不可用（拿不到 raw socket），硬做出来只会给个假数字。
+# 而这项检查本来就不需要常跑——一条线路的路径 MTU 基本不变，测一次就够。
+
+IPV4_HDR = 28              # 20 字节 IP 头 + 8 字节 ICMP 头
+MTU_MAX_PAYLOAD = 1472     # MTU 1500 时最大不分片 payload
+
+
+def is_termux():
+    return "com.termux" in os.environ.get("PREFIX", "")
+
+
+def _ping_df_ok(size, host, wait_ms=1500):
+    """发一个「禁止分片」的 ICMP 包：收到回应 = 这个 payload 能整包过去。
+
+    必须用不分片模式（-f / -M do / -D）。普通 ping 大包会被中间设备静默
+    分片，看起来通了，但真实 TCP 流量一旦置 DF 就会丢——这正是 MTU 设大了
+    时「网页能开、下载大文件卡死」的成因。
+    """
+    if IS_WIN:
+        cmd = ["ping", "-n", "1", "-f", "-l", str(size), "-w", str(wait_ms), host]
+    elif IS_MAC:
+        cmd = ["ping", "-c", "1", "-D", "-s", str(size), "-W", "2", host]
+    else:
+        cmd = ["ping", "-c", "1", "-M", "do", "-s", str(size), "-W", "2", host]
+    out = sh(cmd, timeout=max(4.0, wait_ms / 1000.0 + 3))
+    low = out.lower()
+    # 明确的「包太大」回执：Windows「需要拆分数据包」/ 英文 Frag needed / MTU 字样
+    if "fragment" in low or "需要拆分" in out or "too big" in low or "mtu" in low:
+        return False
+    # 收到任何一次回包就算过（不同语言版本的 TTL 字样不同，退一步看 xx ms）
+    return bool(_ANY_MS.search(out) or "ttl" in low)
+
+
+def detect_path_mtu(host=DEFAULT_PING_HOST, lo=1200, hi=MTU_MAX_PAYLOAD):
+    """二分找出到 host 的路径 MTU。返回 (mtu 或 None, 给人看的说明)。"""
+    if is_termux():
+        return None, ("手机端拿不到 ICMP 权限，MTU 只能在电脑上测"
+                      "（这条和频段优化无关，不影响手机体检）")
+    if not IS_WIN and not shutil.which("ping"):
+        return None, "这台机器上没有 ping 命令，测不了"
+
+    if _ping_df_ok(hi, host):
+        return hi + IPV4_HDR, f"{hi + IPV4_HDR} 字节（标准值，不用改）"
+
+    if not _ping_df_ok(lo, host):
+        # 连 1200 都不通：要么链路真的有问题，要么 ICMP 被拦（公共 WiFi 很常见）。
+        # 这种时候给任何数字都是瞎猜，必须说「测不出来」。
+        return None, (f"连 {lo} 字节的大包都不通：可能是 ICMP 被中间设备拦了"
+                      f"（公共网络常见），也可能是链路本身有问题。"
+                      f"这种情况测不出来，别据此改 MTU")
+
+    a, b = lo, hi                     # a 能过、b 过不去
+    while b - a > 1:
+        mid = (a + b) // 2
+        if _ping_df_ok(mid, host):
+            a = mid
+        else:
+            b = mid
+    return a + IPV4_HDR, f"{a + IPV4_HDR} 字节（最大不分片 payload {a} 字节）"
 
 
 _RTT = re.compile(r"(?:time|时间|tiempo|temps|zeit|زمان)[=<]\s*([\d.,]+)\s*ms", re.I)
