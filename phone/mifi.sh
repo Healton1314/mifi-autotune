@@ -7,6 +7,7 @@
 #   mifi --restore  还原成「不锁频段 + 自动信道」
 #   mifi --web      起本地面板（可选；需要一直留着这个窗口）
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
+#   mifi --help     显示上面这段；mifi --help --all 看全部参数
 #
 # 为什么默认不再用网页面板：手机上跑网页服务需要一个常驻进程，安卓会为省电把它杀掉，
 # 于是浏览器打不开、用户以为工具坏了。终端里跑没有这个问题——进程在前台，
@@ -24,7 +25,10 @@ PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null)"
 
 case "${1:-}" in
   --help|-h)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    # 打印本文件顶部的注释块，止于第一条非注释行——比写死行号稳，
+    # 以后加参数不会把帮助截断。
+    [ "${2:-}" = "--all" ] && exec "$PY" -u autotune.py --help
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
     exit 0
     ;;
   --update)

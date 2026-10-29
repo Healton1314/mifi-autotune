@@ -34,6 +34,10 @@ STATE = HERE / "state.json"
 LOG = HERE / "autotune-log.jsonl"
 CONFIG = HERE / "config.json"
 
+# 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
+# 改功能就往上加，别让两个不同的行为共用一个号。
+__version__ = "0.3.0"
+
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
@@ -941,6 +945,8 @@ def main():
                     help="只看当前状态（频段/信道/信号），不测量、不改动")
     ap.add_argument("--scan", action="store_true",
                     help="只扫周边 2.4G 信道（几秒，不碰设备）——用来验证手机能不能扫")
+    ap.add_argument("--version", action="version",
+                    version=f"mifi-autotune {__version__}")
     ap.add_argument("--watch", action="store_true",
                     help="进阶：长期挂在后台，明显劣化时才自动重测并切换")
     ap.add_argument("--watch-interval", type=int, default=300,
@@ -957,10 +963,12 @@ def main():
         # 不该为了验证它去跑一次 5 分钟的频段体检。
         own = args.ssid or cfg.get("own_ssid") or scanner.connected_ssid()
         print(f"扫描周边 2.4G（{args.scan_rounds} 轮合并）…")
+        print("      （手机上第一次调用要先唤起 Termux:API，慢的话可能要等半分钟；"
+              "卡住会在超时后直接告诉你是哪一步坏了）")
         aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
         if not aps:
             print(f"[×] 没扫到邻居 AP：{scanner.scan_failure_hint()}")
-            print("      原始信息（排查用）：")
+            print("      原始信息（排查用，复制这一段就能定位问题）：")
             print(scanner.scan_diagnose())
             return 1
         if own:
