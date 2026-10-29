@@ -68,6 +68,17 @@ PHONE_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "env", "dist", "build
 PHONE_SKIP_FILES = {"state.json", "config.json", "plan.json", "autotune-log.jsonl",
                     ".panel-token"}
 
+# 打进包时必须强制 LF 的文本类型。
+#
+# 踩过的坑：Windows 上工作区的 .sh 是 CRLF（.gitattributes 只管 git 读写，
+# 管不到已经落盘的文件），直接 zip 给手机后 bash 会把行尾的 \r 当成命令的一部分——
+# 报错是 `line 11: PREFIX: command not found`、`case "$PKG" in\r` 语法错误这种
+# 完全看不出和换行符有关的怪样子，排查一次要半天。这里在打包时抹掉，谁的工作区
+# 是什么样都不影响手机端能不能跑。
+# .bat 不在此列：Windows 自己要用，CRLF 才是它该有的样子。
+PHONE_LF_SUFFIXES = {".sh", ".py", ".txt", ".md", ".toml", ".yml", ".yaml", ".json",
+                     ".html", ".css", ".js", ".manifest", ".webmanifest"}
+
 
 def build_phone_package():
     """把当前代码打成 zip（排除运行期产物与本机配置）。"""
@@ -86,7 +97,14 @@ def build_phone_package():
                 continue
             if p.suffix in (".pyc", ".zip"):
                 continue
-            z.write(p, str(Path("mifi-autotune") / rel))
+            arcname = str(Path("mifi-autotune") / rel)
+            if p.suffix.lower() in PHONE_LF_SUFFIXES:
+                # 用 writestr 才能改写内容；from_file 保留时间戳与权限位
+                info = zipfile.ZipInfo.from_file(p, arcname)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(info, p.read_bytes().replace(b"\r\n", b"\n"))
+            else:
+                z.write(p, arcname)
     return buf.getvalue()
 
 
