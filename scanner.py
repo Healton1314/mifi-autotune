@@ -40,12 +40,29 @@ def sh(cmd, timeout=60):
         p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_env())
     except Exception:  # noqa: BLE001
         return ""
+    return _decode(p.stdout)
+
+
+def _decode(raw):
     for enc in ("oem", "utf-8", "gbk", "cp936", "latin-1"):
         try:
-            return p.stdout.decode(enc)
+            return raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
-    return p.stdout.decode("utf-8", "ignore")
+    return raw.decode("utf-8", "ignore")
+
+
+def run_detail(cmd, timeout=60):
+    """跑命令并同时拿到 stdout / stderr / 退出码。
+
+    诊断「为什么扫不到」必须看 stderr：手机上 termux-wifi-scaninfo 失败时
+    常常是 **stdout 空 + stderr 报错**，只看 stdout 会一律误判成「没权限」。
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_env())
+    except Exception as e:  # noqa: BLE001
+        return "", f"{type(e).__name__}: {e}", None
+    return _decode(p.stdout), _decode(p.stderr), p.returncode
 
 
 # ---------------------------------------------------------------- 关键词表
@@ -147,6 +164,9 @@ def freq_to_channel(freq):
     return None
 
 
+_LAST_TERMUX = {"stdout": "", "stderr": "", "code": None}
+
+
 def _scan_termux():
     """Android 上通过 Termux:API 拿扫描结果。
 
@@ -155,7 +175,8 @@ def _scan_termux():
     """
     if not shutil.which("termux-wifi-scaninfo"):
         return []
-    out = sh(["termux-wifi-scaninfo"], timeout=45)
+    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=45)
+    _LAST_TERMUX.update(stdout=out, stderr=err, code=code)
     try:
         data = json.loads(out)
     except Exception:  # noqa: BLE001
@@ -263,6 +284,23 @@ def _scan_macos():
 # ---------------------------------------------------------------- 统一入口
 
 
+def scan_diagnose():
+    """扫描失败时把原始事实摊开：命令在不在、退出码、stdout / stderr。
+
+    用户遇到「每次都扫不到」时，一句结论往往猜错；直接把原始输出给出来，
+    才能一次定位是缺包、缺 App、还是缺权限。
+    """
+    lines = []
+    which = shutil.which("termux-wifi-scaninfo")
+    lines.append(f"termux-wifi-scaninfo：{which or '未安装（pkg install termux-api）'}")
+    if which:
+        out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=25)
+        lines.append(f"退出码：{code}")
+        lines.append(f"stdout：{(out or '(空)').strip()[:200]}")
+        lines.append(f"stderr：{(err or '(空)').strip()[:200]}")
+    return "\n".join("      " + ln for ln in lines)
+
+
 def scan_failure_hint():
     """扫描返回空时，指出具体缺哪一步。
 
@@ -275,18 +313,35 @@ def scan_failure_hint():
     is_termux = "com.termux" in os.environ.get("PREFIX", "") or bool(shutil.which("termux-info"))
     if is_termux:
         if not shutil.which("termux-wifi-scaninfo"):
-            return ("手机上没装 termux-api。需要两样东西：① Termux 里 `pkg install termux-api`；"
-                    "② 装 Termux:API 这个应用（F-Droid 搜 Termux:API）。"
-                    "只有 ① 没 ② 一样扫不到。频段优化不受影响。")
-        try:
-            out = sh(["termux-wifi-scaninfo"], timeout=25).strip()
-        except Exception:  # noqa: BLE001
-            return "Termux:API 调用失败，检查 Termux:API 应用是否安装、是否允许后台运行"
-        if out in ("", "[]"):
-            return ("Termux:API 返回了空列表 → 缺权限。到系统设置里给 Termux:API 开"
-                    "「定位」权限（安卓 10+ 把 WiFi 扫描算作位置信息），"
-                    "安卓 12+ 可能还要开「附近的设备」。频段优化不受影响。")
-        return "拿到了扫描结果但解析不出可用 AP，可能是 5G-only 或格式不同"
+            return ("手机上没装 termux-api 包：在 Termux 里执行 `pkg install termux-api`。"
+                    "（只是跳过信道优化，频段不受影响）")
+
+        out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=25)
+        err_l = (err or "").lower()
+        body = (out or "").strip()
+
+        # 只有 Termux:API 这个 **App** 才能真的去调系统扫描。包装了这个 App 没装，
+        # 命令会存在但拿不到数据 —— 这是最常见的一种，光看 stdout 会误判成「没权限」。
+        if any(k in err_l for k in ("termux-api", "not installed", "unable to", "no such",
+                                    "command not found", "permission denied by user")):
+            return ("Termux:API 应用没装或没响应。需要两样都装：① Termux 里 "
+                    "`pkg install termux-api`；② **Termux:API 这个 App**（F-Droid 搜，"
+                    "必须和 Termux 同一个来源装）。频段优化不受影响。")
+
+        if any(k in err_l for k in ("permission", "denied", "not allowed", "security",
+                                    "unauthorized")):
+            return ("系统拒绝了扫描：去设置里给 **Termux:API** 开「定位」权限"
+                    "（安卓 10+ 把 WiFi 扫描算作位置信息），安卓 12+ 可能还要开「附近的设备」。")
+
+        if err.strip():
+            return f"termux-wifi-scaninfo 报错：{err.strip().splitlines()[0][:120]}"
+
+        if body in ("", "[]"):
+            return ("Termux:API 返回空列表 —— 十有八九是没给 **Termux:API** 的「定位」权限。"
+                    "安卓 10+ 把 WiFi 扫描算作位置信息，没权限就只能拿到空结果。"
+                    "频段优化不受影响。")
+
+        return "拿到了扫描结果但解析不出可用 AP（可能只返回了当前连接的那个）"
     if sys.platform.startswith("win"):
         return "netsh 没抓到 BSSID：系统语言可能不在支持列表，或无线网卡被禁用"
     if sys.platform == "darwin":

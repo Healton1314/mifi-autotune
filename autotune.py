@@ -960,6 +960,8 @@ def main():
         aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
         if not aps:
             print(f"[×] 没扫到邻居 AP：{scanner.scan_failure_hint()}")
+            print("      原始信息（排查用）：")
+            print(scanner.scan_diagnose())
             return 1
         if own:
             print(f"（已排除自己的 AP：{own}）")
