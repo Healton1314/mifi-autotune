@@ -842,7 +842,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             ch_auto = not cur_ch            # 0/None = 设备处于「自动信道」
             cur_score = (None if ch_auto
                          else next((r["score"] for r in rows if r["ch"] == cur_ch), None))
-            best = rows[0]
+            best = scanner.pick_best_channel(rows)
             wifi = {"current": cur_ch, "auto": ch_auto, "cur_score": cur_score,
                     "best": best["ch"], "best_score": best["score"],
                     "neighbors": len(aps)}
@@ -1541,12 +1541,16 @@ def main():
         shown = rows[:5]
         for r in shown:
             print(f"  信道 {r['ch']:>2}   干扰分 {r['score']}")
-        best = rows[0]
+        best = scanner.pick_best_channel(rows)
         # 最干净的信道经常不在上面几条里（那正是它干净的原因）。
         # 不说明的话，用户会以为「7 号没扫到」或「工具算错了」——实机反馈过。
         if best["ch"] not in {r["ch"] for r in shown}:
             print(f"  …只列干扰最高的 5 个；最干净的 {best['ch']} 号不在其中，"
                   f"正因为附近没人用")
+        if rows and best["ch"] != rows[0]["ch"]:
+            # 被「标准信道优先」改选过，得说清为什么不是分最低的那个。
+            print(f"  （{rows[0]['ch']} 号分更低（{rows[0]['score']}），但它夹在两条信道中间、"
+                  f"和 1/6/11 都不对齐；差距不到 {scanner.CHANNEL_PREF_MARGIN} 时优先标准信道）")
         print(f"\n最干净：信道 {best['ch']}（干扰分 {best['score']}）")
         print("这里只扫描，不会改设备。想连频段一起优化就跑 `mifi`。")
         return 0
@@ -1706,7 +1710,7 @@ def main():
             chs = caps.get("channels") or list(range(1, 14))
             rows = scanner.score_channels(aps, chs)
             cur_score = next((r["score"] for r in rows if r["ch"] == cur_ch), None)
-            best = rows[0]
+            best = scanner.pick_best_channel(rows)
             best_ch = best["ch"]
             print(f"      当前信道 {cur_ch} 评分 {cur_score} ｜ 最优信道 {best_ch} 评分 {best['score']}")
             if best["detail"]:

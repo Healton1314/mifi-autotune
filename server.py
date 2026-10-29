@@ -447,7 +447,9 @@ class Handler(SimpleHTTPRequestHandler):
             return {"current": st["channel"], "best": None, "aps": [],
                     "scores": [], "error": scanner.scan_failure_hint()}
         rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
-        return {"current": st["channel"], "best": rows[0]["ch"], "aps": aps, "scores": rows}
+        best = scanner.pick_best_channel(rows)
+        return {"current": st["channel"], "best": best["ch"] if best else None,
+                "aps": aps, "scores": rows}
 
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
