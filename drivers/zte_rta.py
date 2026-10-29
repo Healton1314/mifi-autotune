@@ -157,11 +157,17 @@ class ZteRtaClient:
                 "    自动登录（login.cgi）也没成功，通常是设备正忙或密码不是默认的 admin。\n"
                 "    处理：① 确认 --password 与设备后台密码一致；\n"
                 "          ② 用浏览器打开后台登录一次，再重试本命令。")
-        return False
+
+        # 连 login_status 都没有：设备在切换频段时重启射频，这段时间它什么都不回。
+        # 这是**临时**状态，必须让上层重试，而不是报「检查地址与网段」——
+        # 之前把它当永久错误，导致测完一个死频段后，后面每个频段都被判「通信中断」，
+        # 连自动还原都失败，设备被留在没信号的频段上。
+        raise DeviceUnreachable("设备暂时不应答（可能在重启射频）")
 
     def _auth(self, method):
-        if not self._nonce and not self._challenge():
-            raise ConnectionError("设备没有返回认证挑战，检查地址与网段")
+        if not self._nonce:
+            # 拿不到会自己抛 DeviceUnreachable / DeviceBusy，不会静默返回 False
+            self._challenge()
         i = self._nonce
         self._nc += 1
         nc = format(self._nc, "08x")
@@ -177,7 +183,7 @@ class ZteRtaClient:
         return (f'Digest username="{self.user}", realm="{i["realm"]}", nonce="{i["nonce"]}", '
                 f'uri="{self.DIGEST_URI}", response="{resp}"')
 
-    def get(self, file, retries=2):
+    def get(self, file, retries=3):
         path = f"/xml_action.cgi?method=get&module=duster&file={file}"
         last = (0, "")
         last_err = None
@@ -188,9 +194,10 @@ class ZteRtaClient:
                 # 是 KICKOFF 循环的直接来源。_auth() 在缺 nonce 时会自己挑战。
                 code, txt, _ = self._raw(path, "GET", None, self._auth("GET"))
             except DeviceUnreachable as e:
-                # 设备射频重启期间连不上：退避重试，别把临时故障当永久错误
+                # 设备射频重启期间连不上、或暂时不发挑战：退避重试，
+                # 别把临时故障当永久错误（这是把设备留在死频段的根源）
                 last_err = e
-                time.sleep(2.0 + i * 2)
+                time.sleep(min(3 + i * 3, 12))
                 continue
             last = (code, txt)
             if code == 200 and len(txt) > 40 and "UNAUTHORIZED" not in txt and "KICKOFF" not in txt:
@@ -201,7 +208,7 @@ class ZteRtaClient:
             raise last_err
         raise ConnectionError(f"读取 {file} 失败（code={last[0]}）")
 
-    def post(self, file, inner_xml, retries=2):
+    def post(self, file, inner_xml, retries=4):
         path = f"/xml_action.cgi?method=set&module=duster&file={file}"
         body = ('<?xml version="1.0" encoding="US-ASCII"?><RGW>' + inner_xml + "</RGW>").encode("ascii")
         last_err = None
@@ -209,9 +216,11 @@ class ZteRtaClient:
             try:
                 return self._raw(path, "POST", body, self._auth("POST"))
             except DeviceUnreachable as e:
+                # set_band 是最关键的一步：改不动就没法测、也没法还原。
+                # 设备切频段时自己会重启射频，这一刻它不回任何请求，所以多给点时间。
                 last_err = e
                 self._nonce = None
-                time.sleep(2.0 + i * 2)
+                time.sleep(min(3 + i * 3, 12))
         raise last_err
 
 

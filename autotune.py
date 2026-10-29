@@ -150,6 +150,51 @@ def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
     return "timeout", round(time.time() - t0, 1)
 
 
+def restore_band(dev, band, tries=3, poll=45, step=5):
+    """把设备切回原频段，然后**耐心等它重新注册**到能读状态为止。
+
+    为什么不能「发一次 POST，睡 26 秒，读一次」：
+    实测（2026-10-29）在无覆盖频段上，设备是**在线**的、也照常发认证挑战，
+    但响应体是空的 —— 也就是切回好频段之后，它需要一段时间重新注册才会重新
+    吐 XML。这期间读状态会失败，但设备本身没问题。固定等一次就判定失败，
+    会把「还在恢复」误判成「还原失败」，也让最后一行结论不可信。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            st = dev.get_state()
+            if str(st.get("band") or "") == str(band or ""):
+                return True, st
+        except Exception as e:  # noqa: BLE001
+            last = e            # 读不到就继续往下发指令，不要卡在这里
+
+        try:
+            dev.set_band(band)   # 实测：状态读不出时，这条 POST 依然能改频段
+        except Exception as e:   # noqa: BLE001
+            last = e
+            if i < tries - 1:
+                print(f"      [!] 第 {i + 1} 次还原没成功（{type(e).__name__}），稍后重试…")
+                time.sleep(min(step * (i + 1), 15))
+                continue
+
+        # 发出去了，等它重新注册（这段时间读不到状态是正常的）
+        deadline = time.time() + poll
+        while time.time() < deadline:
+            time.sleep(step)
+            try:
+                st = dev.get_state()
+            except Exception as e:  # noqa: BLE001
+                last = e
+                continue
+            if str(st.get("band") or "") == str(band or ""):
+                return True, st
+        if i < tries - 1:
+            print(f"      [!] 第 {i + 1} 次还原后仍读不到状态，继续等…")
+    if last is not None:
+        print(f"      （最后一次错误：{type(last).__name__}: {last}）")
+    return False, None
+
+
 def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """单频段多轮实测，取中位数，同时保留离散度用于判断可信程度。
 
@@ -343,6 +388,18 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                     if r.get("error"):
                         print(f"      原因：{r['error']}")
                 left = len(bands) - idx
+
+                # 这个频段测失败（没覆盖 / 读不到状态）时，先退回原频段再测下一个。
+                # 2026-10-29 实测：切到 BAND 38（当地无覆盖）后设备仍在线、仍发认证挑战，
+                # 但响应体是空的 —— 状态读不出来，于是后面每个频段都被判「通信中断」，
+                # 连自动还原都失败，用户被留在没信号的频段上。
+                # 从健康状态出发测下一个频段，就不会被上一个频段的坏状态连累。
+                if not r["ok"] and str(b) != str(cur_band) and left:
+                    print("      退回原频段，避免在坏状态上继续切…")
+                    ok_r, _ = restore_band(dev, cur_band, tries=2, poll=45)
+                    if not ok_r:
+                        print("      [!] 退不回去，剩下的频段先不测了")
+                        break
                 if left:
                     used = (time.time() - t_band0) / idx
                     print(f"      （还剩 {left} 个，预计 {used * left / 60:.1f} 分钟）")
@@ -376,18 +433,13 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             # 无论正常结束、抛异常还是 Ctrl+C，都必须还原。
             # 这条是血的教训：之前在测 BAND 8 时驱动超时崩溃，整个进程退出，
             # 设备被留在 BAND 8（丢包 60%），用户当场上不了网。
-            try:
-                now_band = dev.get_state()["band"]
-                if now_band != cur_band:
-                    print(f"\n[还原] 切回 {_band_label(cur_band)} …")
-                    dev.set_band(cur_band)
-                    time.sleep(SETTLE_SEC)
-                    print("      已切回")
-                else:
-                    print(f"\n[还原] 设备仍在 {_band_label(cur_band)}，无需切换")
-            except Exception as e:  # noqa: BLE001
-                print(f"      [!] 自动还原失败：{type(e).__name__}: {e}")
-                print(f"          请手动在设备后台把频段改回 BAND {cur_band}")
+            print(f"\n[还原] 切回 {_band_label(cur_band)} …")
+            ok, _st = restore_band(dev, cur_band)
+            if ok:
+                print("      已切回")
+            else:
+                print(f"      [!] 自动还原失败。请手动在设备后台把频段改回 BAND {cur_band}")
+                print("          设备可能刚重启射频，等 1 分钟再试 `mifi --restore` 也行。")
 
         usable = [r for r in lte if r["ok"]]
         if usable:
@@ -726,6 +778,56 @@ def watch(args, cfg):
 
 # ---------------- 主流程 ----------------
 
+def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
+    """终端里一条命令走完「体检 → 给结论 → 问一句 → 应用」。
+
+    为什么要有这个模式：手机上跑面板需要常驻一个网页服务，安卓会为省电把它杀掉，
+    用户看到的就是「网页打不开」。终端里跑没这个问题——进程在前台，系统不会静默杀，
+    也不需要记地址、不需要浏览器。
+    """
+    print("\n接下来会逐个切换频段实测：中途断网 2~4 次（每次约 30 秒），")
+    print("结束时自动切回现在的配置。全程约 3~6 分钟，中途 Ctrl+C 可随时中止。\n")
+
+    rc = run_preview(dev, caps, st0, args, cfg, speed_url, ping_host)
+    if rc != 0:
+        return rc
+
+    try:
+        plan = json.loads(PLAN.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print("\n[!] 没能读到本次结论，请重跑一次。")
+        return 1
+
+    if plan.get("caveats"):
+        print("\n[!] 本次数据不足以支撑改动，已停在这里（原因见上面的 [!] 行）。")
+        return 0
+
+    changes = plan.get("changes") or []
+    if not changes:
+        print("\n[√] 不用改。你的设备现在就是这个环境下最好的配置。")
+        return 0
+
+    print("\n" + "=" * 56)
+    print("要现在就应用吗？直接回车 = 应用；输入 n = 不改，保持原样")
+    print("（应用只切一次，约 30~60 秒，会短暂断网）")
+    try:
+        ans = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n已跳过，设备保持原样。")
+        return 0
+
+    if ans in ("n", "no", "q", "quit", "不", "否", "取消"):
+        print("已跳过，设备保持原样。下次想应用直接跑：python autotune.py --apply-plan")
+        return 0
+
+    try:
+        cur = dev.get_state()
+    except Exception as e:  # noqa: BLE001
+        print(f"[×] 读取设备状态失败：{type(e).__name__}: {e}")
+        return 1
+    return run_apply_plan(dev, caps, cur, args, cfg, ping_host)
+
+
 def main():
     cfg = load_config()
 
@@ -752,6 +854,10 @@ def main():
                     help="体检并给出「预期提升」，结束时恢复原配置（推荐的第一步）")
     ap.add_argument("--apply-plan", action="store_true",
                     help="按上一次 --preview 的结论应用，不再重测（只切一次，最快）")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="体检 → 给结论 → 问一句是否应用（手机上的 mifi 用的就是这个）")
+    ap.add_argument("--status", action="store_true",
+                    help="只看当前状态（频段/信道/信号），不测量、不改动")
     ap.add_argument("--watch", action="store_true",
                     help="进阶：长期挂在后台，明显劣化时才自动重测并切换")
     ap.add_argument("--watch-interval", type=int, default=300,
@@ -818,6 +924,19 @@ def main():
     if sig.get("rsrp"):
         print(f"信号：RSRP {sig.get('rsrp')} | SINR {sig.get('sinr')} | PCI {sig.get('pci')}")
     print("=" * 56)
+
+    if args.status:
+        # 已经打印过设备/频段/信道/信号了，这里补一条实时延迟就够了。
+        p = probe.ping_stats(6, ping_host)
+        if p["avg"] is None:
+            print("网络：测不到回应（可能正在注册或没有数据通路）")
+        else:
+            print(f"网络：延迟 {p['avg']}ms ｜ 抖动 {p['jitter']}ms ｜ 丢包 {p['loss']}%")
+        print("\n想看「能提升多少」就跑：mifi        （体检约 3~6 分钟）")
+        return 0
+
+    if args.interactive:
+        return _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host)
 
     if args.preview:
         return run_preview(dev, caps, st0, args, cfg, speed_url, ping_host)

@@ -409,19 +409,25 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 ```bash
 # 1. 装 Termux（F-Droid 或应用商店搜，选 F-Droid 版更省心）
 
-# 2. 让手机拿到代码。两种来源任选：
-#    a) 电脑上的面板还没关：用它现成的安装包（推荐，这条路不依赖外网）
-python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('http://<电脑局域网IP>:8787/api/phone-package').read())"
-#    b) 能从 GitHub 下载的话
-#       curl -L -o p.zip https://github.com/Healton1314/mifi-autotune/archive/refs/heads/main.zip
-
-# 3. 在 Termux 里装（不需要 curl，python 自带解压）
+# 2. 在 Termux 里装 Python
 pkg install -y python
+
+# 3. 取代码并安装。两个来源任选：
+#    a) 手机能上 GitHub（不需要电脑）
+python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('https://codeload.github.com/Healton1314/mifi-autotune/zip/refs/heads/main').read())"
+#    b) 手机连不上 GitHub：让电脑的面板开着，从它取包（60KB，一瞬）
+python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('http://<电脑局域网IP>:8787/api/phone-package').read())"
+
+# 4. 解包并安装（不需要 curl，python 自带）
 python -m zipfile -e p.zip ~
 bash ~/mifi-autotune/phone/install.sh
 ```
 
-`install.sh` 会做三件事：装 Python、把代码放到 `~/mifi-autotune`、创建 `mifi` 命令。
+`install.sh` 会做四件事：装 Python（已有则跳过）→ 拿安装包 → 解包到 `~/mifi-autotune` → 创建 `mifi` 命令。
+
+它自己也会按「本地 zip → 电脑面板 → GitHub」的顺序试下载，所以在手机上网关正常的情况下，直接 `pkg install -y python && bash` 这一步就能跑通。
+
+以后升级只要一条：`mifi --update`。
 
 ### 之后每天怎么用
 
@@ -429,20 +435,38 @@ bash ~/mifi-autotune/phone/install.sh
 mifi
 ```
 
-它会在手机上起一个**只监听本机**的面板，并自动用浏览器打开。界面和电脑上完全一样：体检 → 看结论 → 一键应用。建议把页面「添加到主屏幕」，就是一个 App。
+它会**在终端里直接跑完**：体检 → 打印「现在多少 / 能到多少 / 提多少」→ 问一句要不要应用 → 回个车就改完。
 
-也可以不用界面，直接看文字结论：
+```
+========================================================
+体检结论
+========================================================
+  频段：BAND 40 31.4 Mbps  →  最优 BAND 3 54.1 Mbps
+        切换后预计 +22.7 Mbps（+72%）
+  信道：13（干扰分 0.77）  →  最优 1（干扰分 0.0）
+--------------------------------------------------------
+可以优化的项：
+  · 频段 BAND 40 → BAND 3
+  · 信道 13 → 1
+
+要现在就应用吗？直接回车 = 应用；输入 n = 不改，保持原样
+>
+```
+
+> 为什么默认不是网页面板：手机上跑网页服务需要常驻进程，安卓会为省电把它杀掉，你看到的就是「网页打不开」。终端里跑没有这个问题——进程在前台，系统不会静默杀掉，也不用记地址、不用浏览器。
+
+其他用法：
 
 ```bash
-cd ~/mifi-autotune
-python autotune.py --preview       # 体检，给对比和建议
-python autotune.py --apply-plan    # 应用上次体检的结论
-python autotune.py --watch         # 挂后台持续盯（Ctrl+C 停）
+mifi --status     # 只看当前状态（几秒，不测量）
+mifi --restore    # 还原成「不锁频段 + 自动信道」
+mifi --web        # 还想要图形界面时用（需要留着那个窗口）
+mifi --update     # 更新到最新代码
 ```
 
 **三个手机上特有的点**：
 
-- **换频段时「上网」会断 30 秒左右，但手机和设备的 WiFi 不会断**（设备的 AP 不依赖移动网络），所以面板不会失联，测完会自动切回原频段。
+- **换频段时「上网」会断 30 秒左右，但手机和设备的 WiFi 不会断**（设备的 AP 不依赖移动网络），所以体检不会失联，测完会自动切回原频段。
 - 安卓普通应用拿不到 ICMP，`ping` 也用不了。工具会自动改用 **TCP 握手耗时**测延迟（`probe._tcp_latency`），不影响判断。
 - 想扫周边 WiFi 需要装 Termux:API 并给**定位权限**（安卓 10+ 把 WiFi 扫描算作位置信息）。拿不到就跳过信道优化，**频段优化不受影响**。MIUI/HyperOS 记得给 Termux 关掉省电限制。
 

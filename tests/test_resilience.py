@@ -141,5 +141,81 @@ class TestReliability(unittest.TestCase):
         self.assertTrue(caveats)   # 已经是 0 Mbps，必然被标不可信
 
 
+class FlakyDev:
+    """还原时会失败几次的设备替身。
+
+    对应 2026-10-29 实测：切到 BAND 38（当地没覆盖）后设备重启射频，
+    连续 50 多秒不应答，一次性的还原直接失败，设备被留在死频段上。
+    """
+
+    def __init__(self, start_band=38, fail_times=2):
+        self.band = start_band
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def _maybe_fail(self):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise DeviceUnreachable("设备暂时不应答（可能在重启射频）")
+
+    def get_state(self):
+        self._maybe_fail()
+        return {"band": self.band}
+
+    def set_band(self, band):
+        self._maybe_fail()
+        self.band = band
+
+
+class TestRestore(unittest.TestCase):
+    def setUp(self):
+        # 真实 SETTLE_SEC 是 26 秒，测试里不能真等
+        self._p = mock.patch.object(autotune, "SETTLE_SEC", 0)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_restore_retries_until_device_answers(self):
+        dev = FlakyDev(fail_times=2)
+        ok, st = autotune.restore_band(dev, 3, tries=6, poll=0)
+        self.assertTrue(ok)
+        self.assertEqual(dev.band, 3)
+
+    def test_restore_gives_up_after_tries(self):
+        dev = FlakyDev(fail_times=99)
+        ok, st = autotune.restore_band(dev, 3, tries=3, poll=0)
+        self.assertFalse(ok)
+        self.assertIsNone(st)
+
+    def test_no_change_needed(self):
+        dev = FlakyDev(start_band=3, fail_times=0)
+        ok, st = autotune.restore_band(dev, 3, tries=2, poll=0)
+        self.assertTrue(ok)
+        self.assertEqual(st["band"], 3)
+
+
+class TestNoChallengeIsTransient(unittest.TestCase):
+    """没有任何挑战、也没有 login_status ＝ 设备在重启射频，属于临时故障。
+
+    以前这种情况抛 ConnectionError（不可重试），导致测完一个死频段后，
+    后面每个频段都被判「通信中断」，连还原都失败。
+    """
+
+    def test_raises_device_unreachable(self):
+        c = zte.ZteRtaClient("192.0.2.1", "admin", "admin", timeout=1)
+        with mock.patch.object(c, "_raw", return_value=(200, "<RGW></RGW>", {})), \
+             mock.patch.object(c, "_login", return_value=False):
+            with self.assertRaises(DeviceUnreachable):
+                c._challenge()
+
+    def test_kickoff_still_reports_busy(self):
+        from drivers.base import DeviceBusy
+        c = zte.ZteRtaClient("192.0.2.1", "admin", "admin", timeout=1)
+        body = "<RGW><login_status>KICKOFF</login_status></RGW>"
+        with mock.patch.object(c, "_raw", return_value=(200, body, {})), \
+             mock.patch.object(c, "_login", return_value=False):
+            with self.assertRaises(DeviceBusy):
+                c._challenge()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,8 @@
   .pl:last-of-type{border:0}
   .pl .lbl{color:#8A8A85;font-size:12px;min-width:44px}
   .pl .val{font-variant-numeric:tabular-nums;text-align:right}
+  .empty{font-size:12px;color:#8A8A85;line-height:1.7;padding:2px 0}
+  .empty b{color:#2B2B28;font-weight:600}
   .gain{color:#1D9E75;font-weight:600}
   .flat{color:#8A8A85}
   .warnbox{margin-top:10px;padding:10px 12px;border-radius:10px;background:#FFF6E5;
@@ -82,11 +84,11 @@
 <div class="acts">
   <button id="btnScan">扫描信道</button>
   <button class="warn" id="btnRestore">恢复默认</button>
-  <button class="primary wide" id="btnPreview">体检并预估（约 3 分钟，中途会断网）</button>
+  <button class="primary wide" id="btnPreview">体检并预估（约 3~6 分钟，中途会断网）</button>
   <div class="jobstat" id="jobStatus"></div>
 </div>
 
-<div class="sec" id="planSec" style="display:none">
+<div class="sec" id="planSec">
   <h2>体检结论 <span class="note" id="planWhen" style="float:right;margin:0"></span></h2>
   <div id="planBody"></div>
   <button class="primary wide" id="btnApplyPlan" style="margin-top:11px">一键应用这个优化</button>
@@ -96,8 +98,9 @@
 <div class="sec" id="phoneSec">
   <h2>让手机自己跑（一次性安装）</h2>
   <div class="note" style="margin-top:0">
-    现在这个页面靠电脑上的服务在跑，电脑关了就没了。
-    想彻底摆脱电脑：把代码装到手机里，之后手机连着随身WiFi 就能自己体检、自己优化。
+    这个页面跑在电脑上，电脑关了就没了。
+    想彻底摆脱电脑：把代码装进手机，之后手机连着随身WiFi 就能自己体检、自己优化。
+    装好后在 Termux 里敲 <code>mifi</code>，它会直接在终端里给结论并问你要不要优化。
   </div>
   <button class="wide" id="btnPhonePkg" style="margin-top:10px">下载手机安装包（约 60KB）</button>
   <div class="note" id="phoneSteps">
@@ -106,7 +109,7 @@
     <code>python -c "import urllib.request as u;open('p.zip','wb').write(u.urlopen('__PKG_URL__').read())"</code><br>
     <code>python -m zipfile -e p.zip ~</code><br>
     <code>bash ~/mifi-autotune/phone/install.sh</code><br>
-    装完后在 Termux 里输入 <code>mifi</code> 就能启动，<b>不再需要这台电脑</b>。
+    装完输入 <code>mifi</code> 即可。<b>这一步之后不再需要这台电脑</b>（以后升级用 <code>mifi --update</code>）。
   </div>
 </div>
 
@@ -335,9 +338,25 @@ async function loadPlan() {
     const r = await fetch("/api/plan", { cache: "no-store" });
     if (r.status === 401) { needToken("读取体检结论被拒绝（401）"); return; }
     const d = await r.json();
-    if (!d.plan) { $("planSec").style.display = "none"; return; }
+    if (!d.plan) { renderEmptyPlan(); return; }
     renderPlan(d.plan);
   } catch (e) { /* 忽略 */ }
+}
+
+// 没有结论时也要显示这一块，不能整体隐藏。
+// 隐藏过一版：手机上新装的环境没有 plan.json，整块消失，用户看到的是
+// 「没有优化建议、也没有一键优化」，以为功能没了。
+function renderEmptyPlan() {
+  $("planWhen").textContent = "";
+  $("planBody").innerHTML =
+    `<div class="empty">
+       <b>还没做过体检</b><br>
+       体检会逐个切换频段实测（约 3~6 分钟，中途断网几次，
+       结束自动恢复现在的配置），然后告诉你「现在多少 / 能到多少 / 提多少」。
+     </div>`;
+  $("btnApplyPlan").style.display = "none";
+  $("planHint").textContent = "体检不改你的设备。点上面的「体检并预估」开始，看到结论再决定要不要优化。";
+  $("planSec").style.display = "block";
 }
 
 function renderPlan(p) {
@@ -454,13 +473,16 @@ $("btnWatch").onclick = async () => {
 };
 
 $("btnScan").onclick = scan;
-$("btnPreview").onclick = () => {
-  if (confirm("会逐个切换频段实测，中途断网 2~3 次（约 3 分钟），结束后自动恢复原设置。继续？")) {
+function previewFlow() {
+  if (busy) return;
+  if (confirm("会逐个切换频段实测，中途断网 2~4 次（约 3~6 分钟），结束后自动恢复原设置。继续？")) {
     startJob("/api/preview", "体检");
   }
-};
+}
+$("btnPreview").onclick = previewFlow;
 $("btnApplyPlan").onclick = () => {
-  if (confirm("按体检结论切换一次，约 30 秒，会短暂断网。继续？")) {
+  if (busy) return;
+  if (confirm("按体检结论切换一次，约 30~60 秒，会短暂断网。继续？")) {
     startJob("/api/apply-plan", "应用");
   }
 };
