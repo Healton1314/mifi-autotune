@@ -263,6 +263,35 @@ def _scan_macos():
 # ---------------------------------------------------------------- 统一入口
 
 
+def scan_failure_hint():
+    """扫描返回空时，指出具体缺哪一步。
+
+    原来只报「系统语言不支持或无线网卡未启用」——在手机上这句是错的：
+    真正的原因通常是没装 termux-api，或者没给定位权限。用户照着这句话
+    排查会白折腾。
+    """
+    import os
+
+    is_termux = "com.termux" in os.environ.get("PREFIX", "") or bool(shutil.which("termux-info"))
+    if is_termux:
+        if not shutil.which("termux-wifi-scaninfo"):
+            return ("手机上没装 termux-api：`pkg install termux-api` 并安装 Termux:API 应用。"
+                    "（只是跳过信道优化，频段不受影响）")
+        try:
+            out = sh(["termux-wifi-scaninfo"], timeout=25).strip()
+        except Exception:  # noqa: BLE001
+            return "Termux:API 调用失败，检查 Termux:API 应用是否安装、是否允许后台运行"
+        if out in ("", "[]"):
+            return ("Termux:API 返回了空列表，通常是没给「定位」权限"
+                    "（安卓 10+ 把 WiFi 扫描算作位置信息）。频段优化不受影响。")
+        return "拿到了扫描结果但解析不出可用 AP，可能是 5G-only 或格式不同"
+    if sys.platform.startswith("win"):
+        return "netsh 没抓到 BSSID：系统语言可能不在支持列表，或无线网卡被禁用"
+    if sys.platform == "darwin":
+        return "macOS 14+ 已移除 airport 命令，需要换扫描实现"
+    return "nmcli / iw 都不可用（iw 主动扫描需要 root）"
+
+
 def scan_once(ssid_hint=None):
     """单轮扫描，返回原始 AP 列表（未合并、未过滤）。"""
     if sys.platform.startswith("win"):

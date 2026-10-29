@@ -226,11 +226,20 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     if status != "ok":
         return dict(empty, reason=status, waited=waited)
 
-    try:
-        st = probe.ping_stats(6, ping_host)
-    except Exception:  # noqa: BLE001
-        st = {"avg": None, "loss": 100}
-    if st["avg"] is None or st["loss"] == 100:
+    # 注册成功 ≠ 数据通道就绪。实测（2026-10-29 手机端）：BAND 40 在 4.6 秒就被判
+    # 「有信号但数据不通」，而它实际能跑 27~31 Mbps —— 刚注册完那一两秒 ping 全丢，
+    # 拿一次结果就下结论会漏掉真正更快的频段。这里多确认几次再判死。
+    st = {"avg": None, "loss": 100}
+    for attempt in range(4):
+        try:
+            st = probe.ping_stats(6, ping_host)
+        except Exception:  # noqa: BLE001
+            st = {"avg": None, "loss": 100}
+        if st.get("avg") is not None and st.get("loss") != 100:
+            break
+        if attempt < 3:
+            time.sleep(5)
+    if st.get("avg") is None or st.get("loss") == 100:
         return dict(empty, reason="no_data", waited=waited)
 
     samples = []
@@ -284,6 +293,24 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
 
 def _band_label(band):
     return f"BAND {band}" if band else "自动"
+
+
+def describe_unmeasured(lte):
+    """「有信号但这次没测出结果」的频段，用一句话说清楚。
+
+    这类频段**不等于比当前慢**，只是没测成。不点出来，用户会以为所有频段
+    都比过了，从而完全相信「当前已是最优」。实测（2026-10-29 手机端）：
+    BAND 40 被 4.6 秒判成「数据不通」直接跳过，而它实际能跑 27~31 Mbps。
+    """
+    reason_cn = {"no_data": "数据不通", "speed_fail": "测速失败",
+                 "timeout": "注册超时", "device_error": "通信中断"}
+    skipped = [r for r in lte
+               if not r.get("ok") and r.get("reason") not in (None, "no_signal")]
+    if not skipped:
+        return ""
+    names = "、".join(f"BAND {r.get('band')}（{reason_cn.get(r.get('reason'), '不可用')}）"
+                      for r in skipped)
+    return f"另有 {names}没测出结果，所以「最优」只在这些能测出来的频段里成立。"
 
 
 def assess_reliability(lte, cur_res, best_res):
@@ -353,7 +380,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 print(f"      当前信道 {cur_ch} 干扰分 {cur_score} ｜ "
                       f"最优 {best['ch']} 干扰分 {best['score']}")
         else:
-            print("      [!] 没扫到邻居 AP，跳过信道部分（系统语言不支持或无线网卡未启用）")
+            print(f"      [!] 没扫到邻居 AP，跳过信道部分：{scanner.scan_failure_hint()}")
 
     # ---- 二、LTE 频段 ----
     lte = []
@@ -509,6 +536,13 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             print("        当前频段已是最优，无需改动")
         elif band_gain is not None:
             print(f"        最优只高 {band_gain:.1f} Mbps，不到 {MIN_BAND_GAIN_MBPS} Mbps，不值得切换")
+
+    # 有些频段是「有信号但这次没测出结果」，它不等于「比当前慢」。
+    # 不点出来，用户会以为已经比过了所有频段 —— 实际是没比成。
+    note = describe_unmeasured(lte)
+    if note:
+        print(f"  {note}")
+        print("        想更确定可以过一会儿再跑一次。")
 
     if wifi:
         if wifi.get("auto"):
