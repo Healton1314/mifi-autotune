@@ -38,6 +38,8 @@ SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
 SPEED_FLOOR_MBPS = 3                # 最优频段都低于这个值，说明网络太差、结论不可信
+MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也不能选
+MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
 
 # 守护模式（--watch）的劣化判定阈值。
@@ -295,6 +297,37 @@ def _band_label(band):
     return f"BAND {band}" if band else "自动"
 
 
+def quality_issue(res):
+    """这个频段算不算「能用的」？返回问题描述（空串 = 干净可用）。
+
+    为什么不能只看带宽：2026-10-29 手机实测里，BAND 39 丢包 90%、延迟 1068ms，
+    却照样测出 13.4 Mbps。那天它带宽不最高所以没被选上；但只要它带宽高一点点，
+    就会被推荐成「最优」—— 而它连网页都打不开。带宽好看 ≠ 能用。
+    """
+    if not res.get("ok"):
+        return ""
+    issues = []
+    loss = res.get("loss") or 0
+    if loss >= MAX_USABLE_LOSS:
+        issues.append(f"丢包 {loss}%")
+    ping = res.get("avg")
+    if ping is not None and ping >= MAX_USABLE_PING_MS:
+        issues.append(f"延迟 {ping}ms")
+    return "、".join(issues)
+
+
+def bands_worth_comparing(lte):
+    """能参与「最优」评选的频段：测得出来 + 质量可接受。
+
+    丢包 90% 的频段即使带宽数字漂亮也不能选，否则会把人推荐到打不开网页的网络里。
+    但如果所有能用的都质量差，就原样返回 —— 不能因此得出「没有可用频段」的假结论，
+    那种情况该由 assess_reliability 说「这次结论不可信」。
+    """
+    ok = [r for r in lte if r.get("ok")]
+    clean = [r for r in ok if not quality_issue(r)]
+    return clean or ok
+
+
 def describe_unmeasured(lte):
     """「有信号但这次没测出结果」的频段，用一句话说清楚。
 
@@ -325,6 +358,9 @@ def assess_reliability(lte, cur_res, best_res):
         caveats.append("当前频段测不出速度（测速源不可用，或该频段几乎没有数据能力）")
     if best_res and best_res.get("mbps") is not None and best_res["mbps"] < SPEED_FLOOR_MBPS:
         caveats.append(f"最优频段也只有 {best_res['mbps']} Mbps，低于 {SPEED_FLOOR_MBPS} Mbps 参考线")
+    if best_res and quality_issue(best_res):
+        caveats.append(f"被选为最优的 BAND {best_res['band']} 本身质量不过关"
+                       f"（{quality_issue(best_res)}），说明当前网络整体状态不好")
     for r in lte:
         samples = r.get("mbps_all") or []
         if r.get("ok") and len(samples) >= 2 and min(samples) > 0 \
@@ -403,8 +439,12 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
                 lte.append(r)
                 if r["ok"]:
+                    jit = f"{r['jitter']}ms" if r["jitter"] is not None else "—"
                     print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
-                          f"延迟 {r['avg']}ms  抖动 {r['jitter']}ms  丢包 {r['loss']}%")
+                          f"延迟 {r['avg']}ms  抖动 {jit}  丢包 {r['loss']}%")
+                    bad = quality_issue(r)
+                    if bad:
+                        print(f"       [!] {bad} —— 质量不可接受，不参与「最优」的评选")
                 else:
                     why = {"no_signal": "无信号（当地没这个频段）",
                            "timeout": "注册超时",
@@ -431,7 +471,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                     used = (time.time() - t_band0) / idx
                     print(f"      （还剩 {left} 个，预计 {used * left / 60:.1f} 分钟）")
 
-            usable = [r for r in lte if r["ok"]]
+            usable = bands_worth_comparing(lte)
             # 决赛：全部粗测完后，对「最优」和「当前」各补一轮。
             # 单轮结果容易被瞬时调度带偏，而这两者的差值正是决策依据，值得多花 90 秒确认。
             if usable and len(bands) > 2:
@@ -468,7 +508,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 print(f"      [!] 自动还原失败。请手动在设备后台把频段改回 BAND {cur_band}")
                 print("          设备可能刚重启射频，等 1 分钟再试 `mifi --restore` 也行。")
 
-        usable = [r for r in lte if r["ok"]]
+        usable = bands_worth_comparing(lte)
         if usable:
             usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
             best_band = usable[0]["band"]
@@ -576,6 +616,13 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             print(f"  · {c}")
         print(f"\n应用方式：python autotune.py --apply-plan"
               f"   （只在手机上点一下也行）")
+    elif do_band is False and best_band and str(best_band) != str(cur_band) \
+            and band_gain is not None:
+        # 有别的频段略好，但差距在阈值内 —— 不能写成「当前已是最优」，
+        # 那跟上面那句「最优只高 0.1 Mbps」自相矛盾。
+        print(f"不建议切换：BAND {best_band} 只比现在高 {band_gain:.1f} Mbps，"
+              f"在正常波动范围内，不值得为它断一次网。")
+        print("（结论已存 plan.json；环境变了可以重新体检一次）")
     else:
         print("当前配置已经是这个环境下最优，不需要改动。")
         print("（结论已存 plan.json；环境变了可以重新体检一次）")
@@ -892,6 +939,8 @@ def main():
                     help="体检 → 给结论 → 问一句是否应用（手机上的 mifi 用的就是这个）")
     ap.add_argument("--status", action="store_true",
                     help="只看当前状态（频段/信道/信号），不测量、不改动")
+    ap.add_argument("--scan", action="store_true",
+                    help="只扫周边 2.4G 信道（几秒，不碰设备）——用来验证手机能不能扫")
     ap.add_argument("--watch", action="store_true",
                     help="进阶：长期挂在后台，明显劣化时才自动重测并切换")
     ap.add_argument("--watch-interval", type=int, default=300,
@@ -901,6 +950,27 @@ def main():
     ap.add_argument("--watch-dry-run", action="store_true",
                     help="守护模式演练：只报告会触发什么，不改设备")
     args = ap.parse_args()
+
+    if args.scan:
+        # 只读扫描，不需要连上设备，也不改任何设置。
+        # 单独做成一个命令，是因为手机上「能不能扫」需要几十秒就能验证，
+        # 不该为了验证它去跑一次 5 分钟的频段体检。
+        own = args.ssid or cfg.get("own_ssid") or scanner.connected_ssid()
+        print(f"扫描周边 2.4G（{args.scan_rounds} 轮合并）…")
+        aps = scanner.scan_2g(rounds=args.scan_rounds, own_ssid=own)
+        if not aps:
+            print(f"[×] 没扫到邻居 AP：{scanner.scan_failure_hint()}")
+            return 1
+        if own:
+            print(f"（已排除自己的 AP：{own}）")
+        rows = scanner.score_channels(aps)
+        print(f"\n扫到 {len(aps)} 个 AP。各信道干扰分（0 最好，越低越干净）：")
+        for r in rows[:5]:
+            print(f"  信道 {r['ch']:>2}   干扰分 {r['score']}")
+        best = rows[0]
+        print(f"\n最干净：信道 {best['ch']}（干扰分 {best['score']}）")
+        print("这里只扫描，不会改设备。想连频段一起优化就跑 `mifi`。")
+        return 0
 
     if args.list_drivers:
         print("可用驱动：")
