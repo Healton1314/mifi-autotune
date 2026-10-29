@@ -217,5 +217,29 @@ class TestNoChallengeIsTransient(unittest.TestCase):
                 c._challenge()
 
 
+class TestUnmeasuredBands(unittest.TestCase):
+    """「没测出结果」不等于「更慢」，必须单独说明。
+
+    2026-10-29 手机端实测：BAND 40 被 4.6 秒判成「数据不通」跳过，
+    而它实际能跑 27~31 Mbps。若不点出来，用户会以为所有频段都比过了。
+    """
+
+    def test_mentions_unmeasured_band(self):
+        lte = [{"band": 3, "ok": True, "mbps": 45.8},
+               {"band": 38, "ok": False, "reason": "no_signal"},
+               {"band": 40, "ok": False, "reason": "no_data"}]
+        note = autotune.describe_unmeasured(lte)
+        self.assertIn("BAND 40", note)
+        self.assertNotIn("BAND 38", note)      # 无信号是确定的，不算「没测成」
+
+    def test_empty_when_everything_measured(self):
+        lte = [{"band": 3, "ok": True, "mbps": 45.8}]
+        self.assertEqual(autotune.describe_unmeasured(lte), "")
+
+    def test_only_dead_bands_gives_empty(self):
+        lte = [{"band": 38, "ok": False, "reason": "no_signal"}]
+        self.assertEqual(autotune.describe_unmeasured(lte), "")
+
+
 if __name__ == "__main__":
     unittest.main()
