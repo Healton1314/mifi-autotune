@@ -10,6 +10,7 @@ state.json
 config.json
 .panel-token
 plan.json
+sites.json
 autotune-log.jsonl
 *.log
 

@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import probe
@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -56,6 +56,7 @@ MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也�
 MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
 OBSERVE_SEC = 90                    # 应用后盯多久，确认「能一直通」
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
+SITES = HERE / "sites.json"         # 位置记忆：每个 PCI 下哪些频段有覆盖、哪个最好
 
 # 守护模式（--watch）的劣化判定阈值。
 # 三段式：min(上限, max(基线×倍数, 下限))
@@ -74,6 +75,21 @@ WATCH_JITTER_CAP_MS = 80            # 抖动上限
 WATCH_JITTER_COLD_MS = 40           # 冷启动抖动阈值
 
 LOG_KEEP = 1                        # 运行记录默认只留最近一次（0 = 写完就删）
+
+# 位置记忆：同一个地方测过几次之后，别再重复踩同样的坑。
+DEAD_SKIP_MIN = 3                   # 连续这么多次「无信号」才敢跳过
+DEAD_REPROBE_EVERY = 5              # 但每 N 次强制全测一遍，防止环境变了还一直跳
+# 记忆会随时间过期。用户实机（2026-10-30）指出的场景：一个地方以前常来，
+# 隔了很久没来 —— 这期间可能加了基站/拆了基站、邻居换了几轮、晚上八点的人流
+# 也完全不同，拿旧数据跳着测就是拿过期结论当答案。所以分三档：
+#   fresh  72 小时内  —— 记忆全信，可以用「只测两个」的快速模式
+#   aging  3~7 天     —— 覆盖还在（有没有信号很稳定），速度作废：能收到的全测
+#   stale  超过 7 天  —— 整段记忆作废，一条都不跳，全部重测
+SITE_FRESH_HOURS = 72
+SITE_STALE_DAYS = 7
+SITE_TTL_DAYS = 30                  # 这么久没来过的位置，连记录一起删掉（搬家/换城市）
+FAST_LEAD_RATIO = 1.2               # 历史最优比第二名快这么多倍，才敢只测它俩
+FAST_MIN_SEEN = 2                   # 至少来过这么多次，历史才可信（一次不算）
 
 # 全自动守护（--guard）：按「人在不在动」决定锁不锁频段。
 #
@@ -714,6 +730,187 @@ def assess_reliability(lte, cur_res, best_res):
     return caveats
 
 
+# ---------------- 位置记忆（同一个地方，第二次起就别重头再测） ----------------
+
+def _site_key(st):
+    """这个位置怎么标识：PCI + 运营商。
+
+    PCI 是服务小区的物理标识，换个地方必变；加运营商是为了压 PCI 复用
+    （PCI 只有 0~503，不同城市完全可能撞）。室内 GPS 基本没用，所以不用它。
+    读不到就返回空串 —— 宁可这次不记忆，也不能把两地混成一个。
+    """
+    sig = (st or {}).get("signal") or {}
+    pci = _pci_num(sig.get("pci"))
+    if pci is None:
+        return ""
+    return f"{pci}-{(sig.get('operator') or '?').strip()}"
+
+
+def load_sites():
+    try:
+        return json.loads(SITES.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sites(data):
+    try:
+        SITES.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _parse_ts(s):
+    try:
+        return datetime.fromisoformat(str(s))
+    except (TypeError, ValueError):
+        return None
+
+
+def site_age_hours(rec, now=None):
+    """这个位置上次来是几小时前。读不出时间就返回 None（当作「不知道」，按过期处理）。
+
+    负值（系统时间回拨、记录来自未来的机器）按 0 算，不然会把新鲜记录误判成过期的。
+    """
+    dt = _parse_ts((rec or {}).get("last"))
+    if dt is None:
+        return None
+    sec = ((now or datetime.now()) - dt).total_seconds()
+    return max(0.0, sec / 3600.0)
+
+
+def site_memory_state(rec, now=None):
+    """记忆的可信度分档：none / fresh / aging / stale。"""
+    if not rec:
+        return "none"
+    age = site_age_hours(rec, now)
+    if age is None or age > SITE_STALE_DAYS * 24:
+        return "stale"
+    if age > SITE_FRESH_HOURS:
+        return "aging"
+    return "fresh"
+
+
+def _fmt_age(hours):
+    if hours is None:
+        return "时间未知"
+    if hours < 1:
+        return "不到 1 小时前"
+    if hours < 48:
+        return f"{hours:.0f} 小时前"
+    return f"{hours / 24:.0f} 天前"
+
+
+def band_plan(rec, bands, serving=None, now=None):
+    """按这个位置的历史，决定测哪些、跳过哪些。
+
+    用户实机（2026-10-30）：在宿舍测了十几二十次，BAND 38/41 每次都没信号，
+    却每次都要等它们各超时 15 秒，剩下的频段也是从头重测一遍。
+    跳过「这里从来没信号」的频段，并把上次最好的排在最前面 ——
+    万一中途被打断，先拿到的就是最可能用的那条。
+
+    但记忆是按时间打折的（见 SITE_* 常量）：太久没来的位置一条都不跳，
+    因为「上次很快」这件事过期得比「这里收不收得到信号」快得多。
+
+    返回 (要测的频段, 无信号跳过的, 因为太慢跳过的, 历史最优)。
+    为了防「环境变了还一直跳过」，每 DEAD_REPROBE_EVERY 次强制全测一遍。
+    """
+    if not rec or not bands:
+        return list(bands), [], [], None
+    state = site_memory_state(rec, now)
+    if state == "stale":
+        # 隔太久（或记录里没有可用时间）：覆盖和速度都可能变了，全部重测。
+        return list(bands), [], [], None
+    seen = int(rec.get("seen") or 0)
+    hist = rec.get("bands") or {}
+    dead = {b for b, v in hist.items()
+            if (v.get("dead") or 0) >= DEAD_SKIP_MIN and (v.get("ok") or 0) == 0}
+    if seen and seen % DEAD_REPROBE_EVERY == 0:
+        dead = set()                      # 定期抽查，别把记忆当永久真理
+    keep = [b for b in bands if str(b) not in dead]
+    dead_list = [b for b in bands if str(b) in dead]
+
+    best = rec.get("best")
+    try:
+        best = int(best) if best is not None else None
+    except (TypeError, ValueError):
+        best = None
+    if best is not None and best not in keep:
+        best = None
+
+    # 快速模式：历史最优领先明显时，只测「历史最优 + 当前驻留」。
+    # 这是真正省时间的那一步 —— 跳过死频段只省 30 秒，而有信号的频段每个要 54 秒。
+    # 只在来过 >= FAST_MIN_SEEN 次后才敢这么做，且每 DEAD_REPROBE_EVERY 次全测一遍。
+    # 另外只有 fresh 档才敢用：速度是最容易变的东西，隔了 3 天以上就不认了。
+    slow = []
+    if (best is not None and seen >= FAST_MIN_SEEN and state == "fresh"
+            and seen % DEAD_REPROBE_EVERY != 0):
+        def v(b):
+            return float((hist.get(str(b)) or {}).get("best") or 0)
+
+        rest = [b for b in keep if b != best and b != serving]
+        second = max(rest, key=v) if rest else None
+        if second is not None and v(best) >= v(second) * FAST_LEAD_RATIO:
+            chosen = [best]
+            if serving and serving != best:
+                chosen.append(serving)
+            elif second is not None:
+                # 当前驻留就是最优时，也要带上第二名：只测一个没法交叉确认，
+                # 单轮测速的波动足以把结论翻转（用户 2026-10-30 指出的偶发性）。
+                chosen.append(second)
+            slow = [b for b in keep if b not in chosen]
+            keep = chosen
+
+    if best is not None and best in keep:
+        keep = [best] + [b for b in keep if b != best]
+    return keep, dead_list, slow, best
+
+
+def record_site(key, results, best_band=None, reset_best=False):
+    """把这次的结果记到位置上。只记「有没有信号」和「最好跑到多少」。
+
+    reset_best：这次是全量重测（隔太久没来），历史速度数字已经不作数，
+    直接用本次的成绩覆盖，而不是和旧值取最大。
+    """
+    if not key:
+        return
+    data = load_sites()
+    rec = data.setdefault(key, {"seen": 0, "bands": {}})
+    rec["seen"] = int(rec.get("seen") or 0) + 1
+    rec["last"] = datetime.now().isoformat(timespec="seconds")
+    for r in results:
+        b = str(r.get("band"))
+        v = rec["bands"].setdefault(b, {"dead": 0, "ok": 0})
+        if r.get("ok"):
+            v["ok"] = int(v.get("ok") or 0) + 1
+            v["dead"] = 0                      # 有信号就清零，别让旧记录一直压着
+            now_mbps = float(r.get("mbps") or 0)
+            v["best"] = now_mbps if reset_best else max(
+                float(v.get("best") or 0), now_mbps)
+            v["last_ok"] = datetime.now().isoformat(timespec="seconds")
+        elif r.get("reason") == "no_signal":
+            v["dead"] = int(v.get("dead") or 0) + 1
+    if best_band:
+        rec["best"] = int(best_band)
+    save_sites(data)
+
+
+def prune_sites(days=SITE_TTL_DAYS):
+    """清掉太久没去的记录：搬家、换城市之后旧记忆只会误导。"""
+    data = load_sites()
+    cutoff = datetime.now() - timedelta(days=days)
+    keep = {}
+    for k, v in data.items():
+        try:
+            if datetime.fromisoformat(v.get("last", "")) >= cutoff:
+                keep[k] = v
+        except (TypeError, ValueError):
+            continue
+    if len(keep) != len(data):
+        save_sites(keep)
+    return data, keep
+
+
 def resolve_bands(caps, args, cfg):
     """决定要实测哪些频段。
 
@@ -926,13 +1123,58 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     # ---- 二、LTE 频段 ----
     lte = []
     best_band = None
+    state = "none"                      # 记忆年龄档位；没有记忆/没测频段时都是 none
     if not args.wifi_only and caps.get("can_lock_band"):
         bands = resolve_bands(caps, args, cfg)
         if not bands:
             print("\n[2/2] 驱动没有声明可用频段，跳过频段实测。")
         else:
+            # 这个位置以前测过就复用记忆：跳过从来没收到的频段、把上次最好的排前面。
+            # 用户实机（2026-10-30 宿舍）：测了十几二十次，38/41 每次都没覆盖，
+            # 却每次都白等 15 秒 × 2，剩下的也是从头重排。
+            site = _site_key(st0)
+            if site:
+                # 太久没来的位置连记录一起清掉，免得拿着「搬家前」的历史当参考。
+                prune_sites()
+            rec = load_sites().get(site) if site else None
+            if getattr(args, "fresh", False):
+                rec = None
+            state = site_memory_state(rec)
+            skipped = []
+            if rec:
+                bands, dead_list, slow_list, known_best = band_plan(
+                    rec, bands, serving=cmp_band)
+                seen = int(rec.get("seen") or 0)
+                hist = rec.get("bands") or {}
+
+                def _hist_v(b):
+                    return (hist.get(str(b)) or {}).get("best") or 0
+
+                print(f"\n[2/2] 这个位置（PCI {site.split('-')[0]}）之前测过 {seen} 次，"
+                      f"上次来是 {_fmt_age(site_age_hours(rec))}")
+                if state == "stale":
+                    print(f"      隔了 {SITE_STALE_DAYS} 天以上没来，历史作废："
+                          f"这次全部 {len(bands)} 个频段都重测（覆盖会变，速度更会变）")
+                elif state == "aging":
+                    print(f"      隔了 {SITE_FRESH_HOURS // 24} 天以上没来，"
+                          f"上次的速度数字不再作数：能收到的频段全部重新测速")
+                if dead_list:
+                    print(f"      跳过 {dead_list}：这里从来没信号")
+                if slow_list:
+                    desc = " / ".join(f"BAND {b} {_hist_v(b)}" for b in slow_list)
+                    print(f"      跳过 {slow_list}：历史只有 {desc} Mbps，"
+                          f"比 BAND {known_best}（{_hist_v(known_best)}）慢太多")
+                if known_best and state != "stale":
+                    print(f"      上次最好：BAND {known_best}，这次先测它")
+                tail = ("（一条都不跳）" if state == "stale"
+                        else f"（每 {DEAD_REPROBE_EVERY} 次会全测一遍兜底）")
+                print(f"      本次测 {len(bands)} 个：{bands}{tail}")
+            else:
+                why = ("按 --fresh 忽略位置记忆"
+                       if getattr(args, "fresh", False)
+                       else "这个地方没来过（或记忆已过期被清掉）")
+                print(f"\n[2/2] {why}，设备声明的 {len(bands)} 个频段全部实测：{bands}")
             per = SETTLE_SEC + rounds * 20 + 8
-            print(f"\n[2/2] 设备声明支持 {len(bands)} 个频段：{bands}")
             print(f"      逐个实测（每段 {rounds} 轮，有信号的约 {per} 秒，"
                   f"没信号的会提前跳过；预计 {per * len(bands) / 60:.0f} 分钟以内）")
             print("      期间会短暂断网，全部测完自动切回原频段…")
@@ -944,6 +1186,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         if usable:
             usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
             best_band = usable[0]["band"]
+        if args.bands in ("default", "all") and not args.wifi_only:
+            # 记忆过期那次是全测，速度数字就是最新的：把「历史最好」换成这次的，
+            # 否则 8 天前那个偏高的旧数字会一直压着，快速模式又会被它骗一次。
+            record_site(_site_key(st0), lte, best_band, reset_best=(state == "stale"))
 
     # ---- 三、结论 ----
     cur_res = next((r for r in lte if r["band"] == cmp_band), None)
@@ -1892,6 +2138,11 @@ def main():
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
     ap.add_argument("--observe", type=int, default=OBSERVE_SEC, metavar="秒",
                     help=f"应用后盯多少秒确认稳定（0 = 不盯，默认 {OBSERVE_SEC}）")
+    ap.add_argument("--fresh", action="store_true",
+                    help=f"忽略位置记忆，把全部频段重测一遍"
+                         f"（隔 {SITE_STALE_DAYS} 天以上没来会自动这样，一般不用手动给）")
+    ap.add_argument("--forget", action="store_true",
+                    help="清空位置记忆（搬过家、换过城市之后用）")
     ap.add_argument("--clean", action="store_true",
                     help="清掉历史运行记录与缓存（保留 config.json 和面板令牌）")
     ap.add_argument("--mtu", action="store_true",
@@ -2011,6 +2262,15 @@ def main():
         for d in list_drivers():
             print(f"  {d['name']:<12} {d['description']}")
         print("\n新增机型：参考 drivers/template.py，在 drivers/__init__.py 里登记一行。")
+        return 0
+
+    if args.forget:
+        data = load_sites()
+        if data:
+            save_sites({})
+            print(f"位置记忆已清空（原有 {len(data)} 个位置）。")
+        else:
+            print("还没有位置记忆，不用清。")
         return 0
 
     if args.clean:
