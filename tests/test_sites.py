@@ -570,6 +570,57 @@ class SiteCells(unittest.TestCase):
         self.assertIn("236", [c["pci"] for c in rec["cells"]])
 
 
+class ProvisionalLifecycle(unittest.TestCase):
+    """「先锁一下、没测过」这个标记必须会消失。
+
+    实机 2026-10-30 19:44：236-CMCC 在 18:14 已经实测过 40/3/8/39 四条频段，
+    但 17:59 打上的 provisional 一直挂着 —— guard_memory_band 看到它就当成
+    新地方，走了「快测当前、直接锁」，记忆里的最优和信号闸门一次都没被用到。
+    更糟的是它永远不会触发体检，所以这个标记也没机会被清掉。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _prov(self):
+        self.tmp.write_text("{}", encoding="utf-8")
+        A.mark_site_provisional("236-CMCC", 40)
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["236-CMCC"]
+        self.assertTrue(rec.get("provisional"))
+        return rec
+
+    def test_real_measurement_drops_the_flag(self):
+        self._prov()
+        A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 12.0,
+                                    "rsrp": -77}])
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["236-CMCC"]
+        self.assertNotIn("provisional", rec)
+        self.assertTrue(A._site_measured(rec))
+
+    def test_all_dead_still_counts_as_unmeasured(self):
+        # 全都没信号 = 什么也没证明，标记留着，下次来补测
+        self._prov()
+        A.record_site("236-CMCC", [{"band": 38, "ok": False,
+                                    "reason": "no_signal"}])
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["236-CMCC"]
+        self.assertTrue(rec.get("provisional"))
+        self.assertFalse(A._site_measured(rec))
+
+    def test_measured_provisional_is_not_disposable(self):
+        # 老数据留下的「标记为真、数据其实有」：不能当成空壳并到别处去
+        data = {"350-CMCC": {"seen": 9, "last": ago(hours=30), "best": 3,
+                             "bands": {"3": {"dead": 0, "ok": 9, "best": 46.8}}},
+                "236-CMCC": {"seen": 1, "provisional": True,
+                             "last": ago(hours=2), "best": 40,
+                             "bands": {"40": {"dead": 0, "ok": 1, "best": 17.8}}}}
+        self.assertEqual(A.find_site(data, "236-CMCC"), "236-CMCC")
+
+
 class NoteCellChange(unittest.TestCase):
     """守护每 30 秒看一次 PCI：设备自己换小区（解锁后换频段）时要把它记下来，
     否则「窗口一过就分家」。实机 17:52：BAND 41 / 477 → BAND 40 / 236。"""

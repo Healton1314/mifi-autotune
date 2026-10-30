@@ -162,6 +162,26 @@ class GuardMemoryFirst(unittest.TestCase):
         self.assertIsNone(band)
         self.assertIn("PCI", why)
 
+    def test_provisional_without_data_means_measure(self):
+        # 第一次来只锁了一下、没测过 —— 下次来该补测
+        self._write({"seen": 0, "provisional": True, "best": 40,
+                     "last": self.ago(hours=1), "bands": {}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("快速判断", why)
+
+    def test_old_provisional_flag_with_real_data_is_ignored(self):
+        # 实机 2026-10-30 19:44：0.6.7 之前的 provisional 只写不清，
+        # 236-CMCC 18:14 已实测四条频段，标记却还挂着 → 守护当成「没测过」，
+        # 永远走「快测当前、直接锁」，记忆和信号闸门一次都没跑到。
+        self._write({"seen": 1, "provisional": True, "best": 40,
+                     "last": self.ago(hours=1),
+                     "bands": {"40": {"dead": 0, "ok": 1, "best": 17.8},
+                               "3": {"dead": 0, "ok": 1, "best": 15.5}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertEqual(band, 40)
+        self.assertIn("最优 BAND 40", why)
+
 
 class QuickProbe(unittest.TestCase):
     """停在半路先「只看不锁」—— 用户 2026-10-30：停下来的地方很可能只是路过，
@@ -350,6 +370,45 @@ class MovingDetection(unittest.TestCase):
 
     def test_still_here(self):
         self.assertFalse(self._move())
+
+
+class StillReset(unittest.TestCase):
+    """「坐满 10 分钟才锁」不能被移动判定的尾巴拖长。
+
+    实机 2026-10-30：19:30 人已经坐下，PCI 从那时起一直是 236，但 moving 在
+    最后一次换小区之后还要保持 300s，于是每一拍都把计时起点推到当下，
+    19:34:55 才显示「静止 0/10」，19:44:29 才锁上 —— 拖了 4 分半。
+    """
+
+    def test_no_reset_while_only_the_window_lags(self):
+        # moving 为真、但这一拍 PCI 没变、链路也正常 → 不能清零
+        self.assertFalse(A.guard_still_reset(False, True, False))
+
+    def test_reset_on_real_change(self):
+        self.assertTrue(A.guard_still_reset(True, True, False))
+
+    def test_reset_when_link_dies(self):
+        self.assertTrue(A.guard_still_reset(False, True, True))
+
+    def test_quiet_sample_does_not_reset(self):
+        self.assertFalse(A.guard_still_reset(False, False, False))
+
+    def test_ten_minutes_means_ten_minutes(self):
+        # 每秒一拍地模拟：第 0 秒换过小区，之后 moving 还要挂 300 秒。
+        # 旧逻辑要 14.5 分钟才判「坐够」，新逻辑应当是 10 分钟。
+        t, last_change, stable_since = 0, 0, 0
+        window, settle = 300, 600
+        lock_at = None
+        while t <= 1200:
+            moving = (t - last_change) < window          # 尾巴
+            pci_changed = False
+            if A.guard_still_reset(pci_changed, moving, False):
+                stable_since = t
+            if t - stable_since >= settle and lock_at is None:
+                lock_at = t
+            t += 1
+        self.assertEqual(lock_at, settle)
+        self.assertGreater(settle + window, 600)         # 旧行为会等到这儿之后
 
 
 class QuickGrade(unittest.TestCase):

@@ -6,6 +6,7 @@
 #   mifi --scan     只扫周边信道（几秒，验证手机能不能扫）
 #   mifi --restore  还原成「不锁频段 + 自动信道」
 #   mifi --guard    全自动守护：在动就解锁频段、久坐就选优并锁定（Ctrl+C 停）
+#   mifi --stop     停掉正在跑的守护（Ctrl+C 按不出来时用这个）
 #   mifi --clean    清掉历史记录与缓存（只留最近一次运行结果、配置和令牌）
 #   mifi --web      起本地面板（可选；需要一直留着这个窗口）
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
@@ -75,6 +76,33 @@ case "${1:-}" in
     # 先拷一份再执行：install.sh 会 rm -rf 整个目录，脚本自己也在里面
     cp "$DIR/phone/install.sh" "$HOME/.mifi-install.sh"
     exec bash "$HOME/.mifi-install.sh" -f
+    ;;
+  --stop)
+    # 守护可能开在另一个窗口/后台，Ctrl+C 未必按得到（手机上要先进扩展键栏
+    # 点 CTRL 再点 C，很容易按成别的）。这里直接按命令行认进程杀掉 ——
+    # 同一个 Termux uid，不需要 root，也不像 adb 那样被权限挡住。
+    # 用它停止时守护会走和 Ctrl+C 同一条收尾路径（打印「已停止」）。
+    killed=0
+    for _p in /proc/[0-9]*; do
+      [ -r "$_p/cmdline" ] || continue
+      _cmd="$(tr '\0' ' ' <"$_p/cmdline" 2>/dev/null)"
+      case "$_cmd" in
+        *"autotune.py --guard"*)
+          _pid="${_p#/proc/}"
+          [ "$_pid" = "$$" ] && continue
+          kill "$_pid" 2>/dev/null && killed=$((killed + 1))
+          ;;
+      esac
+    done
+    unset _p _cmd _pid
+    if [ "$killed" -gt 0 ]; then
+      echo "[√] 已停止守护（设备保持当前配置，锁着的频段不会自动解开）"
+    else
+      echo "没有在跑的守护进程"
+    fi
+    # 守护被外部杀掉时它自己来不及放 wake lock，这里补一下，别继续吃电。
+    command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null
+    exit 0
     ;;
   --web)
     SERVER_PID=""
