@@ -102,6 +102,8 @@ class ChannelSwitchSurvivesDisconnect(unittest.TestCase):
             mock.patch.object(autotune, "append_log", lambda *a, **k: None),
             mock.patch.object(autotune, "_mark_applied", lambda *a, **k: None),
             mock.patch.object(autotune.time, "sleep", lambda s: None),
+            # 应用后的观察期会真的去 ping 90 秒，测试里必须挡掉
+            mock.patch.object(autotune, "observe_after_apply", lambda *a, **k: None),
             contextlib.redirect_stdout(buf),
         ]
         if wait_ok is not None:
