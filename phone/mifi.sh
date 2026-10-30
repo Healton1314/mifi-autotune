@@ -5,6 +5,7 @@
 #   mifi --status   只看当前状态（几秒，不测量）
 #   mifi --scan     只扫周边信道（几秒，验证手机能不能扫）
 #   mifi --restore  还原成「不锁频段 + 自动信道」
+#   mifi --guard    全自动守护：在动就解锁频段、久坐就选优并锁定（Ctrl+C 停）
 #   mifi --clean    清掉历史记录与缓存（只留最近一次运行结果、配置和令牌）
 #   mifi --web      起本地面板（可选；需要一直留着这个窗口）
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
@@ -79,6 +80,15 @@ PYCHK
     ;;
   "")
     exec "$PY" -u autotune.py --interactive
+    ;;
+  --guard)
+    # 全自动守护要长时间挂着，安卓会为省电把后台进程杀掉 —— 先拿 wake lock。
+    # 用 exec 的话 trap 不会跑，锁就一直不放，所以这里等它结束再释放。
+    command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null
+    "$PY" -u autotune.py --guard "${@:2}"
+    RC=$?
+    command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null
+    exit $RC
     ;;
   *)
     exec "$PY" -u autotune.py "$@"
