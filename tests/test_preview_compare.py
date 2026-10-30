@@ -347,5 +347,44 @@ class ServingBandParse(unittest.TestCase):
         self.assertEqual(autotune._band_label(0), "自动")
 
 
+class ContestPicksCorrectBands(unittest.TestCase):
+    """决赛名单：第一名的领先幅度决定要不要复测第二名。
+
+    用户实机（2026-10-30 12:34）：BAND 40 31.5 vs BAND 3 29.0，只差 8%。
+    单轮测速的波动轻易就有 10~20%，这种差距根本说不清谁快谁慢；当时因为
+    「最快的就是当前驻留的」只复测了一个，等于拿一次运气当结论。
+    """
+
+    def _run(self, table, contest):
+        dev = FakeDev(band=contest)
+        measured = []
+
+        def fake_measure(d, band, **kw):
+            measured.append(band)
+            d.band = band
+            return band_result(band, table[band])
+
+        with mock.patch.object(autotune, "measure_band", fake_measure), \
+                mock.patch.object(autotune.time, "sleep", lambda s: None):
+            autotune.measure_all_bands(dev, sorted(table), 1, contest,
+                                       f"BAND {contest}", contest_band=contest)
+        return measured
+
+    def test_close_second_is_also_rechecked(self):
+        # 粗测 3/39/40，决赛必须补 40 和 3
+        m = self._run({40: 31.5, 3: 29.0, 39: 12.2}, 40)
+        self.assertEqual(m, [3, 39, 40, 40, 3])
+
+    def test_clear_winner_only_rechecks_itself(self):
+        # 领先 61%，没有第二个候选值得比（频段数要 >2 才进决赛）
+        m = self._run({40: 31.5, 3: 12.2, 39: 8.5}, 40)
+        self.assertEqual(m, [3, 39, 40, 40])
+
+    def test_current_band_third_is_added_as_reference(self):
+        # 当前驻留的排第三，仍要测它 —— 算「提升多少」需要这个基准
+        m = self._run({40: 31.5, 3: 29.0, 8: 6.4}, 8)
+        self.assertEqual(m, [3, 8, 40, 40, 3, 8])
+
+
 if __name__ == "__main__":
     unittest.main()

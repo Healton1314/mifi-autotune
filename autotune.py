@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.6"
+__version__ = "0.6.0"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -74,6 +74,23 @@ WATCH_JITTER_CAP_MS = 80            # 抖动上限
 WATCH_JITTER_COLD_MS = 40           # 冷启动抖动阈值
 
 LOG_KEEP = 1                        # 运行记录默认只留最近一次（0 = 写完就删）
+
+# 全自动守护（--guard）：按「人在不在动」决定锁不锁频段。
+#
+# 为什么用 PCI 判断移动：PCI 是服务小区的物理标识，换基站/换扇区它必变。
+# 比「信号强弱」可靠得多 —— 信号会因天气、遮挡、人多而波动，但人没动的时候
+# PCI 不会跳。用户实机（2026-10-30）就是靠这个区分「在上班路上」和「坐在工位」。
+GUARD_INTERVAL = 30                 # 采样间隔（秒）：10 个 ping，几百字节
+GUARD_SETTLE_SEC = 600              # 连续这么久 PCI 没变 = 原地不动（10 分钟）
+GUARD_MOVE_WINDOW = 180             # 判定「在移动」的时间窗
+GUARD_MOVE_HITS = 2                 # 窗口内 PCI 变这么多次 = 在移动
+GUARD_BAD_HITS = 3                  # 连续这么多次采样不通 = 锁定的频段撑不住
+GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网
+
+# 决赛：第二名和第一名的差距小于这个比例时，两个都要复测。
+# 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
+# 这时只复测第一名，等于拿运气当结论（用户实机 2026-10-30：31.5 vs 29.0）。
+CONTEST_CLOSE_RATIO = 0.25
 
 DEFAULT_CONFIG = {
     "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
@@ -800,14 +817,26 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
             # 用户当场就问：说好不参评，怎么又进决赛了？（2026-10-29 实机截图）
             # 真相是：它确实还会被复测一次，但它不参评，只是给「提升多少」当基准。
             fastest = usable[0]
+            second = usable[1] if len(usable) > 1 else None
             pairs = [(fastest["band"], "候选")]
-            if contest_band is not None and str(contest_band) != str(fastest["band"]):
+            # 第二名咬得紧时也要复测：这种差距很可能只是单轮噪声，不复测就等于
+            # 拿运气当结论。用户实机（2026-10-30）：BAND 40 31.5 vs BAND 3 29.0，
+            # 只差 8%，却因为「最快的正好是当前驻留的」只复测了一个。
+            if second and fastest["mbps"] and \
+                    second["mbps"] >= fastest["mbps"] * (1 - CONTEST_CLOSE_RATIO):
+                pairs.append((second["band"], "候选·和第一名只差 "
+                              f"{(1 - second['mbps'] / fastest['mbps']) * 100:.0f}%，要确认"))
+            if contest_band is not None and \
+                    str(contest_band) not in {str(b) for b, _ in pairs}:
                 pairs.append((contest_band, "当前·只作对照，不参评"))
             print(f"\n[决赛] 补 1 轮确认：" +
                   "、".join(f"BAND {b}（{role}）" for b, role in pairs))
             if len(pairs) == 1:
-                print(f"      最快的 {_band_label(fastest['band'])} 就是当前驻留的，"
-                      f"只复测它（没有别的候选值得比）")
+                gap_txt = (f"比第二名快 "
+                           f"{(1 - second['mbps'] / fastest['mbps']) * 100:.0f}%"
+                           if second and fastest["mbps"] else "没有别的可用频段")
+                print(f"      只有 {_band_label(fastest['band'])} 候选"
+                      f"（{gap_txt}，领先足够明显），复测它自己确认不是一次性波动")
             by_band = {r["band"]: r for r in results}
             for b, role in pairs:
                 prev = by_band.get(b)
@@ -1574,6 +1603,204 @@ def watch(args, cfg):
         return 0
 
 
+# ---------------- 全自动守护（--guard） ----------------
+
+def _now_hm():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _pci_num(v):
+    """PCI 在设备里是字符串（'236'）。拿不到就返回 None —— 不能当 0 用。"""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
+                 cooldown_left, outage_after_unlock):
+    """守护状态机：只回答「现在该做什么」，完全不碰设备（为了能单测）。
+
+    规则（用户 2026-10-30 定的）：
+      · 在移动、且锁着频段 → 解锁。锁死一个频段，走到没覆盖的地方就断网，
+        而设备本来能自己换。这是「保证一直有网」的第一道保险。
+      · 原地不动够久、且没锁 → **先选优，再锁定**（跑一次体检测出最优频段）。
+        只锁「当前驻留的」不一定最优，可能把一个次优频段长期锁死；
+        选优只在久坐时发生一次，不会反复断网（--guard-fast 可跳过选优）。
+      · 锁定后连续不通 → 先解锁自救（最快恢复）。解锁后仍然不通 → 才跑完整体检：
+        那说明不是「锁错频段」，而是这个位置真的没覆盖/基站有问题，换频段才有意义。
+        用户实机：切到 BAND 40 后 3~5 分钟断一次，就是靠这条抓出来的。
+
+    返回 (action, 原因)，action ∈ {None, "unlock", "lock", "measure"}。
+    """
+    if cooldown_left > 0:
+        return None, f"冷却中（{int(cooldown_left)}s）"
+    if moving and locked:
+        return "unlock", "检测到移动，锁死频段会限制可用覆盖"
+    if bad_streak >= GUARD_BAD_HITS and locked:
+        return "unlock", f"锁定后连续 {bad_streak} 次不通，先解锁自救"
+    if bad_streak >= GUARD_BAD_HITS and not locked and outage_after_unlock:
+        return "measure", f"解锁后仍然 {bad_streak} 次不通 —— 不是频段问题，换一个试试"
+    if not moving and not locked and still_sec >= settle_sec:
+        return "lock", f"原地待了 {int(still_sec / 60)} 分钟，锁住当前频段防止它自己乱跳"
+    return None, ""
+
+
+def _guard_unlock(dev, cur_band):
+    print(f"      解锁频段（原 BAND {cur_band}）…", flush=True)
+    try:
+        dev.set_band(0)
+    except DeviceUnreachable:
+        # 射频重启导致请求本身断掉，指令通常已经送达
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"      [!] 解锁失败：{type(e).__name__}: {e}", flush=True)
+        return False
+    ok = wait_device_back(dev, timeout=60)
+    print("      已解锁，设备可以自己换频段了" if ok
+          else "      [!] 后台没回来，稍后自动重试", flush=True)
+    return ok
+
+
+def _guard_lock_current(dev, serving):
+    if not serving:
+        print("      [!] 读不到当前驻留的频段，这次先不锁", flush=True)
+        return False
+    print(f"      锁到当前驻留的 BAND {serving}（不重新测，几乎不断网）…", flush=True)
+    try:
+        dev.set_band(serving)
+    except DeviceUnreachable:
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"      [!] 锁定失败：{type(e).__name__}: {e}", flush=True)
+        return False
+    ok = wait_device_back(dev, timeout=60)
+    print(f"      已锁定 BAND {serving}" if ok
+          else "      [!] 后台没回来，稍后自动重试", flush=True)
+    return ok
+
+
+def _guard_measure(args):
+    """跑一次完整体检。
+
+    另起子进程，会自己登录设备 —— 和守护进程的长连接互相顶掉（KICKOFF），
+    所以调用方必须先把 dev 放掉，跑完重连。
+    """
+    print("      跑完整体检选最优（会断网几次，约 5 分钟）…", flush=True)
+    code = run_cycle(args)
+    print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
+    return code
+
+
+def run_guard(args, cfg):
+    """全自动守护：打开一次就一直在，按「人在不在动」管频段锁定。"""
+    interval = max(15, args.guard_interval)
+    settle = max(interval * 4, args.guard_settle)
+    host = cfg["ping_host"]
+    dry = args.guard_dry_run
+
+    print("=" * 62)
+    print("全自动守护")
+    print(f"  每 {interval}s 采样一次（PCI + 延迟/丢包），不测速，几乎不占流量")
+    print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次 → 解锁，保证有网")
+    print(f"  不动：连续 {settle}s PCI 不变 → 先选优，再锁定最优频段"
+          + ("（--guard-fast：直接锁当前驻留的，跳过选优）" if args.guard_fast else ""))
+    print("  锁了之后连续不通 → 先解锁自救；解锁还不通 → 才跑体检换频段")
+    print(f"  Ctrl+C 停止{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
+    print("=" * 62, flush=True)
+
+    dev = None
+    last_pci, stable_since, pci_log = None, time.time(), deque()
+    bad_streak, next_allowed = 0, 0.0
+    unlocked_at = None
+
+    try:
+        while True:
+            now = time.time()
+            if dev is None:
+                try:
+                    dev = detect(args.host, args.user, args.password, name=args.driver)
+                except Exception as e:  # noqa: BLE001
+                    print(f"{_now_hm()}  连不上设备（{type(e).__name__}），5 秒后重试",
+                          flush=True)
+                    time.sleep(5)
+                    continue
+            try:
+                st = dev.get_state()
+            except Exception as e:  # noqa: BLE001
+                print(f"{_now_hm()}  设备暂时无响应（{type(e).__name__}），稍后重连",
+                      flush=True)
+                dev = None
+                time.sleep(interval)
+                continue
+
+            ping = probe.ping_stats(10, host)
+            sig = st.get("signal") or {}
+            pci = _pci_num(sig.get("pci"))
+            locked_band = st.get("band") or 0
+            serving = locked_band or _serving_band(st)
+            locked = locked_band != 0
+
+            if pci is not None:
+                if last_pci is not None and pci != last_pci:
+                    pci_log.append(now)
+                    stable_since = now
+                last_pci = pci
+            while pci_log and now - pci_log[0] > GUARD_MOVE_WINDOW:
+                pci_log.popleft()
+
+            moving = len(pci_log) >= GUARD_MOVE_HITS
+            still = now - stable_since
+            bad_now = ping["avg"] is None or (ping["loss"] or 0) >= 20
+            bad_streak = bad_streak + 1 if bad_now else 0
+            outage_after_unlock = (unlocked_at is not None
+                                   and now - unlocked_at < 300)
+
+            lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
+            who = (f"锁定 BAND {locked_band}" if locked
+                   else f"未锁（驻留 {serving or '?'}）")
+            tag = ("移动中" if moving
+                   else f"静止 {int(still / 60)}/{int(settle / 60)} 分钟")
+            print(f"{_now_hm()}  {who:<18} PCI {pci if pci is not None else '—':<4} "
+                  f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
+                  flush=True)
+
+            action, why = guard_decide(
+                moving=moving, still_sec=still, settle_sec=settle, locked=locked,
+                bad_streak=bad_streak, cooldown_left=max(0.0, next_allowed - now),
+                outage_after_unlock=outage_after_unlock)
+
+            if action:
+                print(f"      → {why}", flush=True)
+                if dry:
+                    print("      （演练模式，未改动设备）", flush=True)
+                elif action == "unlock":
+                    _guard_unlock(dev, locked_band)
+                    unlocked_at = time.time()
+                    pci_log.clear()
+                    bad_streak = 0
+                elif action == "lock":
+                    # 久坐 → 先选优（跑一次体检拿最优），再锁定。
+                    # 用户定这条：只锁「当前驻留的」不一定是最优，可能一直锁在
+                    # 一个次优频段上。选优只在「久坐」和「解锁后仍不通」时发生，
+                    # 平时只采样，不会反复断网。
+                    if args.guard_fast:
+                        _guard_lock_current(dev, serving)
+                    else:
+                        dev = None
+                        _guard_measure(args)
+                    stable_since = time.time()
+                else:  # measure
+                    dev = None
+                    _guard_measure(args)
+                    stable_since = time.time()
+                next_allowed = time.time() + GUARD_COOLDOWN
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[守护] 已停止（设备保持当前配置）")
+        return 0
+
+
 # ---------------- 主流程 ----------------
 
 def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
@@ -1698,6 +1925,16 @@ def main():
                     help="演练：把要做的改动打出来但不碰设备（配合 --apply / --apply-plan）")
     ap.add_argument("--version", action="version",
                     version=f"mifi-autotune {__version__}")
+    ap.add_argument("--guard", action="store_true",
+                    help="全自动守护：在动就解锁频段、久坐就锁住，避免锁死导致没网")
+    ap.add_argument("--guard-interval", type=int, default=GUARD_INTERVAL,
+                    help=f"守护采样间隔秒数（默认 {GUARD_INTERVAL}）")
+    ap.add_argument("--guard-settle", type=int, default=GUARD_SETTLE_SEC,
+                    help=f"连续多少秒 PCI 不变算「久坐」，久坐才锁定（默认 {GUARD_SETTLE_SEC}）")
+    ap.add_argument("--guard-fast", action="store_true",
+                    help="久坐时直接锁当前驻留的频段、不做选优（省几分钟，但不保证最优）")
+    ap.add_argument("--guard-dry-run", action="store_true",
+                    help="守护演练：只报告会做什么，不改设备")
     ap.add_argument("--watch", action="store_true",
                     help="进阶：长期挂在后台，明显劣化时才自动重测并切换")
     ap.add_argument("--watch-interval", type=int, default=300,
@@ -1803,6 +2040,9 @@ def main():
     # 0 Mbps，工具据此推荐了错误的频段。先选源能把这类假结论挡在源头。
     if not (args.watch or args.restore or args.apply_plan or args.list_drivers):
         speed_url = probe.resolve_speed_url(speed_url)
+
+    if args.guard:
+        return run_guard(args, cfg)
 
     if args.watch:
         return watch(args, cfg)
