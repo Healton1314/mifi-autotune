@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -438,6 +438,25 @@ def _band_label(band, serving=None):
     return "自动"
 
 
+def describe_band_state(cur_band, serving):
+    """状态行里怎么描述频段：锁定值和实际驻留分开说。
+
+    为什么必须分开：实机截图出现过「当前状态：频段 BAND 39」，而整份结论
+    都在说 BAND 3 —— 用户根本分不清「我锁的是哪个」和「我现在实际在哪个」。
+    两者不一致本身就是重要信息：说明锁定没生效（设备在该频段信号太差时会
+    自己回落），继续以为锁着 39 只会让人白等。
+
+    返回 (描述文本, 是否要警告)。
+    """
+    if cur_band and serving and str(cur_band) != str(serving):
+        return f"锁定 BAND {cur_band}，实际驻留 BAND {serving}", True
+    if cur_band:
+        return f"BAND {cur_band}", False
+    if serving:
+        return f"自动（实际驻留 BAND {serving}）", False
+    return "未锁定", False
+
+
 def _serving_band(st):
     """设备当前**实际驻留**的频段。
 
@@ -757,8 +776,15 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
             print("\n[决赛] 先把设备切回原频段并等它恢复…")
             ok_r, _ = restore_band(dev, cur_band)
             if ok_r:
-                time.sleep(5)
-                print("      已恢复，开始复测")
+                # 光「指令发出去了」不算恢复。实机（2026-10-30 11:37）踩到：
+                # 这里只睡 5 秒就复测，结果「BAND 3 复测没测成（无信号）」——
+                # 设备刚从死频段（38/41）回来，5 秒根本不够重新注册。
+                status, waited = wait_for_service(dev, cur_band, timeout=45)
+                if status == "ok":
+                    print(f"      已恢复（{waited}s），开始复测")
+                else:
+                    print(f"      [!] 等了 {waited}s 还是没注册上（{status}），"
+                          f"复测多半测不出来")
             else:
                 print("      [!] 没切回去，复测结果可能偏低")
 
@@ -1038,9 +1064,11 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         print(f"按「{label}」可以做的改动：")
         for c in plan["changes"]:
             print(f"  · {c}")
-        print(f"\n应用方式：python autotune.py --apply-plan"
-              + ("" if strategy == "auto" else f" --strategy {strategy}"))
-        print("           （只想看会改什么、不真改：再加 --dry-run）")
+        if not getattr(args, "interactive", False):
+            # interactive 模式紧接着就会问「要不要应用」，这里再说一遍是废话。
+            print(f"\n应用方式：python autotune.py --apply-plan"
+                  + ("" if strategy == "auto" else f" --strategy {strategy}"))
+            print("           （只想看会改什么、不真改：再加 --dry-run）")
     else:
         if not lte and wifi:
             # 只测信道时不能印「当前频段没有可用数据」—— 那是没测，不是没有。
@@ -1459,22 +1487,31 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
     # 默认走自动裁决；只有用户想强制某一条时才需要输入字母。
     options = plan.get("options") or {}
     avail = [k for k in ("auto", "speed", "stability") if options.get(k)]
-    if not avail:
-        # 上面的体检结论刚说过「为什么不用改」，这里再说一遍就是啰嗦
-        # （实跑截图的末尾出现过「…不值得为它断一次网」紧跟「没有更好的选择」）。
+    changes = plan.get("changes") or []
+
+    if not avail and not changes:
+        # 频段和信道都没什么可改的：上面的结论已经说清原因，这里不再重复。
         return 0
 
     print("\n" + "=" * 56)
-    if options.get("auto"):
+    if not avail:
+        # 只有信道建议（频段那边保持现状）。
+        # 原来这个分支直接 return 0 —— 用户看到「信道 11 → 7，干扰降 74%」，
+        # 却没有任何「要不要应用」的提示，只能自己去敲 --apply-plan
+        # （2026-10-30 实机反馈）。信道改动几秒完成、不断网，更没理由不问。
+        print("要现在就应用吗？回车 = 只改信道；n = 不改")
+        print("（改信道几秒完成，不会断网）")
+    elif options.get("auto"):
         a = options["auto"]
         print(f"要现在就应用吗？回车 = 按自动建议切到 BAND {a['band']}（{a['reason']}）")
     else:
         print("要现在就应用吗？回车 = 应用上面的建议")
-    if options.get("speed"):
-        print("  a = 只看速度那条线")
-    if options.get("stability"):
-        print("  b = 只看稳定那条线")
-    print("  n = 不改，保持原样（应用只切一次，约 30~60 秒，会短暂断网）")
+    if avail:
+        if options.get("speed"):
+            print("  a = 只看速度那条线")
+        if options.get("stability"):
+            print("  b = 只看稳定那条线")
+        print("  n = 不改，保持原样（应用只切一次，约 30~60 秒，会短暂断网）")
     try:
         ans = input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1488,10 +1525,10 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
         args.strategy = "speed"
     elif ans.startswith("b") and options.get("stability"):
         args.strategy = "stability"
-    else:
+    elif avail:
         args.strategy = "auto" if options.get("auto") else avail[0]
-    if args.strategy not in [k for k in avail]:
-        args.strategy = avail[0]
+    # 只有信道建议时不动 strategy：run_apply_plan 会沿用它自己解析出的策略，
+    # 而那时目标本来就只含信道。原来这里直接取 avail[0]，avail 空会 IndexError。
 
     try:
         cur = dev.get_state()
@@ -1659,8 +1696,12 @@ def main():
     cur_ch = st0["channel"]
     print("=" * 56)
     print(f"设备：{getattr(dev, 'description', dev.name)}")
-    print(f"当前状态：频段 {_band_label(cur_band, _serving_band(st0))} | "
+    band_txt, band_warn = describe_band_state(cur_band, _serving_band(st0))
+    print(f"当前状态：频段 {band_txt} | "
           f"信道 {cur_ch or '自动'} | 带宽 {st0.get('bandwidth') or '—'} | MTU {st0.get('mtu') or '—'}")
+    if band_warn:
+        print("[!] 锁定的频段和设备实际在用的不是同一个 —— 锁定没生效，"
+              "多半是这个频段信号太差、设备自己回落了。")
     sig = st0.get("signal") or {}
     if sig.get("rsrp"):
         print(f"信号：RSRP {sig.get('rsrp')} | SINR {sig.get('sinr')} | PCI {sig.get('pci')}")
