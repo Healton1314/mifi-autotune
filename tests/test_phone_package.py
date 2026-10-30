@@ -64,18 +64,14 @@ class TestPhonePackage(unittest.TestCase):
         self.assertIn("mifi-autotune/phone/tips.txt", names)
         self.assertNotIn("mifi-autotune/tests/test_scoring.py", names)
 
-    def test_output_log_stays_inside_termux(self):
-        """输出要能复盘，但只能落在 Termux 自己的目录里。
-
-        用户 2026-10-30 明确要求：除 Termux 家目录外的东西一律不碰。
-        所以日志写 `$DIR/last-run.log`，不写 /sdcard、不写相册、不经网络。
-        """
+    def test_output_log_has_a_path_the_pc_can_read(self):
+        """输出要能复盘：优先落到 ~/storage/downloads（电脑数据线能读到），
+        没给存储权限时退回 Termux 自己的目录，两种情况都不能崩。"""
         body = self.zip.read("mifi-autotune/phone/mifi.sh").decode("utf-8")
-        self.assertIn('LOG="$DIR/last-run.log"', body)
+        self.assertIn('LOG="$DIR/last-run.log"', body)          # 兜底位置
+        self.assertIn('for _d in "$HOME/storage/downloads"; do', body)   # 首选位置
+        self.assertIn('LOG="$_d/mifi-last.log"', body)
         self.assertIn('tee -a "$LOG"', body)
-        # 写目标只能是 Termux 目录：手机存储、下载目录一律不出现
-        self.assertNotIn("/sdcard/Download", body)
-        self.assertNotIn("storage/downloads", body)
         self.assertIn("run --guard", body)          # guard 之后要放 wake lock，不能 exec
 
 

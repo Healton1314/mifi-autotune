@@ -29,11 +29,16 @@ cd "$DIR" 2>/dev/null || { red "[×] 找不到 $DIR，请先运行 phone/install
 PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null)"
 [ -n "$PY" ] || { red "[×] 没找到 python，先执行：pkg install python"; exit 1; }
 
-# ---- 输出留一份在 Termux 目录里（不外写任何其它位置） ----
-# 用途：手机上人只能看见最后十几行，想复盘早先的频段结果就没料了。
-# 写在 $DIR/last-run.log，跑完 `cat last-run.log | head -100` 就能复制出来。
-# 只落在 Termux 自己的家目录，不碰手机存储、不碰相册、不经网络。
+# ---- 输出留一份到文件（手机上只能看见最后十几行，早先的频段结果就没了） ----
+# 日志位置：优先放 Termux 的存储链接（~/storage/downloads → 手机 Download 目录），
+# 电脑接数据线才读得到（Termux 私有目录外部读不了）。没给存储权限就退回
+# Termux 自己的目录，纯打屏也照常能用。这是用户 2026-10-30 同意开的口子，
+# 只为调试期看输出用，调完就删。
 LOG="$DIR/last-run.log"
+for _d in "$HOME/storage/downloads"; do
+  [ -d "$_d" ] && [ -w "$_d" ] && LOG="$_d/mifi-last.log" && break
+done
+unset _d
 
 log_head() {
   # 单次运行超过 2MB 就换一份，别让 --guard 挂一天把目录写满
