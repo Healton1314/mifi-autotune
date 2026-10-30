@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1165,6 +1165,25 @@ def run_mtu_check(st0, ping_host):
     return 0
 
 
+def wait_device_back(dev, timeout=45, poll=5):
+    """写完频段后等设备的 web 后台重新可达。
+
+    换频段会让设备重启射频，管理后台跟着掉 5~20 秒。原来发完指令就
+    sleep 固定秒数，然后立刻读状态 / 写信道 —— 正好撞在重启窗口里：
+    实机表现是「[应用] 切换 WiFi 信道到 1 … → [×] 应用过程中设备无响应」，
+    其实频段早就切成功了，只是后台没回来。
+    轮询比盲睡可靠：设备 6 秒回来就不必等 26 秒。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            dev.get_state()
+            return True
+        except Exception:  # noqa: BLE001
+            time.sleep(poll)
+    return False
+
+
 def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     if not PLAN.exists():
         print("[×] 还没有体检结论。先跑一次：python autotune.py --preview")
@@ -1197,17 +1216,24 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
         t_band = opt.get("band", t_band)
 
     todo = []
-    if t_band != cur_band and caps.get("can_lock_band"):
-        todo.append(("band", t_band))
+    # 顺序很重要：先动信道，最后动频段。
+    # 换频段会让设备重启射频，web 后台跟着掉线 5~20 秒；原来把频段排在前面，
+    # 紧接着再写信道，正好撞进重启窗口 —— 实机表现是
+    # 「[应用] 切换 WiFi 信道到 1 … → [×] 应用过程中设备无响应」，
+    # 结果频段锁好了、信道没改，用户被留在半改状态。
     if t_ch != cur_ch and caps.get("can_set_channel", True):
         todo.append(("channel", t_ch))
+    if t_band != cur_band and caps.get("can_lock_band"):
+        todo.append(("band", t_band))
 
     if not todo:
         print("[√] 当前配置已经和体检结论一致，无需改动。")
         _mark_applied(plan, cur_band, cur_ch, "nothing_to_do")
         return 0
 
-    print(f"按体检结论应用（策略：{'速度' if strategy == 'speed' else '稳定'}）：")
+    strat_label = {"auto": "自动裁决", "speed": "速度", "stability": "稳定"}.get(
+        strategy, strategy)
+    print(f"按体检结论应用（策略：{strat_label}）：")
     for kind, val in todo:
         if kind == "band":
             print(f"  · 频段 {_band_label(cur_band)} → {_band_label(val)}")
@@ -1232,6 +1258,13 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
                 except Unsupported as e:
                     print(f"[跳过] {e}")
                     continue
+                if not wait_device_back(dev, timeout=60):
+                    print("[!] 设备后台 60 秒没回来 —— 多半还在重启。")
+                    print("    等 1 分钟跑 `python autotune.py` 看实际状态；"
+                          "要强制回原样用 `--restore`。")
+                    failed = True
+                    break
+                print(f"      设备已回来，等它重新注册（{SETTLE_SEC}s）…")
                 time.sleep(SETTLE_SEC)
                 chk = probe.ping_stats(6, ping_host)
                 if chk["avg"] is None:
@@ -1279,7 +1312,8 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
                 "after": {"band": end["band"], "channel": end["channel"]}})
     print(f"\n完成：频段 {_band_label(end['band'])} ｜ 信道 {end['channel'] or '自动'}")
     if failed:
-        print("（有一项没成功，已回滚到原值，详见上面的 [!] 行）")
+        # 别写成「已回滚」—— 现在可能是「信道改好了、频段没成」，两条路不一样。
+        print("（没全部成功，详见上面的 [!] 行；上面显示的是设备的实际状态）")
         _mark_applied(plan, end["band"], end["channel"], "partial_failure")
         return 1
     _mark_applied(plan, end["band"], end["channel"], "ok")
@@ -1549,8 +1583,15 @@ def main():
                   f"正因为附近没人用")
         if rows and best["ch"] != rows[0]["ch"]:
             # 被「标准信道优先」改选过，得说清为什么不是分最低的那个。
-            print(f"  （{rows[0]['ch']} 号分更低（{rows[0]['score']}），但它夹在两条信道中间、"
-                  f"和 1/6/11 都不对齐；差距不到 {scanner.CHANNEL_PREF_MARGIN} 时优先标准信道）")
+            # 注意分数可能并列（都是 0.0），这时说「更低」就是错话 —— 实机出现过。
+            low = rows[0]
+            if abs(low["score"] - best["score"]) < 0.01:
+                print(f"  （{low['ch']} 号与 {best['ch']} 号分数并列（{low['score']}）；"
+                      f"同等条件下优先 1/6/11，所以选 {best['ch']}）")
+            else:
+                print(f"  （{low['ch']} 号分更低（{low['score']}），但它和 1/6/11 不共用一个"
+                      f"20MHz 频段、会和相邻信道重叠；差距不到 "
+                      f"{scanner.CHANNEL_PREF_MARGIN} 时优先标准信道）")
         print(f"\n最干净：信道 {best['ch']}（干扰分 {best['score']}）")
         print("这里只扫描，不会改设备。想连频段一起优化就跑 `mifi`。")
         return 0
