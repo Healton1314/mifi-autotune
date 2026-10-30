@@ -93,5 +93,75 @@ class PciParsing(unittest.TestCase):
         self.assertEqual(A._pci_num("0"), 0)
 
 
+class GuardMemoryFirst(unittest.TestCase):
+    """久坐时先认「这个位置的历史最优」，别每次都跑 5 分钟体检。
+
+    用户体感（2026-10-30）：手动测一次锁上比设备自动好，但守护每次久坐都
+    重测、断网几次，用起来反而像厂商的自动 —— 因为它重新决策，而不用已知答案。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+        from datetime import datetime, timedelta
+        from pathlib import Path
+        from unittest import mock
+        self.json, self.tmpdir, self.dt = json, tempfile, datetime
+        self.SITES = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.SITES)
+        self._p.start()
+        self.ago = lambda **kw: (datetime.now() - timedelta(**kw)).isoformat()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _write(self, rec):
+        self.SITES.write_text(self.json.dumps({"236-CMCC": rec}), encoding="utf-8")
+
+    def _st(self, pci="236", op="CMCC"):
+        return {"signal": {"pci": pci, "operator": op}}
+
+    def test_uses_recent_memory(self):
+        self._write({"seen": 4, "last": self.ago(hours=2), "best": 40,
+                     "bands": {"40": {"dead": 0, "ok": 4, "best": 43.0}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertEqual(band, 40)
+        self.assertIn("最优 BAND 40", why)
+
+    def test_no_record_means_measure(self):
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("没测过", why)
+
+    def test_stale_memory_means_measure(self):
+        self._write({"seen": 9, "last": self.ago(days=9), "best": 40,
+                     "bands": {"40": {"dead": 0, "ok": 9, "best": 43.0}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("过期", why)
+
+    def test_flappy_best_means_measure(self):
+        # 历史最优会周期性掉包 → 不能直接锁它，宁可重测
+        self._write({"seen": 4, "last": self.ago(hours=1), "best": 40,
+                     "bands": {"40": {"dead": 0, "ok": 4, "best": 43.0,
+                                      "samples": [[12, 40, 60, 90], [12, 40, 5, 70],
+                                                  [12, 40, 45, 88]]}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("掉包", why)
+
+    def test_dead_best_means_measure(self):
+        self._write({"seen": 4, "last": self.ago(hours=1), "best": 38,
+                     "bands": {"38": {"dead": 6, "ok": 0}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("没覆盖", why)
+
+    def test_no_pci_means_measure(self):
+        band, why = A.guard_memory_band({"signal": {}})
+        self.assertIsNone(band)
+        self.assertIn("PCI", why)
+
+
 if __name__ == "__main__":
     unittest.main()

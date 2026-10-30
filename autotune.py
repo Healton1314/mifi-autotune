@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2035,22 +2035,67 @@ def _guard_unlock(dev, cur_band):
     return ok
 
 
-def _guard_lock_current(dev, serving):
-    if not serving:
-        print("      [!] 读不到当前驻留的频段，这次先不锁", flush=True)
-        return False
-    print(f"      锁到当前驻留的 BAND {serving}（不重新测，几乎不断网）…", flush=True)
+def guard_memory_band(st):
+    """久坐时：能不能凭「这个位置的历史」直接锁定？返回 (频段 or None, 说明)。
+
+    为什么要有这一步：守护原来是「久坐 → 跑一次 5 分钟体检 → 锁」。用户体感
+    （2026-10-30）是「手动测一次锁上比设备自动好，但守护用起来反而像厂商的
+    自动」—— 因为它每次都从头重新决策，还要断好几次网。可这个位置最优是哪条
+    频段，sites.json 里早就写着，够新就直接用。
+
+    四条否决条件，任一条不满足就老老实实重测：
+      读不到 PCI / 这个位置没测过 / 记忆不是 fresh（72 小时内）/
+      记忆里的最优频段现在没覆盖、或历史上会周期性掉包。
+    """
+    key = _site_key(st)
+    if not key:
+        return None, "读不到 PCI，没法查这个位置"
+    data = load_sites()
+    rec = data.get(find_site(data, key))
+    if not rec:
+        return None, "这个位置没测过"
+    state = site_memory_state(rec)
+    if state != "fresh":
+        return None, ("位置记忆已过期" if state == "stale"
+                      else "位置记忆有点旧（超过 72 小时）")
+    band = rec.get("best")
     try:
-        dev.set_band(serving)
+        band = int(band) if band is not None else None
+    except (TypeError, ValueError):
+        band = None
+    if band is None:
+        return None, "记忆里没有最优频段"
+    v = (rec.get("bands") or {}).get(str(band)) or {}
+    if (v.get("dead") or 0) >= DEAD_SKIP_MIN and not (v.get("ok") or 0):
+        return None, f"记忆里的最优 BAND {band} 现在没覆盖"
+    if band_flap(v)[0]:
+        return None, f"记忆里的最优 BAND {band} 会周期性掉包"
+    return band, (f"这个位置 {_fmt_age(site_age_hours(rec))}测过 "
+                  f"{int(rec.get('seen') or 0)} 次，最优 BAND {band}")
+
+
+def _guard_lock_band(dev, band):
+    print(f"      锁到 BAND {band}（不重新测，几乎不断网）…", flush=True)
+    try:
+        dev.set_band(band)
     except DeviceUnreachable:
+        # 射频重启导致请求本身断掉，指令通常已经送达
         pass
     except Exception as e:  # noqa: BLE001
         print(f"      [!] 锁定失败：{type(e).__name__}: {e}", flush=True)
         return False
     ok = wait_device_back(dev, timeout=60)
-    print(f"      已锁定 BAND {serving}" if ok
+    print(f"      已锁定 BAND {band}" if ok
           else "      [!] 后台没回来，稍后自动重试", flush=True)
     return ok
+
+
+def _guard_lock_current(dev, serving):
+    if not serving:
+        print("      [!] 读不到当前驻留的频段，这次先不锁", flush=True)
+        return False
+    print("      锁当前驻留的频段（--guard-fast，跳过选优）…", flush=True)
+    return _guard_lock_band(dev, serving)
 
 
 def _guard_measure(args):
@@ -2159,13 +2204,21 @@ def run_guard(args, cfg):
                     pci_log.clear()
                     bad_streak = 0
                 elif action == "lock":
-                    # 久坐 → 先选优（跑一次体检拿最优），再锁定。
-                    # 用户定这条：只锁「当前驻留的」不一定是最优，可能一直锁在
-                    # 一个次优频段上。选优只在「久坐」和「解锁后仍不通」时发生，
-                    # 平时只采样，不会反复断网。
-                    if args.guard_fast:
+                    # 久坐 → 锁定。顺序很重要：
+                    #   ① 这个位置 3 天内测过、历史最优还站得住 → 直接锁它（几秒，几乎不断网）
+                    #   ② 没可信历史 → 才跑一次体检选优
+                    #   ③ --guard-fast → 只锁当前驻留的
+                    # 用户 2026-10-30 的体感：手动测一次锁上比设备自动好，但守护
+                    # 每次久坐都重测 5 分钟、断网几次，用起来反而像「厂商的自动」——
+                    # 因为它一直在重新决策，而不是用已经知道的答案。
+                    memo, memo_why = guard_memory_band(st)
+                    if memo:
+                        print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
+                        _guard_lock_band(dev, memo)
+                    elif args.guard_fast:
                         _guard_lock_current(dev, serving)
                     else:
+                        print(f"      → {memo_why}，跑一次完整体检再锁", flush=True)
                         dev = None
                         _guard_measure(args)
                     stable_since = time.time()
