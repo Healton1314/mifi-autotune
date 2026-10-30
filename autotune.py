@@ -29,7 +29,7 @@ from pathlib import Path
 import probe
 import scanner
 from drivers import detect, list_drivers
-from drivers.base import DeviceBusy, Unsupported
+from drivers.base import DeviceBusy, DeviceUnreachable, Unsupported
 
 HERE = Path(__file__).resolve().parent
 STATE = HERE / "state.json"
@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1193,13 +1193,22 @@ def run_mtu_check(st0, ping_host):
     return 0
 
 
-def wait_device_back(dev, timeout=45, poll=5):
-    """写完频段后等设备的 web 后台重新可达。
+def _cli():
+    """提示里该用哪个命令前缀。
 
-    换频段会让设备重启射频，管理后台跟着掉 5~20 秒。原来发完指令就
-    sleep 固定秒数，然后立刻读状态 / 写信道 —— 正好撞在重启窗口里：
-    实机表现是「[应用] 切换 WiFi 信道到 1 … → [×] 应用过程中设备无响应」，
-    其实频段早就切成功了，只是后台没回来。
+    手机（Termux）装的是 `mifi` 包装脚本，电脑上是 `python autotune.py`。
+    原来一律写 `python autotune.py --restore`，手机用户得自己翻译一遍。
+    """
+    return "mifi" if probe.is_termux() else "python autotune.py"
+
+
+def wait_device_back(dev, timeout=45, poll=5):
+    """等设备的 web 后台重新可达。
+
+    两种情况后台都会掉 5~20 秒：换频段（重启射频）、改信道（重启 AP）。
+    手机上更慢一层 —— 手机自己就是通过这台设备的 WiFi 连着后台的，
+    改信道等于把手机的网先掐了，还得等系统自动重连。
+    所以「发完指令立刻读状态」必然失败，那不是出错，是还没连上。
     轮询比盲睡可靠：设备 6 秒回来就不必等 26 秒。
     """
     t0 = time.time()
@@ -1268,9 +1277,19 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
         else:
             print(f"  · 信道 {cur_ch} → {val}")
 
+    # 体检和应用之间设备被改过（自己动的手、或设备自动换信道）：目标值是按体检时
+    # 算的，仍然成立；但数字对不上会让人以为工具记错了，说一句。
+    plan_ch = (plan.get("current") or {}).get("channel")
+    if plan_ch and cur_ch and plan_ch != cur_ch:
+        print(f"  （体检时信道是 {plan_ch}，现在是 {cur_ch} —— 期间被改过，以现在为准）")
+
     if getattr(args, "dry_run", False):
         print("\n[演练] 以上是「将会做」的改动；加了 --dry-run 所以没有碰设备。")
-        print("       去掉 --dry-run 就会真的切过去（约 30~60 秒，中途断网一次）。")
+        if any(k == "band" for k, _ in todo):
+            print("       去掉 --dry-run 就会真的切过去（约 60~90 秒，会断两次网）。")
+        else:
+            print("       去掉 --dry-run 就会真的切过去（约 20~40 秒；"
+                  "设备重启 WiFi，本机断 5~20 秒后自动重连）。")
         return 0
 
     save_state({"saved_at": datetime.now().isoformat(),
@@ -1288,8 +1307,8 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
                     continue
                 if not wait_device_back(dev, timeout=60):
                     print("[!] 设备后台 60 秒没回来 —— 多半还在重启。")
-                    print("    等 1 分钟跑 `python autotune.py` 看实际状态；"
-                          "要强制回原样用 `--restore`。")
+                    print(f"    等 1 分钟跑 {_cli()} --status 看实际状态；"
+                          f"要强制回原样用 {_cli()} --restore。")
                     failed = True
                     break
                 print(f"      设备已回来，等它重新注册（{SETTLE_SEC}s）…")
@@ -1304,16 +1323,36 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
                 print(f"[√] 已生效，延迟 {chk['avg']}ms")
             else:
                 print(f"\n[应用] 切换 WiFi 信道到 {val} …")
+                # 改信道 = 设备重启自己的 AP = **手机/电脑先断网**（这台设备的
+                # WiFi 就是当前唯一的通道）。所以绝不能「发完就立刻读状态」，
+                # 那必定 DeviceUnreachable，还会被当成「应用出错」。
+                # 2026-10-30 实机：信道其实已经切成 1 了，界面却报
+                # 「[×] 应用过程中设备无响应」+「读不回设备状态」，用户以为失败。
+                print("      设备会重启 WiFi，这台机器的连接会断 5~20 秒（正常现象）")
                 try:
                     dev.set_channel(val)
                 except Unsupported as e:
                     print(f"[跳过] {e}")
                     continue
-                time.sleep(5)
+                except DeviceUnreachable:
+                    # 指令多半已经送到，只是设备重启太快、响应没回来。
+                    # 当失败处理会误判，先等它回来再核对。
+                    print("      指令已发出（设备重启太快，响应没回来 —— 正常）")
+                print("      等 WiFi 恢复…")
+                if not wait_device_back(dev, timeout=90, poll=5):
+                    print("[!] 90 秒还没连回来。")
+                    print(f"    手机看 WiFi 是否已重连，然后跑 {_cli()} --status；"
+                          f"要强制回原样用 {_cli()} --restore。")
+                    failed = True
+                    break
                 got = dev.get_state()["channel"]
                 if got != val:
-                    print(f"[!] 信道未生效（当前 {got}），恢复原值")
-                    dev.set_channel(cur_ch)
+                    print(f"[!] 信道未生效（当前 {got}），恢复原值 {cur_ch}")
+                    try:
+                        dev.set_channel(cur_ch)
+                        wait_device_back(dev, timeout=90)
+                    except Exception:  # noqa: BLE001
+                        print(f"    恢复也没发出去，请手动在设备后台把信道改回 {cur_ch}")
                     failed = True
                 else:
                     print("[√] 已生效")
@@ -1325,15 +1364,25 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
         # 别甩一段 traceback 让人无从下手。
         print(f"\n[×] 应用过程中设备无响应：{type(e).__name__}: {e}")
         print("    设备可能已经切换成功，也可能还停在原频段。")
-        print("    等 30 秒后重跑 `python autotune.py` 看当前状态；"
-              "要强制回原样用 `python autotune.py --restore`。")
+        print(f"    等 30 秒后跑 {_cli()} --status 看当前状态；"
+              f"要强制回原样用 {_cli()} --restore。")
         failed = True
 
+    end = None
     try:
         end = dev.get_state()
     except Exception as e:  # noqa: BLE001
-        print(f"\n[×] 改动已发出，但读不回设备状态（{type(e).__name__}）。")
-        print("    等 30 秒后跑 `python autotune.py` 确认实际状态。")
+        # 刚切完信道时手机 WiFi 常常还没重连上。直接报错会把「成功」说成「失败」，
+        # 多等一轮再下结论（2026-10-30 实机就卡在这里）。
+        print(f"\n[!] 暂时读不到设备（{type(e).__name__}），等 WiFi 恢复再试…")
+        if wait_device_back(dev, timeout=45, poll=8):
+            try:
+                end = dev.get_state()
+            except Exception as e2:  # noqa: BLE001
+                print(f"[×] 还是读不到（{type(e2).__name__}）。")
+    if end is None:
+        print(f"    改动多半已经生效，只是这台机器还没连回去。")
+        print(f"    手机 WiFi 重连后跑 {_cli()} --status 确认；不行就 {_cli()} --restore。")
         return 1
     append_log({"ts": datetime.now().isoformat(), "mode": "apply-plan",
                 "plan": plan.get("expected"), "before": {"band": cur_band, "channel": cur_ch},
@@ -1498,9 +1547,12 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
         # 只有信道建议（频段那边保持现状）。
         # 原来这个分支直接 return 0 —— 用户看到「信道 11 → 7，干扰降 74%」，
         # 却没有任何「要不要应用」的提示，只能自己去敲 --apply-plan
-        # （2026-10-30 实机反馈）。信道改动几秒完成、不断网，更没理由不问。
+        # （2026-10-30 实机反馈）。
         print("要现在就应用吗？回车 = 只改信道；n = 不改")
-        print("（改信道几秒完成，不会断网）")
+        # 断网这句话必须说实话：这台设备的 WiFi 就是当前唯一通道，
+        # 改信道 = AP 重启 = 本机先断 5~20 秒。写成「不会断网」会让用户
+        # 以为卡死了（2026-10-30 实机就是先看到报错再看到这句话）。
+        print("（设备会重启 WiFi，本机断 5~20 秒；Termux 里不用管，会自动重连）")
     elif options.get("auto"):
         a = options["auto"]
         print(f"要现在就应用吗？回车 = 按自动建议切到 BAND {a['band']}（{a['reason']}）")
@@ -1519,7 +1571,7 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
         return 0
 
     if ans in ("n", "no", "q", "quit", "不", "否", "取消"):
-        print("已跳过，设备保持原样。下次想应用直接跑：python autotune.py --apply-plan")
+        print(f"已跳过，设备保持原样。下次想应用直接跑：{_cli()} --apply-plan")
         return 0
     if ans.startswith("a") and options.get("speed"):
         args.strategy = "speed"
