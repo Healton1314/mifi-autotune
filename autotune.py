@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -131,6 +131,12 @@ GUARD_QUICK_MIN_MBPS = 15           # 「够用」的速度下限
 GUARD_QUICK_MAX_LOSS = 5            # 「够用」的丢包上限
 GUARD_QUICK_MAX_MS = 150            # 「够用」的延迟上限
 GUARD_QUICK_PROBE_SEC = 5           # 快测只下 5 秒，判断量级足够
+# 久坐锁定前，把「刚才快测到的当前速度」和「记忆里的历史最优」比一下。
+# 用户实机（2026-10-30 18:00）：记忆说 BAND 3 有 44.6 Mbps，但那是上午、还是在
+# 另一个 PCI（350）下测的；当时实测当前 BAND 40 有 32 Mbps，延迟 65ms 正常。
+# 差 30% 以内就别折腾 —— 切一次频段要断几秒、要重新注册，而"记忆里的最优"
+# 本身可能是别的扇区、别的时段测出来的，未必代表现在。只有明显快得多才值得切。
+GUARD_QUICK_KEEP_RATIO = 0.7        # 当前 ≥ 历史最优 × 这个比例 → 就留在当前
 
 # 锁定之后判「这条不行」的线。原来是丢包 ≥20%，太敏感：宿舍 BAND 40 每 3~5 分钟
 # 掉 30~50%，会导致守护反复解锁 —— 越解越像「厂商的自动」，而这正是要治的病。
@@ -2114,6 +2120,50 @@ def guard_alt_band(st, skip=None):
     return rows[0][1] if rows else None
 
 
+def guard_memo_speed(key, band):
+    """记忆里这个频段的历史最好速度（Mbps）；查不到返回 0。
+
+    只用来和「刚才快测的当前速度」比大小，不参与别的判断 ——
+    它可能是几天前、在另一个 PCI 下测出来的，单看它不可信。
+    """
+    if not key or band is None:
+        return 0.0
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key)) or {}
+        v = (rec.get("bands") or {}).get(str(int(band))) or {}
+        return float(v.get("best") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def guard_pick_lock(memo, memo_mbps, serving, quick):
+    """久坐时到底锁哪一条。返回 (频段 or None, 依据)；依据 ∈ {memo, keep, quick}。
+
+      memo      记忆里的最优频段（None = 没有可信记忆）
+      memo_mbps 记忆里那条的历史最好速度
+      serving   设备当前驻留的频段
+      quick     刚才的快测结果 dict（可能为 None，或测的是别的频段）
+
+    依据的含义：
+      keep   记忆有值，但当前这条刚量出来不比它差多少 → 留在当前，不切
+      memo   记忆里的最优明显更快 → 切过去（值得断那几秒）
+      quick  没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
+    返回 None 表示信息不够，该老老实实跑一次完整体检。
+    """
+    cur_ok = bool(quick and quick.get("ok") and serving
+                  and quick.get("band") == serving)
+    cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
+    if (memo is not None and cur_ok and str(serving) != str(memo)
+            and memo_mbps and cur_mbps >= memo_mbps * GUARD_QUICK_KEEP_RATIO):
+        return int(serving), "keep"
+    if memo is not None:
+        return int(memo), "memo"
+    if cur_ok:
+        return int(serving), "quick"
+    return None, None
+
+
 def mark_site_provisional(key, band):
     """记一笔「这个位置只是先锁住，没实测过」：下次来要补一次完整体检。
 
@@ -2346,28 +2396,38 @@ def run_guard(args, cfg):
                     bad_streak = 0
                     quick, quick_done = None, False
                 elif action == "lock":
-                    # 久坐才走到这里（路过不锁）。顺序：
-                    #   ① 有可信记忆 → 直接锁记忆里的最优（几秒，几乎不断网）
-                    #   ② 没记忆、但刚才快测「够用」且频段没变 → 锁当前这条，
-                    #      标「只做过快速判断」，下次来补一次完整体检
-                    #   ③ 其余 → 跑完整体检再锁
-                    if memo:
-                        print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
-                        _guard_lock_band(dev, memo)
-                    elif getattr(args, "guard_fast", False):
+                    # 久坐才走到这里（路过不锁）。锁哪一条交给 guard_pick_lock：
+                    # 它会把「记忆里的历史最优」和「刚才快测到的当前速度」放在一起比。
+                    if getattr(args, "guard_fast", False):
                         _guard_lock_current(dev, serving)
-                    elif (quick and quick.get("ok") and serving
-                          and quick.get("band") == serving):
-                        print(f"      → 当前 BAND {serving} 快测够用"
-                              f"（{quick['mbps']:.0f} Mbps / {quick['avg']}ms），直接锁它；"
-                              f"其余频段下次来再比", flush=True)
-                        _guard_lock_band(dev, serving)
-                        mark_site_provisional(_site_key(st), serving)
                     else:
-                        print(f"      → {memo_why or '没有可信依据'}，跑一次完整体检再锁",
-                              flush=True)
-                        dev = None
-                        _guard_measure(args)
+                        memo_best = (guard_memo_speed(_site_key(st), memo)
+                                     if memo else 0.0)
+                        band, kind = guard_pick_lock(memo, memo_best, serving, quick)
+                        if kind == "keep":
+                            # 记忆里的最优可能是几天前、甚至换了 PCI 测的；
+                            # 当前这条是几分钟前刚量的。差得不多就别切。
+                            gap = int(round((1 - GUARD_QUICK_KEEP_RATIO) * 100))
+                            print(f"      → 记忆里 BAND {memo} 是 {memo_best:.0f} Mbps，"
+                                  f"但刚才实测当前 BAND {serving} 有 "
+                                  f"{float(quick.get('mbps') or 0):.0f} Mbps"
+                                  f"（差不到 {gap}%），锁当前这条，不切换", flush=True)
+                            _guard_lock_band(dev, band)
+                        elif kind == "memo":
+                            print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
+                            _guard_lock_band(dev, band)
+                        elif kind == "quick":
+                            print(f"      → 当前 BAND {serving} 快测够用"
+                                  f"（{float(quick.get('mbps') or 0):.0f} Mbps / "
+                                  f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
+                                  flush=True)
+                            _guard_lock_band(dev, band)
+                            mark_site_provisional(_site_key(st), band)
+                        else:
+                            print(f"      → {memo_why or '没有可信依据'}，"
+                                  f"跑一次完整体检再锁", flush=True)
+                            dev = None
+                            _guard_measure(args)
                     stable_since = time.time()
                     quick, quick_done = None, False
                 else:  # measure：解锁后仍然不通，说明不是「锁错了」

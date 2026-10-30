@@ -236,5 +236,85 @@ class AltBand(unittest.TestCase):
         self.assertIsNone(A.guard_alt_band(self._st(), skip=3))
 
 
+class PickLockBand(unittest.TestCase):
+    """久坐锁定前：记忆里的历史最优 vs 刚才快测的当前速度，锁哪一条。
+
+    真实数据（2026-10-30 宿舍）：记忆说 BAND 3 是 44.6，但那是上午、在另一个
+    PCI（350）下测的；当时实测当前 BAND 40 是 32 Mbps、延迟 65ms、丢包 0%。
+    差 28% 就切过去，等于拿「别的扇区、别的时段」的数字换掉刚量到的真实值，
+    还要断几秒 —— 不值得。差得明显（比如 20 对 44.6）才切。
+    """
+
+    def _q(self, band=40, mbps=32.0, ok=True):
+        return {"band": band, "ok": ok, "mbps": mbps, "avg": 65, "loss": 0}
+
+    def test_close_enough_keeps_current(self):
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
+                                       quick=self._q(40, 32.0))
+        self.assertEqual((band, kind), (40, "keep"))
+
+    def test_much_slower_current_switches_to_memory(self):
+        # 当前只有 20，记忆里 44.6 —— 这个差距值得断几秒换过去
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
+                                       quick=self._q(40, 20.0))
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_memory_without_quick_still_used(self):
+        # 快测没做（停的时间不够）→ 只能听记忆的
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
+                                       quick=None)
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_quick_measuring_other_band_is_ignored(self):
+        # 快测的是 BAND 8，人后来跳到 40 了 —— 那个数字不能拿来给 40 作证
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
+                                       quick=self._q(8, 50.0))
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_no_memory_quick_enough_locks_current(self):
+        band, kind = A.guard_pick_lock(memo=None, memo_mbps=0.0, serving=40,
+                                       quick=self._q(40, 32.0))
+        self.assertEqual((band, kind), (40, "quick"))
+
+    def test_no_memory_quick_not_enough_means_measure(self):
+        band, kind = A.guard_pick_lock(memo=None, memo_mbps=0.0, serving=40,
+                                       quick=self._q(40, 8.0, ok=False))
+        self.assertIsNone(band)
+        self.assertIsNone(kind)
+
+    def test_same_band_as_memory_is_not_a_switch(self):
+        # 当前就是记忆里那条，不该说「不切换」绕一圈，直接按记忆算
+        band, kind = A.guard_pick_lock(memo=40, memo_mbps=44.6, serving=40,
+                                       quick=self._q(40, 44.0))
+        self.assertEqual((band, kind), (40, "memo"))
+
+
+class MemoSpeed(unittest.TestCase):
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        self.SITES = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.SITES)
+        self._p.start()
+        self.json = json
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_reads_band_best(self):
+        self.SITES.write_text(self.json.dumps(
+            {"236-CMCC": {"seen": 2, "last": "2026-10-30T17:00:00",
+                          "best": 3, "bands": {"3": {"ok": 2, "best": 44.6}}}}),
+            encoding="utf-8")
+        self.assertAlmostEqual(A.guard_memo_speed("236-CMCC", 3), 44.6)
+
+    def test_missing_band_is_zero(self):
+        self.assertAlmostEqual(A.guard_memo_speed("236-CMCC", 3), 0.0)
+        self.assertAlmostEqual(A.guard_memo_speed("", 3), 0.0)
+        self.assertAlmostEqual(A.guard_memo_speed("236-CMCC", None), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
