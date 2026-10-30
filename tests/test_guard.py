@@ -59,11 +59,21 @@ class GuardDecide(unittest.TestCase):
         self.assertIsNone(decide(locked=False, bad_streak=A.GUARD_BAD_HITS,
                                  outage_after_unlock=False)[0])
 
-    def test_cooldown_blocks_everything(self):
-        # 冷却期内哪怕条件全满足也不动，避免反复断网
-        action, why = decide(moving=True, locked=True, cooldown_left=120)
+    def test_cooldown_blocks_proactive_lock_only(self):
+        # 冷却只该管「别反复切频段」这类主动动作，不该挡住自救。
+        action, why = decide(still_sec=700, locked=False, cooldown_left=120)
         self.assertIsNone(action)
         self.assertIn("冷却", why)
+
+    def test_cooldown_does_not_block_unlock(self):
+        # 实机踩到：解锁后冷却 300s，「解锁后仍不通→体检」的窗口也正好 300s，
+        # 两者互斥，自救链整条走不到。所以自救必须排在冷却前面。
+        self.assertEqual(decide(locked=True, bad_streak=A.GUARD_BAD_HITS,
+                                cooldown_left=200)[0], "unlock")
+        self.assertEqual(decide(moving=True, locked=True, cooldown_left=200)[0], "unlock")
+        self.assertEqual(decide(locked=False, bad_streak=A.GUARD_BAD_HITS,
+                                outage_after_unlock=True, cooldown_left=200)[0],
+                         "measure")
 
     def test_bad_streak_below_threshold_ignored(self):
         self.assertIsNone(decide(locked=True, bad_streak=A.GUARD_BAD_HITS - 1)[0])

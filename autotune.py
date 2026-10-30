@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -112,7 +112,10 @@ GUARD_SETTLE_SEC = 600              # 连续这么久 PCI 没变 = 原地不动�
 GUARD_MOVE_WINDOW = 180             # 判定「在移动」的时间窗
 GUARD_MOVE_HITS = 2                 # 窗口内 PCI 变这么多次 = 在移动
 GUARD_BAD_HITS = 3                  # 连续这么多次采样不通 = 锁定的频段撑不住
-GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网
+GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（只管主动动作）
+# 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
+# 挂上，窗口就已经关了，后面那条「解锁仍不通 → 跑体检」永远走不到。
+GUARD_RESCUE_WINDOW = 900
 
 # 决赛：第二名和第一名的差距小于这个比例时，两个都要复测。
 # 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
@@ -1998,14 +2001,19 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
 
     返回 (action, 原因)，action ∈ {None, "unlock", "lock", "measure"}。
     """
-    if cooldown_left > 0:
-        return None, f"冷却中（{int(cooldown_left)}s）"
+    bad = bad_streak >= GUARD_BAD_HITS
+    # 自救优先于冷却。冷却本来只管「别反复切频段」，但它要是把自救也挡住，
+    # 就变成「一直不通就一直等着」—— 实机对时间才看出来：解锁后置冷却 300s，
+    # 「解锁后仍不通」的窗口也正好是 300s，两者互斥，`measure` 那条永远走不到，
+    # 等于「锁在坏频段上」的自救链是断的。
     if moving and locked:
         return "unlock", "检测到移动，锁死频段会限制可用覆盖"
-    if bad_streak >= GUARD_BAD_HITS and locked:
+    if bad and locked:
         return "unlock", f"锁定后连续 {bad_streak} 次不通，先解锁自救"
-    if bad_streak >= GUARD_BAD_HITS and not locked and outage_after_unlock:
+    if bad and not locked and outage_after_unlock:
         return "measure", f"解锁后仍然 {bad_streak} 次不通 —— 不是频段问题，换一个试试"
+    if cooldown_left > 0:
+        return None, f"冷却中（{int(cooldown_left)}s）"
     if not moving and not locked and still_sec >= settle_sec:
         return "lock", f"原地待了 {int(still_sec / 60)} 分钟，锁住当前频段防止它自己乱跳"
     return None, ""
@@ -2119,7 +2127,7 @@ def run_guard(args, cfg):
             bad_now = ping["avg"] is None or (ping["loss"] or 0) >= 20
             bad_streak = bad_streak + 1 if bad_now else 0
             outage_after_unlock = (unlocked_at is not None
-                                   and now - unlocked_at < 300)
+                                   and now - unlocked_at < GUARD_RESCUE_WINDOW)
 
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
             who = (f"锁定 BAND {locked_band}" if locked
