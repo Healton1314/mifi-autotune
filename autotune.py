@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -38,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.7"
+__version__ = "0.6.8"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1026,6 +1027,24 @@ def prefer_stable_over_flap(usable, hist, fastest):
                      f"可能隔几分钟掉一次；这次没有差不多快的备选，切过去要有心理准备")
 
 
+def _site_measured(rec):
+    """这条记录里有没有「真测出来的数据」，而不只是「先锁过一下」。
+
+    provisional 是「第一次来，先锁当前免得乱跳」的标记。它原来只在
+    record_site 里该被清掉（现在会清了），但老数据会留下「标记为真、
+    bands 里其实已经有实测数字」的状态 —— 这种记录若再被判成「没测过」，
+    守护就永远走「快测当前、直接锁」，记忆永远上不了台面；更糟的是它
+    也永远不会触发体检去修正自己，死循环。所以判据看数据本身。
+    """
+    for v in (rec.get("bands") or {}).values():
+        try:
+            if int((v or {}).get("ok") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def find_site(data, key, now=None):
     """认出「刚切过频段、PCI 变了但人没挪窝」还是同一个地方。
 
@@ -1048,7 +1067,9 @@ def find_site(data, key, now=None):
     pci, op = _split_key(key)
     if not pci or not op:
         return key
-    prov = bool((data.get(key) or {}).get("provisional"))
+    own = data.get(key) or {}
+    # 「可以丢掉」的只是空记录。已经真测过的记录不能当成空壳并掉。
+    prov = bool(own.get("provisional")) and not _site_measured(own)
     best = None
     for k, v in (data or {}).items():
         if _split_key(k)[1] != op:
@@ -1176,6 +1197,13 @@ def record_site(key, results, best_band=None, reset_best=False):
                     v["rsrp_med"] = int(statistics.median(seen_rsrp))
         elif r.get("reason") == "no_signal":
             v["dead"] = int(v.get("dead") or 0) + 1
+    # 真测过，就把「只是先锁住」的标记摘掉。这个标记本来是给「第一次来、
+    # 先锁当前免得乱跳」用的，可它原来只写不清 —— 于是这个位置永远被判成
+    # 「没测过」，守护每次来都走「快测当前、直接锁」，记忆里那条最优永远
+    # 上不了台面。实机 2026-10-30 19:44：236-CMCC 在 18:14 已实测过四条
+    # 频段，仍被当成新地方，绕过了一整轮信号比较。
+    if any(r.get("ok") for r in results):
+        rec.pop("provisional", None)
     if best_band:
         rec["best"] = int(best_band)
     save_sites(data)
@@ -2495,8 +2523,11 @@ def guard_memory_band(st):
     rec = data.get(find_site(data, key))
     if not rec:
         return None, GUARD_NEW_SITE
-    if rec.get("provisional"):
-        # 上次只是「先锁住别乱跳」，没真测过：这次补一次完整体检再谈最优
+    if rec.get("provisional") and not _site_measured(rec):
+        # 上次只是「先锁住别乱跳」，没真测过：这次补一次完整体检再谈最优。
+        # 注意要带「且没有实测数据」—— 老版本会留下「标记为真、数据其实有」
+        # 的记录（实机 2026-10-30 的 236-CMCC），那种记录必须当成有记忆，
+        # 否则永远用不上、也永远不会去补测，自己锁死自己。
         return None, "这个位置只做过快速判断（没实测速度）"
     state = site_memory_state(rec)
     if state != "fresh":
@@ -2554,6 +2585,38 @@ def _guard_measure(args):
     return code
 
 
+def _install_stop_signals():
+    """让守护能被 SIGTERM 干净地停下（mifi --stop、kill）。
+
+    Ctrl+C 发的是 SIGINT，本来就能停；可手机上那个组合键并不可靠 ——
+    实机 2026-10-30 19:45 用户按了没反应，只能强杀整个 Termux 才停掉。
+    所以另开一条路：SIGTERM 也转成 KeyboardInterrupt，走同一条收尾路径
+    （打印「已停止」、放掉 wake lock），不必再牺牲终端。
+    """
+    def _raise(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _raise)
+        except (ValueError, OSError):
+            pass                        # 非主线程装不了，忽略
+
+
+def guard_still_reset(pci_changed, moving, bad_now):
+    """这一拍要不要把「静止计时」清零。
+
+    只在真发生事的时候清：PCI 真变了，或者链路垮了。**不能写 if moving** ——
+    moving 在最后一次换小区之后还会保持整整 GUARD_MOVE_WINDOW（300s），
+    每一拍都清零等于把起点一直往后推，把「坐满 10 分钟」拖成最多 15 分钟。
+    实机 2026-10-30：19:30 人就坐下了，19:34:55 才开始计时，19:44:29 才锁上。
+    """
+    return bool(pci_changed or (moving and bad_now))
+
+
 def run_guard(args, cfg):
     """全自动守护：打开一次就一直在，按「人在不在动」管频段锁定。"""
     interval = max(15, args.guard_interval)
@@ -2570,8 +2633,11 @@ def run_guard(args, cfg):
     print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
     print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
           f" → 先换备选，没有才解锁")
-    print(f"  Ctrl+C 停止{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
+    print(f"  Ctrl+C 停止（按不出来就在另一个窗口跑 mifi --stop）"
+          f"{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
     print("=" * 62, flush=True)
+
+    _install_stop_signals()
 
     dev = None
     last_pci, last_rsrp, stable_since, pci_log = None, None, time.time(), deque()
@@ -2588,8 +2654,12 @@ def run_guard(args, cfg):
                 try:
                     dev = detect(args.host, args.user, args.password, name=args.driver)
                 except Exception as e:  # noqa: BLE001
-                    print(f"{_now_hm()}  连不上设备（{type(e).__name__}），5 秒后重试",
-                          flush=True)
+                    # 只给异常类名等于没说：LookupError 的消息本身就是「找不到
+                    # 这台设备的后台」这类人话，TimeoutError 才说明是没响应。
+                    # 实机 2026-10-30 19:07 连打三行 LookupError，看不出是
+                    # 「WiFi 还没连上」还是「设备在重启」。
+                    print(f"{_now_hm()}  连不上设备：{e or type(e).__name__}"
+                          f"，5 秒后重试", flush=True)
                     time.sleep(5)
                     continue
             try:
@@ -2636,9 +2706,12 @@ def run_guard(args, cfg):
                 # 人没动、设备自己换的小区 → 记进同一处，这地方以后认得它
                 note_cell_change(last_key, _site_key(st))
             last_key = _site_key(st)
-            # 静止计时只在「真的在动」时清零。原来每变一次 PCI 就归零，
-            # 弱信号下一个晚上重选两次，就永远坐不满 10 分钟、永远不锁。
-            if moving:
+            # 静止计时只在「这一刻真发生了事」时归零：PCI 真的变了，或者链路垮了。
+            # 原来写的是 if moving —— 而 moving 在最后一次换小区之后还会继续保持
+            # 整整 GUARD_MOVE_WINDOW（300s），于是每一轮都把起点往后推，把「坐满
+            # 10 分钟」拖成最多 15 分钟。实机 2026-10-30 19:30 人就坐下了，
+            # 19:34:55 才开始计时，19:44:29 才锁上。
+            if guard_still_reset(pci_changed, moving, bad_now):
                 stable_since = now
             still = now - stable_since
             outage_after_unlock = (unlocked_at is not None
@@ -2675,8 +2748,15 @@ def run_guard(args, cfg):
                             "poor": "不够用"}
                 g = quick.get("grade") or ("good" if quick["ok"] else "poor")
                 sam = " / ".join(f"{x:.0f}" for x in (quick.get("samples") or []))
+                # 两次差 1.5 倍以上就把倍数写出来：「12 Mbps（两次 6 / 12）」
+                # 本身不假，但读者不会立刻意识到这条链路的带宽在坐过山车，
+                # 而这个数字接下来要拿来决定锁哪条频段。
+                vals = [x for x in (quick.get("samples") or []) if x]
+                spread = ""
+                if len(vals) >= 2 and min(vals) > 0 and max(vals) / min(vals) >= 1.5:
+                    spread = f"，两次差 {max(vals) / min(vals):.1f} 倍"
                 lat = f"{quick['avg']}ms" if quick["avg"] is not None else "不通"
-                print(f"      {quick['mbps']:.0f} Mbps（两次 {sam}）｜ 延迟 {lat} ｜ "
+                print(f"      {quick['mbps']:.0f} Mbps（两次 {sam}{spread}）｜ 延迟 {lat} ｜ "
                       f"丢包 {quick['loss']}% → {grade_cn.get(g, g)}"
                       f"（{'先不动它' if quick['ok'] else '坐久了会重新选'}）",
                       flush=True)
@@ -3123,19 +3203,36 @@ def main():
         return run_apply_plan(dev, caps, st0, args, cfg, ping_host)
 
     if args.restore:
+        # 还原是「断网时救命」的命令，绝不能崩。切频段会让射频重启，紧接着
+        # 改信道必然打不进去：原来这里直接抛 DeviceUnreachable、带一屏 traceback
+        # 退出；更糟的是「[还原] 信道 -> 自动」是先打印再调用，于是屏幕显示成功、
+        # 实际没做（实机 2026-10-30 19:06 就这么崩的，信道一直停在 1）。
+        # 现在：先做后说，等设备回来再动下一步，失败也只给一句人话。
+        print("\n[还原] 频段 -> 未锁定")
         try:
-            print("\n[还原] 频段 -> 未锁定")
             dev.set_band(0)
             time.sleep(SETTLE_SEC)
         except Unsupported as e:
             print(f"[跳过] {e}")
-        try:
-            print("[还原] 信道 -> 自动")
-            dev.set_channel(0)
-            time.sleep(4)
-        except Unsupported as e:
-            print(f"[跳过] {e}")
-        print("[√] 已还原。建议等待 30 秒重新注册。")
+        except DeviceUnreachable:
+            pass                    # 射频正在重启，本来就该断一下，下面统一等它
+        back = wait_device_back(dev, timeout=60, poll=3)
+        if not back:
+            print("[!] 设备 60 秒没回来，信道这一步先跳过 —— 等它恢复后再跑一次 --restore")
+        else:
+            try:
+                dev.set_channel(0)
+                print("[还原] 信道 -> 自动")
+                time.sleep(4)
+            except Unsupported as e:
+                print(f"[跳过] {e}")
+            except DeviceUnreachable:
+                # 改信道会把手机自己的 WiFi 掐掉，这条几乎必现，不算失败。
+                print("[!] 改信道时连接断了一下；多半已生效，稍后用 --status 确认")
+        if back:
+            print("[√] 已还原。建议等待 30 秒重新注册。")
+        else:
+            print("[!] 只做了一半：频段已解开，信道没动（设备当时不可达）")
         # 保留改动前的原始记录，只补一条「什么时候还原的」。
         # 直接覆盖会把「我原来是哪个频段」抹掉，之后想查都查不到。
         saved = {}
@@ -3146,7 +3243,7 @@ def main():
         saved.update({"restored_at": datetime.now().isoformat(),
                       "restored_to": {"band": 0, "channel": 0}})
         save_state(saved)
-        return 0
+        return 0 if back else 1
 
     report = {"ts": datetime.now().isoformat(), "before": {"band": cur_band, "channel": cur_ch}}
 
