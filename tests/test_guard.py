@@ -371,6 +371,18 @@ class MovingDetection(unittest.TestCase):
     def test_still_here(self):
         self.assertFalse(self._move())
 
+    def test_band_switch_is_not_moving(self):
+        """实机 2026-10-30 21:46（手机放桌上没动）：BAND 3→40、PCI 350→236、
+        丢包 100%。换频段会让射频重启、WiFi 重连，PCI 变和链路垮同时成立，
+        旧判据必然判成「移动中」——其实人一直坐着，信号还从 -98 变好到 -76。"""
+        self.assertFalse(self._move(pci_changed=True, bad_now=True,
+                                    band_changed=True))
+
+    def test_band_switch_with_churn_still_moving(self):
+        """真在路上走，换频段也会换小区好几次 —— churn 说了算。"""
+        self.assertTrue(self._move(churn=True, pci_changed=True, bad_now=True,
+                                   band_changed=True))
+
 
 class StillReset(unittest.TestCase):
     """「坐满 10 分钟才锁」不能被移动判定的尾巴拖长。
@@ -392,6 +404,12 @@ class StillReset(unittest.TestCase):
 
     def test_quiet_sample_does_not_reset(self):
         self.assertFalse(A.guard_still_reset(False, False, False))
+
+    def test_band_switch_does_not_reset(self):
+        # 设备自己换频段：PCI 变了、链路也断了，但人坐在原处，计时接着数。
+        # 实机 21:46 这一下白等了 2 分钟；设备要是爱换，就永远坐不满 10 分钟。
+        self.assertFalse(A.guard_still_reset(True, False, True,
+                                            band_changed=True))
 
     def test_ten_minutes_means_ten_minutes(self):
         # 每秒一拍地模拟：第 0 秒换过小区，之后 moving 还要挂 300 秒。

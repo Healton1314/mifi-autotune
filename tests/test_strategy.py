@@ -86,6 +86,36 @@ class DecideBand(unittest.TestCase):
         self.assertIsNone(opt)
         self.assertIn("没有可比", why)
 
+    def test_unreliable_data_gives_no_advice(self):
+        """实机 2026-10-30 21:56（手机）：BAND 40 [3.7, 17.8] vs BAND 3 [8.2, 15.5]。
+
+        按最差一轮算 8.2/3.7 = 2.2 倍，旧逻辑判「速度强太多，切」；
+        可同一屏「按速度」那条线写着「数据不足以下结论」。两条线自相矛盾，
+        而且真的把设备切到了信号差 14dB 的频段。
+        """
+        cur = res(40, 10.8, [3.7, 17.8])
+        cand = [res(3, 11.8, [8.2, 15.5])]
+        opt, why = autotune.decide_band(
+            cur, cand, 40, caveats=["BAND 40 多轮结果波动过大（[3.7, 17.8]）"])
+        self.assertIsNone(opt)
+        self.assertIn("不可信", why)
+
+    def test_candidate_with_much_worse_signal_is_skipped(self):
+        """速度快一点、但信号差 24dB —— 不换。今晚就是拿 14dB 换 1 Mbps。"""
+        cur = dict(res(40, 30.0, [29.0, 31.0]), rsrp=-78)
+        cand = [dict(res(3, 33.0, [32.0, 34.0]), rsrp=-102)]
+        opt, why = autotune.decide_band(cur, cand, 40)
+        self.assertIsNone(opt)
+        self.assertIn("信号都比当前差一截", why)
+
+    def test_candidate_with_better_signal_still_wins(self):
+        """信号更好、速度也更快 —— 该切还是要切。"""
+        cur = dict(res(40, 20.0, [19.0, 21.0]), rsrp=-95)
+        cand = [dict(res(3, 40.0, [39.0, 41.0]), rsrp=-78)]
+        opt, _why = autotune.decide_band(cur, cand, 40)
+        self.assertIsNotNone(opt)
+        self.assertEqual(opt["band"], 3)
+
 
 class PreviewRendersAutoDecision(unittest.TestCase):
     """auto 裁决出「换稳定」时，结论必须能正常打印。

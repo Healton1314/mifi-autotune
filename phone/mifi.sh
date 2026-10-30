@@ -82,24 +82,41 @@ case "${1:-}" in
     # 点 CTRL 再点 C，很容易按成别的）。这里直接按命令行认进程杀掉 ——
     # 同一个 Termux uid，不需要 root，也不像 adb 那样被权限挡住。
     # 用它停止时守护会走和 Ctrl+C 同一条收尾路径（打印「已停止」）。
-    killed=0
+    # 2026-10-30 实机：这条命令报过「没有在跑的守护进程」，可 ps 里明明有一个
+    # `python -u autotune.py --guard`。原因可能是匹配过窄，也可能 kill 失败被
+    # 吞掉了 —— 两种情况都只回一句「没有」，用户完全没法判断。
+    # 现在：匹配放宽到「含 autotune.py 且含 --guard」，先打印找到的 pid，
+    # kill 之后再查一遍，还在就 -9，最后如实说结果。
+    _pids=""
     for _p in /proc/[0-9]*; do
       [ -r "$_p/cmdline" ] || continue
-      _cmd="$(tr '\0' ' ' <"$_p/cmdline" 2>/dev/null)"
-      case "$_cmd" in
-        *"autotune.py --guard"*)
+      case "$(tr '\0' ' ' <"$_p/cmdline" 2>/dev/null)" in
+        *autotune.py*--guard*)
           _pid="${_p#/proc/}"
           [ "$_pid" = "$$" ] && continue
-          kill "$_pid" 2>/dev/null && killed=$((killed + 1))
+          _pids="$_pids $_pid"
           ;;
       esac
     done
-    unset _p _cmd _pid
-    if [ "$killed" -gt 0 ]; then
-      echo "[√] 已停止守护（设备保持当前配置，锁着的频段不会自动解开）"
-    else
+    _pids="$(echo $_pids)"
+    if [ -z "$_pids" ]; then
       echo "没有在跑的守护进程"
+    else
+      echo "找到守护进程：$_pids，正在停止…"
+      for _pid in $_pids; do kill "$_pid" 2>/dev/null; done
+      sleep 2
+      _left=""
+      for _pid in $_pids; do
+        [ -d "/proc/$_pid" ] && _left="$_left $_pid"
+      done
+      if [ -n "$_left" ]; then
+        echo "还没退出（$_left），强制结束"
+        for _pid in $_left; do kill -9 "$_pid" 2>/dev/null; done
+        sleep 1
+      fi
+      echo "[√] 已停止守护（设备保持当前配置，锁着的频段不会自动解开）"
     fi
+    unset _p _pids _pid _left
     # 守护被外部杀掉时它自己来不及放 wake lock，这里补一下，别继续吃电。
     command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null
     exit 0

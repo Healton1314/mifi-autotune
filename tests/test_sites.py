@@ -661,5 +661,45 @@ class NoteCellChange(unittest.TestCase):
         self.assertEqual(json.loads(self.tmp.read_text(encoding="utf-8")), {})
 
 
+class NoteBandRsrp(unittest.TestCase):
+    """锁定那一刻把「这条频段此刻的信号」写回记忆。
+
+    老记忆（2026-10-30 之前）只有速度没有 RSRP，守护因此只能跑完整体检 ——
+    实机 21:56 为此白等 6 分钟、断了 7 次网，最后还是靠一次不可信的体检
+    把设备切到了 -95dBm。锁定时的 RSRP 本来就在手上，顺手存了就没这回事。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self.tmp.write_text(json.dumps({"350-CMCC": {
+            "seen": 3, "last": ago(hours=5), "best": 3,
+            "bands": {"3": {"dead": 0, "ok": 3, "best": 44.6},
+                      "40": {"dead": 0, "ok": 2, "best": 40.7}}}},
+            ensure_ascii=False), encoding="utf-8")
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_writes_rsrp_for_that_band_only(self):
+        A.note_band_rsrp("350-CMCC", 40, -77.4)
+        bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
+        self.assertEqual(bands["40"]["rsrp"], -77)
+        self.assertEqual(bands["40"]["rsrp_med"], -77)
+        self.assertNotIn("rsrp", bands["3"])      # 没测过的频段不能瞎写
+
+    def test_unknown_band_or_empty_value_is_ignored(self):
+        A.note_band_rsrp("350-CMCC", 8, -90)      # 这条记忆里没有 BAND 8
+        A.note_band_rsrp("350-CMCC", 40, None)    # 读不到信号
+        bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
+        self.assertNotIn("8", bands)
+        self.assertNotIn("rsrp", bands["40"])
+
+    def test_gate_can_use_it_next_time(self):
+        A.note_band_rsrp("350-CMCC", 40, -77)
+        self.assertEqual(A.guard_memo_rsrp("350-CMCC", 40), -77.0)
+
+
 if __name__ == "__main__":
     unittest.main()
