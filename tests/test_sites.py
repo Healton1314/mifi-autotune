@@ -370,11 +370,27 @@ class RollingSamples(unittest.TestCase):
 
     def test_sample_has_hour_speed_loss_ping(self):
         A.record_site("k", [{"band": 40, "ok": True, "mbps": 31.5,
-                             "loss": 40, "avg": 88}])
-        hour, mbps, loss, ping = self._samples()[0]
+                             "loss": 40, "avg": 88, "rsrp": -77}])
+        hour, mbps, loss, ping, rsrp = self._samples()[0]
         self.assertEqual(mbps, 31.5)
         self.assertEqual((loss, ping), (40, 88))
         self.assertEqual(hour, datetime.now().hour)   # 跨时段比较要用
+        self.assertEqual(rsrp, -77)                   # 锁频段前要比信号
+
+    def test_rsrp_median_survives_old_samples(self):
+        # 老样本只有 4 位（没有 RSRP）。它们不能参与 RSRP 中位数 ——
+        # 拿「没记录」当 0dBm 会把信号算成神仙级别。
+        A.record_site("k", [{"band": 40, "ok": True, "mbps": 10, "loss": 0,
+                             "avg": 50, "rsrp": -100}])
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        data["k"]["bands"]["40"]["samples"].insert(0, [9, 12.0, 0, 40])   # 老格式
+        self.tmp.write_text(json.dumps(data), encoding="utf-8")
+        A.record_site("k", [{"band": 40, "ok": True, "mbps": 20, "loss": 0,
+                             "avg": 50, "rsrp": -80}])
+        v = json.loads(self.tmp.read_text(encoding="utf-8"))["k"]["bands"]["40"]
+        self.assertEqual(v["rsrp"], -80)
+        self.assertEqual(v["rsrp_med"], -90)          # median(-100, -80)
+        self.assertEqual(len(v["samples"][0]), 4)     # 老数据没被改写
 
     def test_samples_are_capped(self):
         # 只留最近几次：文件不能随运行次数一直长
@@ -484,6 +500,114 @@ class SiteMerge(unittest.TestCase):
         self.assertEqual(list(data), ["236-CMCC"])   # 没多出一条「新地方」
         self.assertEqual(data["236-CMCC"]["seen"], 4)
         self.assertIn("350-CMCC", data["236-CMCC"]["aliases"])
+
+
+class SiteCells(unittest.TestCase):
+    """位置 = 一组「见过的小区」，不是一个 PCI。
+
+    实机 2026-10-30：宿舍锁 BAND 3 时是 PCI 350（记着 BAND 3 有 46.8 Mbps），
+    解锁后设备自己驻留 BAND 40 变成 PCI 236，于是新建了一条空记录 ——
+    20 分钟的并档窗口早就过了，46.8 那条历史再也没被看到。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _rich(self, last_hours_ago=30):
+        return {"350-CMCC": {
+            "seen": 9, "last": ago(hours=last_hours_ago), "best": 3,
+            "bands": {"3": {"dead": 0, "ok": 9, "best": 46.8}},
+            "cells": [{"pci": "350", "band": 3, "n": 9},
+                      {"pci": "236", "band": 40, "n": 2}],
+        }}
+
+    def test_cell_list_overrides_merge_window(self):
+        # 隔一天了（早就超出 20 分钟窗口），但 236 在这处的 cells 里 → 还是同一处
+        data = self._rich(30)
+        self.assertEqual(A.find_site(data, "236-CMCC"), "350-CMCC")
+
+    def test_cell_from_another_operator_is_ignored(self):
+        data = self._rich(30)
+        self.assertEqual(A.find_site(data, "236-CTCC"), "236-CTCC")
+
+    def test_richer_record_wins_over_empty_provisional(self):
+        # 236 那条是临时记录（seen=0、bands 空），350 那条有真数据 → 并到 350
+        data = self._rich(30)
+        data["236-CMCC"] = {"seen": 0, "provisional": True, "bands": {},
+                            "best": 40, "last": ago(hours=0.2)}
+        self.assertEqual(A.find_site(data, "236-CMCC"), "350-CMCC")
+
+    def test_used_more_wins(self):
+        # 两条都有数据：用得多的那条是这个位置的本体
+        data = self._rich(30)
+        data["236-CMCC"] = {"seen": 20, "last": ago(hours=0.2),
+                            "bands": {"40": {"dead": 0, "ok": 20, "best": 31.0}}}
+        self.assertEqual(A.find_site(data, "236-CMCC"), "236-CMCC")
+
+    def test_absorb_keeps_cells_and_count_but_not_speeds(self):
+        self.tmp.write_text(json.dumps(self._rich(30)), encoding="utf-8")
+        A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 12.0}])
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["350-CMCC"])      # 只剩一条
+        rec = data["350-CMCC"]
+        self.assertEqual(rec["seen"], 10)               # 9 + 1
+        self.assertEqual(rec["bands"]["3"]["best"], 46.8)   # 旧速度没被污染
+        self.assertEqual(rec["bands"]["40"]["best"], 12.0)
+        self.assertIn("236", [c["pci"] for c in rec["cells"]])
+
+    def test_provisional_does_not_overwrite_measured_best(self):
+        # 「先锁一下」不能把上次体检的结论改掉（实机：会让 BAND 3 最优变成 BAND 40）
+        self.tmp.write_text(json.dumps(self._rich(0.2)), encoding="utf-8")
+        A.mark_site_provisional("236-CMCC", 40)
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]
+        self.assertEqual(rec["best"], 3)
+        self.assertNotIn("provisional", rec)
+        self.assertIn("236", [c["pci"] for c in rec["cells"]])
+
+
+class NoteCellChange(unittest.TestCase):
+    """守护每 30 秒看一次 PCI：设备自己换小区（解锁后换频段）时要把它记下来，
+    否则「窗口一过就分家」。实机 17:52：BAND 41 / 477 → BAND 40 / 236。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self.tmp.write_text("{}", encoding="utf-8")
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _write(self, last_hours_ago=9):
+        self.tmp.write_text(json.dumps({"477-CMCC": {
+            "seen": 4, "last": ago(hours=last_hours_ago), "best": 41,
+            "bands": {"41": {"dead": 0, "ok": 4, "best": 26.0}}}}),
+            encoding="utf-8")
+
+    def test_new_cell_is_remembered(self):
+        self._write()
+        A.note_cell_change("477-CMCC", "236-CMCC")
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["477-CMCC"]
+        self.assertEqual(sorted(c["pci"] for c in rec["cells"]), ["236", "477"])
+        # 以后再看到 236，就认得是这处，哪怕隔了一天
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(A.find_site(data, "236-CMCC"), "477-CMCC")
+
+    def test_other_operator_is_ignored(self):
+        self._write()
+        A.note_cell_change("477-CMCC", "236-CTCC")
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["477-CMCC"]
+        self.assertNotIn("cells", rec)          # 换了运营商是另一张卡的事
+
+    def test_unrecorded_place_is_left_alone(self):
+        # 这处还没建过记录（新地方，第一次来）→ 什么也不做，不留半个壳
+        A.note_cell_change("999-CMCC", "236-CMCC")
+        self.assertEqual(json.loads(self.tmp.read_text(encoding="utf-8")), {})
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.6"
+__version__ = "0.6.7"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -101,16 +101,35 @@ SITE_LOSS_BAD = 20                  # 单次丢包 ≥ 这个值算「这次掉�
 SITE_FLAP_RATIO = 0.3               # 历史样本里掉包占比 ≥ 30% → 判为「会周期性掉包」
 FLAP_SWAP_RATIO = 0.85              # 稳的那个只要不慢过 15%，就优先它
 SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分钟内 → 算同一个地方
+# 一个位置「见过哪些小区」。为什么不能只靠上面那条时间窗：20 分钟一过，
+# 同一张桌子的两条记录就互不相认了。用户实机（2026-10-30 宿舍）就是这么分家的 ——
+# 锁 BAND 3 时是 PCI 350（记着 BAND 3 有 46.8 Mbps），解锁后设备自己驻留 BAND 40
+# 变成 PCI 236，于是新建了一条空记录；下次再测，46.8 那条历史完全没被看到。
+# 所以位置改成「一组见过的小区」：只要当前 PCI 在这组里，就是同一处，跨天也认得出。
+SITE_CELL_KEEP = 8                  # 每个位置最多记几个见过的小区
 
 # 全自动守护（--guard）：按「人在不在动」决定锁不锁频段。
 #
-# 为什么用 PCI 判断移动：PCI 是服务小区的物理标识，换基站/换扇区它必变。
-# 比「信号强弱」可靠得多 —— 信号会因天气、遮挡、人多而波动，但人没动的时候
-# PCI 不会跳。用户实机（2026-10-30）就是靠这个区分「在上班路上」和「坐在工位」。
+# PCI 用来判断移动，但它只是**必要条件，不是充分条件**。原来以为「人没动 PCI
+# 就不会跳」，2026-10-30 的实机日志把这个假设推翻了：坐在宿舍里，锁着 BAND 41
+# 的那三分钟，PCI 自己从 477 跳到 252（-89dBm → -105dBm）—— 信号变弱时设备
+# 会自己重选小区（同频段换扇区），人在原地，PCI 照样跳。
+# 所以判移动要两件事一起看：**PCI 变过几次** + **信号/链路是不是也跟着垮了**。
 GUARD_INTERVAL = 30                 # 采样间隔（秒）：10 个 ping，几百字节
 GUARD_SETTLE_SEC = 600              # 连续这么久 PCI 没变 = 原地不动（10 分钟）
-GUARD_MOVE_WINDOW = 180             # 判定「在移动」的时间窗
-GUARD_MOVE_HITS = 2                 # 窗口内 PCI 变这么多次 = 在移动
+GUARD_MOVE_WINDOW = 300             # 判定「在移动」的时间窗
+# 窗口内 PCI 变这么多次 = 在移动。
+# 这两个数是配着定的，试过两轮：
+#   · 180s / 2 次：静止时一次弱信号重选就够数（477→252），人被判定「在移动」。
+#   · 180s / 3 次：反过来了 —— 走路两分钟才换一个小区，180 秒窗口里凑不满 3 次，
+#     明明在走却判「静止」，10 分钟后把频段锁死在路上（这是最危险的误判）。
+#   · 300s / 2 次：走路 5 分钟内必换两次；静止时偶尔跳一次也够不到两次。
+GUARD_MOVE_HITS = 2
+# PCI 变了、但信号没掉这么多 dB → 是设备自己重选，不算人动，静止计时不清零。
+GUARD_RESELECT_DB = 8
+# 单次采样延迟超过这么多毫秒，也算这条链路不行（原来只看「不通」和「丢包过半」，
+# 实机 17:24 延迟 4402ms、只丢 10%，会被当成「正常」）。
+GUARD_LAG_MS = 2000
 GUARD_BAD_HITS = 3                  # 连续这么多次采样不通 = 锁定的频段撑不住
 GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（只管主动动作）
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
@@ -127,16 +146,32 @@ GUARD_NEW_SITE = "这个位置没测过"
 # 走到新地方，路上本来就是解锁状态（按信号保底有网）；停下来的地方很可能只是
 # 路过，这时候把频段锁死，后面走到没覆盖的地方就是断网。所以先只「看看这条够不够用」。
 GUARD_QUICK_SEC = 180               # 停 3 分钟就先快测一次
-GUARD_QUICK_MIN_MBPS = 15           # 「够用」的速度下限
+# 「够用」的下限。原来是 15 Mbps，实机证明这个数卡在噪声区里：同一张桌子、
+# 前后 22 分钟，快测 32 Mbps 而体检只有 17.8 / 10.8。15 落在波动区间中间，
+# 同样的网络掷到 32 判「够用」（不锁，什么也不发生），掷到 12 判「不够用」
+# （触发 5 分钟体检 + 断网 4 次）—— 判错的代价完全不对等。
+# 所以下限压到 8：只有真的差才承认「不够用」，宁可放过，不要误动设备。
+GUARD_QUICK_MIN_MBPS = 8            # 低于这个才算「不够用」
+GUARD_QUICK_GOOD_MBPS = 20          # 达到这个算「明确够用」
 GUARD_QUICK_MAX_LOSS = 5            # 「够用」的丢包上限
 GUARD_QUICK_MAX_MS = 150            # 「够用」的延迟上限
-GUARD_QUICK_PROBE_SEC = 5           # 快测只下 5 秒，判断量级足够
+GUARD_QUICK_PROBE_SEC = 4           # 每次快测下 4 秒（测两遍，总时长和原来相当）
+GUARD_QUICK_SAMPLES = 2             # 采样几次。单次 5 秒下载的重复性太差
+GUARD_QUICK_NOISY_RATIO = 3.0       # 两次差这么多倍 → 测不准，别拿它下结论
 # 久坐锁定前，把「刚才快测到的当前速度」和「记忆里的历史最优」比一下。
 # 用户实机（2026-10-30 18:00）：记忆说 BAND 3 有 44.6 Mbps，但那是上午、还是在
 # 另一个 PCI（350）下测的；当时实测当前 BAND 40 有 32 Mbps，延迟 65ms 正常。
 # 差 30% 以内就别折腾 —— 切一次频段要断几秒、要重新注册，而"记忆里的最优"
 # 本身可能是别的扇区、别的时段测出来的，未必代表现在。只有明显快得多才值得切。
 GUARD_QUICK_KEEP_RATIO = 0.7        # 当前 ≥ 历史最优 × 这个比例 → 就留在当前
+
+# 锁之前先看信号，这是「记忆说它快」和「它现在能不能用」的区别。
+# 用户实机（2026-10-30 宿舍）：记忆里 BAND 3 有 46.8 Mbps，可那天在这个位置
+# BAND 3 只有 -105dBm、而设备实际驻留的 BAND 40 是 -77dBm。照记忆锁 BAND 3，
+# 结果 8 分钟里 -95 → -110、延迟飙到 4.4 秒、最后丢包，被当成「检测到移动」解锁。
+# 原因是 record_site 只记了速度，没记当时的 RSRP —— 分不清「上次条件好」和
+# 「这次条件差」。所以样本里开始存 RSRP；差这么多 dB 就否决这条记忆。
+GUARD_LOCK_RSRP_DROP = 10           # 记忆最优比当前驻留差这么多 dB → 不锁它
 
 # 锁定之后判「这条不行」的线。原来是丢包 ≥20%，太敏感：宿舍 BAND 40 每 3~5 分钟
 # 掉 30~50%，会导致守护反复解锁 —— 越解越像「厂商的自动」，而这正是要治的病。
@@ -414,7 +449,7 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """
     empty = {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
              "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-             "jitter": None, "loss": 100, "rounds": 0}
+             "jitter": None, "loss": 100, "rounds": 0, "rsrp": None}
 
     try:
         dev.set_band(band)
@@ -450,6 +485,14 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
         return dict(empty, reason="no_data", waited=waited)
 
     samples = []
+    # 记下这条频段此刻的信号强度。锁频段前要拿它跟当前驻留的比 ——
+    # 「历史上很快」和「现在能不能用」是两件事（2026-10-30 实机教训）。
+    rsrp = None
+    try:
+        sig = (dev.get_state() or {}).get("signal") or {}
+        rsrp = _num(sig.get("rsrp"))
+    except Exception:  # noqa: BLE001
+        rsrp = None
     # 注册完成不等于数据通道就绪：实测 ping 已经通了、下载还拿不到字节，
     # 这时候测出来就是 0 Mbps，会被误判成「该频段没有数据能力」。
     # 给 3 秒缓冲，再开始正式测量。
@@ -485,6 +528,7 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
         "jitter": statistics.median(jit_list) if jit_list else None,
         "loss": max(loss_list) if loss_list else 0,
         "rounds": len(samples),
+        "rsrp": rsrp,
     }
 
 
@@ -775,8 +819,10 @@ def assess_reliability(lte, cur_res, best_res):
 def _site_key(st):
     """这个位置怎么标识：PCI + 运营商。
 
-    PCI 是服务小区的物理标识，换个地方必变；加运营商是为了压 PCI 复用
-    （PCI 只有 0~503，不同城市完全可能撞）。室内 GPS 基本没用，所以不用它。
+    PCI 是**当前驻留的那个小区**，不是地点。同一个地方能同时看到好几个 PCI
+    （每个频段一套编号，各 0~503），读到哪个取决于设备当下驻留哪条频段：
+    实机（2026-10-30 宿舍）锁 BAND 3 读到 350、驻留 BAND 40 读到 236，同一张桌子。
+    加运营商是为了压 PCI 复用（不同城市完全可能撞）。
     读不到就返回空串 —— 宁可这次不记忆，也不能把两地混成一个。
     """
     sig = (st or {}).get("signal") or {}
@@ -784,6 +830,35 @@ def _site_key(st):
     if pci is None:
         return ""
     return f"{pci}-{(sig.get('operator') or '?').strip()}"
+
+
+def _split_key(key):
+    """把 `236-CMCC` 拆成 ("236", "CMCC")。拆不出来就返回 ("", "")。"""
+    pci, _, op = str(key or "").partition("-")
+    return pci.strip(), op.strip()
+
+
+def _remember_cell(rec, key, band=None):
+    """把「这处还见过哪个小区」记下来，供下次换个频段时认出是同一地点。
+
+    为什么需要：切频段就会换服务小区，而工具偏偏一直在切。只按 PCI 记账的话，
+    每切一次就把自己「搬了次家」，历史全废（用户实机 2026-10-30 宿舍的 350 / 236）。
+    """
+    pci, _ = _split_key(key)
+    if not pci or not rec:
+        return
+    cells = rec.setdefault("cells", [])
+    stamp = datetime.now().isoformat(timespec="seconds")
+    for c in cells:
+        if str(c.get("pci")) == pci:
+            c["n"] = int(c.get("n") or 0) + 1
+            c["last"] = stamp
+            if band:
+                c["band"] = int(band)
+            return
+    cells.append({"pci": pci, "band": int(band) if band else None, "n": 1,
+                  "last": stamp})
+    del cells[:-SITE_CELL_KEEP]
 
 
 def load_sites():
@@ -957,23 +1032,94 @@ def find_site(data, key, now=None):
     设备锁到哪个频段，服务小区就跟着换 —— 实测同一张桌子（2026-10-30）：
     锁 BAND 40 是 PCI 236，切到 BAND 3 变成 350。按 PCI 一条一条记的话，
     工具每切一次频段就把自己「搬了家」，记忆永远攒不起来，而它偏偏一直在切。
-    判据只有一条：同一运营商，且上一条记录是 SITE_MERGE_MIN 分钟内留下的。
-    人真走到另一个小区，通常不会二十分钟内又测一遍；切频段就几十秒。
+
+    三层判据，从硬到软：
+      1. 当前 PCI 出现在某条记录见过的小区里（cells）—— 这处换过这个小区，
+         就是同一地点。跨天也认，这是唯一能把 350 和 236 绑在一起的东西。
+      2. 记录本身就叫这个 key —— 老朋友。
+      3. 同运营商、且上一条记录是 SITE_MERGE_MIN 分钟内留下的 —— 刚切完频段
+         就接着测。人真走到别处，通常不会二十分钟内又测一遍。
+    收尾一条：自己只是个 provisional（从没实测过）时，如果同运营商有一条 24
+    小时内真测过的记录，就并到那条上 —— provisional 里没有可损失的信息，并过去
+    只会让这个位置更完整（实机 2026-10-30：236 那条空记录把 350 的 46.8 挡在外面）。
     """
-    if not key or key in data:
+    if not key:
         return key
-    op = key.split("-", 1)[1] if "-" in key else key
-    best_key, best_age = None, None
+    pci, op = _split_key(key)
+    if not pci or not op:
+        return key
+    prov = bool((data.get(key) or {}).get("provisional"))
+    best = None
     for k, v in (data or {}).items():
-        k_op = k.split("-", 1)[1] if "-" in k else k
-        if k_op != op:
+        if _split_key(k)[1] != op:
             continue
         age = site_age_hours(v, now)
-        if age is None or age > SITE_MERGE_MIN / 60.0:
+        if age is None or age > SITE_TTL_DAYS * 24:
             continue
-        if best_age is None or age < best_age:
-            best_key, best_age = k, age
-    return best_key or key
+        seen = int(v.get("seen") or 0)
+        cells = {str(c.get("pci")) for c in (v.get("cells") or [])}
+        if k == key:
+            bonus = 1
+        elif pci in cells:
+            bonus = 2
+        elif age <= SITE_MERGE_MIN / 60.0:
+            bonus = 0
+        elif prov and not v.get("provisional") and age <= SITE_FRESH_HOURS:
+            bonus = 0
+        else:
+            continue
+        # 先比「来过几次」：用得多的那条更可能是这个位置的本体；
+        # 再比判据强度，最后比新鲜度。
+        score = (seen, bonus, -(age or 0))
+        if best is None or score > best[0]:
+            best = (score, k)
+    return best[1] if best else key
+
+
+def _absorb_site(data, real, key):
+    """把 key 那条记录并进 real，然后删掉它 —— 一个地方只留一条。
+
+    只搬「见过哪些小区」和来过次数，不搬速度历史：两条记录的测量条件
+    （不同频段、不同时段）不一样，混在一起会造出假的「历史最优」。
+    """
+    if not real or real == key:
+        return
+    old = data.pop(key, None)
+    if old is None:
+        return
+    op = _split_key(real)[1]
+    rec = data.get(real)
+    if rec is None:
+        old.setdefault("cells", [])
+        _remember_cell(old, key, old.get("best"))
+        data[real] = old
+        return
+    _remember_cell(rec, key, old.get("best"))
+    for c in old.get("cells") or []:
+        if c.get("pci"):
+            _remember_cell(rec, f"{c['pci']}-{op}", c.get("band"))
+    rec["seen"] = int(rec.get("seen") or 0) + int(old.get("seen") or 0)
+
+
+def note_cell_change(old_key, new_key):
+    """设备换了个小区、但人没动 —— 把两个 PCI 记到同一处，别让它变成「新地方」。
+
+    这是位置记忆的桥。守护每 30 秒读一次 PCI，能看到「解锁后设备自己换到
+    另一个频段」这种切换（实机 17:52：BAND 41 / PCI 477 → BAND 40 / PCI 236）。
+    靠它建立联系，比靠 20 分钟并档窗口可靠得多 —— 窗口一过，同一张桌子就分家了。
+    """
+    if not old_key or not new_key or old_key == new_key:
+        return
+    if _split_key(old_key)[1] != _split_key(new_key)[1]:
+        return                                  # 换了运营商，是另一张卡的事
+    data = load_sites()
+    real = find_site(data, old_key)
+    rec = data.get(real)
+    if not rec:
+        return                                  # 这处还没建过记录，等体检/快测去建
+    _remember_cell(rec, old_key, None)
+    _remember_cell(rec, new_key, None)
+    save_sites(data)
 
 
 def record_site(key, results, best_band=None, reset_best=False):
@@ -986,9 +1132,13 @@ def record_site(key, results, best_band=None, reset_best=False):
         return
     data = load_sites()
     real = find_site(data, key)
+    # 认出是同一处、但历史存在另一个 PCI 名下 → 先并成一条，再往下写。
+    _absorb_site(data, real, key)
     rec = data.setdefault(real, {"seen": 0, "bands": {}})
+    # 记下这处还见过哪些小区：下次换个频段（PCI 跟着变）才认得出是同一张桌子。
+    _remember_cell(rec, key, best_band)
     if real != key:
-        # 记下这个位置还出现过哪些 PCI，顺便让人能看懂「为什么只有一条记录」
+        # 老字段留着，人看 sites.json 时能明白「为什么只有一条记录」
         al = rec.setdefault("aliases", [])
         if key not in al:
             al.append(key)
@@ -1006,12 +1156,24 @@ def record_site(key, results, best_band=None, reset_best=False):
             v["best"] = now_mbps if reset_best else max(
                 float(v.get("best") or 0), now_mbps)
             v["last_ok"] = now.isoformat(timespec="seconds")
-            # 滚动样本：[小时, 速度, 丢包%, 延迟ms]。只留最近几次，文件不会长大。
+            # 记下这条频段当时的信号强度。没有它，历史就只剩「上次多快」，
+            # 分不清是「上次条件好」还是「这次条件差」—— 实机 2026-10-30 就是
+            # 这么锁到 -105dBm 的 BAND 3 上，撑了 8 分钟然后掉线。
+            rsrp = _num(r.get("rsrp"))
+            # 滚动样本：[小时, 速度, 丢包%, 延迟ms, RSRP]。
+            # 只留最近几次，文件不会长大；老数据是 4 位，读的时候兼容。
             samples = v.setdefault("samples", [])
             samples.append([now.hour, round(now_mbps, 1),
                             int(_num(r.get("loss")) or 0),
-                            int(_num(r.get("avg")) or 0)])
+                            int(_num(r.get("avg")) or 0),
+                            int(rsrp) if rsrp is not None else None])
             del samples[:-SITE_SAMPLES]
+            if rsrp is not None:
+                v["rsrp"] = int(rsrp)
+                seen_rsrp = [s[4] for s in samples
+                             if len(s) > 4 and s[4] is not None]
+                if seen_rsrp:
+                    v["rsrp_med"] = int(statistics.median(seen_rsrp))
         elif r.get("reason") == "no_signal":
             v["dead"] = int(v.get("dead") or 0) + 1
     if best_band:
@@ -1280,11 +1442,21 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 def _hist_v(b):
                     return (hist.get(str(b)) or {}).get("best") or 0
 
-                print(f"\n[2/2] 这个位置（PCI {cur_site.split('-')[0]}）之前测过 {seen} 次，"
-                      f"上次来是 {_fmt_age(site_age_hours(rec))}")
-                alias = [a for a in (rec.get("aliases") or []) if a != cur_site]
-                if alias:
-                    print(f"      同一处还见过 {'、'.join('PCI ' + a.split('-')[0] for a in alias)}"
+                pci_now = cur_site.split("-")[0]
+                if rec.get("provisional") and not seen:
+                    # 只有 mark_site_provisional 动过、没真测过：说「测过 0 次，
+                    # 上次来不到 1 小时前」自相矛盾（实机 2026-10-30 就是这么印的）。
+                    print(f"\n[2/2] 这个位置（PCI {pci_now}）还没正式测过，"
+                          f"上次只是先锁住、没量速度")
+                else:
+                    print(f"\n[2/2] 这个位置（PCI {pci_now}）之前测过 {seen} 次，"
+                          f"上次来是 {_fmt_age(site_age_hours(rec))}")
+                others = [str(c.get("pci")) for c in (rec.get("cells") or [])
+                          if str(c.get("pci")) != pci_now]
+                others += [a.split("-")[0] for a in (rec.get("aliases") or [])
+                           if a != cur_site and a.split("-")[0] not in others]
+                if others:
+                    print(f"      同一处还见过 {'、'.join('PCI ' + p for p in others[:6])}"
                           f"（切频段会换小区，算同一个地方）")
                 if state == "stale":
                     print(f"      隔了 {SITE_STALE_DAYS} 天以上没来，历史作废："
@@ -2011,6 +2183,21 @@ def _pci_num(v):
         return None
 
 
+def guard_is_moving(*, churn, pci_changed, bad_now):
+    """人到底动没动。抽成纯函数，因为这条判断直接决定「要不要解锁」。
+
+    PCI 变只是**必要条件**。2026-10-30 的实测推翻了这个假设：坐在宿舍里、
+    锁着 BAND 41 的那三分钟，PCI 自己从 477 跳到 252（-89 → -105dBm）——
+    信号变弱时设备会自己重选小区（同频段换扇区），人在原地，PCI 照样跳。
+
+    所以两条判据取或：
+      · 窗口内变够多次（GUARD_MOVE_HITS）—— 真走路 25 分钟换 8 个小区；
+      · 或者变了、并且链路确实垮了（掉线 / 丢包过半 / 延迟离谱）——
+        真走出覆盖时，这两件事一定同时发生。
+    """
+    return bool(churn or (pci_changed and bad_now))
+
+
 def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
                  cooldown_left, outage_after_unlock):
     """守护状态机：只回答「现在该做什么」，完全不碰设备（为了能单测）。
@@ -2061,35 +2248,82 @@ def _guard_unlock(dev, cur_band):
     return ok
 
 
+def _quick_grade(q):
+    """快测结果分四档：good / fair / poor / unknown。
+
+    为什么要分档，而不是一个布尔：单次短下载的重复性很差。实机（2026-10-30
+    宿舍）同一张桌子、前后 22 分钟，守护快测 32 Mbps、体检时只有 17.8 和 10.8。
+    原来 15 Mbps 的硬阈值正好卡在这个波动区中间 —— 同样的网络，掷到 32 判
+    「够用」（不锁，什么也不发生），掷到 12 判「不够用」（触发 5 分钟体检 +
+    断网 4 次）。判错的代价完全不对等，所以：
+      · 下限压到 8 Mbps —— 只有真的差才承认不够用；
+      · 两次采样差 3 倍以上 → unknown（测不准），按「别动它」处理。
+    """
+    if not q:
+        return "unknown"
+    loss = q.get("loss")
+    loss = 100 if loss is None else int(loss)
+    avg = q.get("avg")
+    if avg is None or loss >= GUARD_QUICK_MAX_LOSS or avg > GUARD_QUICK_MAX_MS:
+        return "poor"
+    if q.get("noisy"):
+        return "unknown"
+    mbps = float(q.get("mbps") or 0)
+    if mbps >= GUARD_QUICK_GOOD_MBPS:
+        return "good"
+    if mbps >= GUARD_QUICK_MIN_MBPS:
+        return "fair"
+    return "poor"
+
+
 def _quick_ok(q):
-    """快测结果算不算「够用」。"""
+    """快测结果算不算「够用」。
+
+    unknown（两次差太多、测不准）也当够用：证据不足时不动设备，
+    比凭一个不可信的数字去断网体检要好。但**压根没测出结果**（q 为空）不算够用。
+    """
     if not q:
         return False
-    loss = q.get("loss")
-    loss = 100 if loss is None else loss
-    return ((q.get("mbps") or 0) >= GUARD_QUICK_MIN_MBPS
-            and loss < GUARD_QUICK_MAX_LOSS
-            and (q.get("avg") or 9999) <= GUARD_QUICK_MAX_MS)
+    return _quick_grade(q) in ("good", "fair", "unknown")
 
 
-def guard_quick_probe(speed_url, ping_host, secs=GUARD_QUICK_PROBE_SEC):
-    """在当前连接上快测一次：短下载 + ping，**完全不碰设备**。
+def guard_quick_probe(speed_url, ping_host, secs=GUARD_QUICK_PROBE_SEC,
+                      times=GUARD_QUICK_SAMPLES):
+    """在当前连接上快测一遍：短下载 + ping，**完全不碰设备**。
 
     为什么不复用 measure_band：那个第一件事就是 dev.set_band()，哪怕锁的正是
     同一条频段也可能让射频重启一下。而这一步恰恰发生在「可能只是路过」的时候，
     不该有任何断网风险。
+
+    为什么测两次：一次 4~5 秒的下载，在晚高峰的宿舍里能从 32 Mbps 掉到 10。
+    取两次里较好的那次（它更接近这条链路的能力上限），同时把「两次差多少」
+    一起交出去 —— 差得离谱时调用方会判「测不准」，不拿它下结论。
     """
-    try:
-        p = probe.ping_stats(10, ping_host)
-    except Exception:  # noqa: BLE001
-        p = {"avg": None, "jitter": None, "loss": 100}
-    mbps = 0.0
-    if p.get("avg") is not None and (p.get("loss") or 0) < GUARD_BAD_LOSS:
+    runs = []
+    for i in range(max(1, int(times))):
         try:
-            mbps = float(probe.throughput(secs=secs, url=speed_url) or 0)
+            p = probe.ping_stats(10, ping_host)
         except Exception:  # noqa: BLE001
-            mbps = 0.0
-    q = {"mbps": mbps, "avg": p.get("avg"), "loss": p.get("loss")}
+            p = {"avg": None, "jitter": None, "loss": 100}
+        mbps = 0.0
+        if p.get("avg") is not None and (p.get("loss") or 0) < GUARD_BAD_LOSS:
+            try:
+                mbps = float(probe.throughput(secs=secs, url=speed_url) or 0)
+            except Exception:  # noqa: BLE001
+                mbps = 0.0
+        runs.append({"mbps": mbps, "avg": p.get("avg"), "loss": p.get("loss")})
+        if i < times - 1:
+            time.sleep(1)
+
+    best = max(runs, key=lambda r: r["mbps"])
+    speeds = [r["mbps"] for r in runs]
+    noisy = (len(speeds) >= 2 and min(speeds) > 0
+             and max(speeds) / min(speeds) >= GUARD_QUICK_NOISY_RATIO)
+    q = {"mbps": best["mbps"], "avg": best["avg"],
+         # 丢包取最差的那次：一次通不代表链路稳
+         "loss": max(r["loss"] or 0 for r in runs),
+         "samples": [round(x, 1) for x in speeds], "noisy": noisy}
+    q["grade"] = _quick_grade(q)
     q["ok"] = _quick_ok(q)
     return q
 
@@ -2137,23 +2371,68 @@ def guard_memo_speed(key, band):
         return 0.0
 
 
-def guard_pick_lock(memo, memo_mbps, serving, quick):
-    """久坐时到底锁哪一条。返回 (频段 or None, 依据)；依据 ∈ {memo, keep, quick}。
+def guard_memo_rsrp(key, band):
+    """记忆里这个频段典型的 RSRP（dBm）；没记过返回 None。
+
+    老记录里没有 RSRP（2026-10-30 之前只记速度），这时返回 None，
+    调用方就跳过信号比较 —— 不能把「没记录」当成「信号很好」。
+    """
+    if not key or band is None:
+        return None
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key)) or {}
+        v = (rec.get("bands") or {}).get(str(int(band))) or {}
+        val = v.get("rsrp_med", v.get("rsrp"))
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def guard_pick_lock(memo, memo_mbps, serving, quick,
+                    memo_rsrp=None, cur_rsrp=None):
+    """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
+    依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind}。
 
       memo      记忆里的最优频段（None = 没有可信记忆）
       memo_mbps 记忆里那条的历史最好速度
       serving   设备当前驻留的频段
       quick     刚才的快测结果 dict（可能为 None，或测的是别的频段）
+      memo_rsrp 记忆里那条频段的典型 RSRP（没记过就是 None）
+      cur_rsrp  当前驻留频段此刻的 RSRP
 
     依据的含义：
-      keep   记忆有值，但当前这条刚量出来不比它差多少 → 留在当前，不切
-      memo   记忆里的最优明显更快 → 切过去（值得断那几秒）
-      quick  没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
-    返回 None 表示信息不够，该老老实实跑一次完整体检。
+      weak_keep 记忆那条现在信号差一截，但当前这条够用 → 留在当前
+      weak      记忆那条现在信号差一截、当前也不够用 → 老实跑体检
+      blind_keep 记忆没记信号，当前够用 → 不拿未知换已知，留在当前
+      blind     记忆没记信号、当前也不够用 → 跑体检（顺便把 RSRP 补上）
+      keep      记忆有值，但当前这条刚量出来不比它差多少 → 留在当前，不切
+      memo      记忆里的最优明显更快且信号不差 → 切过去（值得断那几秒）
+      quick     没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
+    返回 (None, None) 表示信息不够，该老老实实跑一次完整体检。
     """
     cur_ok = bool(quick and quick.get("ok") and serving
                   and quick.get("band") == serving)
     cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
+    # ① 先看信号，再看速度。记忆里的速度是过去某个时刻量的，而 RSRP 差
+    #    10dB 是结构性的（穿墙、距离），锁上去今天的下场就是一路掉到掉线。
+    #    用户实机 2026-10-30：记忆说 BAND 3 有 46.8 Mbps，那天在这屋 BAND 3
+    #    只有 -105dBm、当前驻留的 BAND 40 是 -77dBm，照着记忆锁 = 自残 8 分钟。
+    if (memo is not None and memo_rsrp is not None and cur_rsrp is not None
+            and str(serving) != str(memo)
+            and memo_rsrp <= cur_rsrp - GUARD_LOCK_RSRP_DROP):
+        if cur_ok:
+            return int(serving), "weak_keep"
+        return None, "weak"
+    # ② 老记忆没有 RSRP（2026-10-30 之前只记速度），就无从判断那条频段现在
+    #    能不能用。这种情况下的「切过去」是拿已知换未知 —— 实机已经吃过一次：
+    #    记忆说 BAND 3 有 46.8，实际那天只有 -105dBm。当前够用就别动；
+    #    不够用就跑一次体检，顺手把每条频段的 RSRP 补上。
+    if (memo is not None and memo_rsrp is None
+            and str(serving) != str(memo)):
+        if cur_ok:
+            return int(serving), "blind_keep"
+        return None, "blind"
     if (memo is not None and cur_ok and str(serving) != str(memo)
             and memo_mbps and cur_mbps >= memo_mbps * GUARD_QUICK_KEEP_RATIO):
         return int(serving), "keep"
@@ -2164,7 +2443,7 @@ def guard_pick_lock(memo, memo_mbps, serving, quick):
     return None, None
 
 
-def mark_site_provisional(key, band):
+def mark_site_provisional(key, band, force_best=False):
     """记一笔「这个位置只是先锁住，没实测过」：下次来要补一次完整体检。
 
     用户 2026-10-30 提的：这套记忆逻辑默认「你去过的地方」，可人也会去新地方。
@@ -2175,10 +2454,24 @@ def mark_site_provisional(key, band):
         return
     data = load_sites()
     real = find_site(data, key)
+    _absorb_site(data, real, key)
     rec = data.setdefault(real, {"seen": 0, "bands": {}})
-    rec["provisional"] = True
+    _remember_cell(rec, key, band)
     rec["last"] = datetime.now().isoformat(timespec="seconds")
-    if band:
+    # 这条频段已经真测过 → 不降级成 provisional，也不动它的 best。
+    # 否则「先锁一下」会把上次完整体检的结论盖掉：实机 2026-10-30 里，
+    # 236 那次 provisional 会把 350 记着的「BAND 3 最优」直接改成 BAND 40。
+    # 这处只要有任何一条频段真测过，就不是「没测过的新地方」——
+    # 不标 provisional，也不动它的 best。否则「先锁一下」会把上次完整体检的
+    # 结论盖掉（实机 2026-10-30：236 那次 provisional 会把 350 记着的
+    # 「BAND 3 最优」直接改成 BAND 40）。
+    has_data = any(int((v or {}).get("ok") or 0) > 0
+                   for v in (rec.get("bands") or {}).values())
+    if not has_data:
+        rec["provisional"] = True
+    # force_best：记忆里的最优被信号闸门否掉时（它现在比当前驻留差太多），
+    # 主动把最优改成当前这条，否则下次还会拿同一条来撞闸门。
+    if band and (not has_data or force_best):
         rec["best"] = int(band)
     save_sites(data)
 
@@ -2272,15 +2565,17 @@ def run_guard(args, cfg):
     print("=" * 62)
     print("全自动守护")
     print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包），平时不测速")
-    print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次 → 解锁，保证有网")
+    print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次、或变了且链路垮了 → 解锁，保证有网")
     print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
-    print(f"  坐满 {int(settle)}s：才锁 —— 有记忆就锁记忆里的最优，没记忆才跑体检")
-    print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通或丢包≥{GUARD_BAD_LOSS}% → 先换备选，没有才解锁")
+    print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
+    print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
+          f" → 先换备选，没有才解锁")
     print(f"  Ctrl+C 停止{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
     print("=" * 62, flush=True)
 
     dev = None
-    last_pci, stable_since, pci_log = None, time.time(), deque()
+    last_pci, last_rsrp, stable_since, pci_log = None, None, time.time(), deque()
+    last_key = ""
     bad_streak, next_allowed = 0, 0.0
     unlocked_at = None
     quick, quick_done = None, False      # 快测结果与「这次停留已经测过没」
@@ -2309,22 +2604,43 @@ def run_guard(args, cfg):
             ping = probe.ping_stats(10, host)
             sig = st.get("signal") or {}
             pci = _pci_num(sig.get("pci"))
+            rsrp = _num(sig.get("rsrp"))
             locked_band = st.get("band") or 0
             serving = locked_band or _serving_band(st)
             locked = locked_band != 0
 
+            # 「这条链路现在还撑得住吗」。除了不通和丢包过半，延迟离谱也算：
+            # 实机 17:24 延迟 4402ms、只丢 10%，原来会被当成完全正常。
+            avg_ms = ping["avg"]
+            bad_now = (avg_ms is None or (ping["loss"] or 0) >= GUARD_BAD_LOSS
+                       or avg_ms >= GUARD_LAG_MS)
+            bad_streak = bad_streak + 1 if bad_now else 0
+
+            pci_changed = (pci is not None and last_pci is not None
+                           and pci != last_pci)
+            dropped_rsrp = (rsrp is not None and last_rsrp is not None
+                            and rsrp <= last_rsrp - GUARD_RESELECT_DB)
+            if pci_changed:
+                pci_log.append(now)
             if pci is not None:
-                if last_pci is not None and pci != last_pci:
-                    pci_log.append(now)
-                    stable_since = now
                 last_pci = pci
+            if rsrp is not None:
+                last_rsrp = rsrp
             while pci_log and now - pci_log[0] > GUARD_MOVE_WINDOW:
                 pci_log.popleft()
 
-            moving = len(pci_log) >= GUARD_MOVE_HITS
+            churn = len(pci_log) >= GUARD_MOVE_HITS
+            moving = guard_is_moving(churn=churn, pci_changed=pci_changed,
+                                     bad_now=bad_now)
+            if pci_changed and not moving:
+                # 人没动、设备自己换的小区 → 记进同一处，这地方以后认得它
+                note_cell_change(last_key, _site_key(st))
+            last_key = _site_key(st)
+            # 静止计时只在「真的在动」时清零。原来每变一次 PCI 就归零，
+            # 弱信号下一个晚上重选两次，就永远坐不满 10 分钟、永远不锁。
+            if moving:
+                stable_since = now
             still = now - stable_since
-            bad_now = ping["avg"] is None or (ping["loss"] or 0) >= GUARD_BAD_LOSS
-            bad_streak = bad_streak + 1 if bad_now else 0
             outage_after_unlock = (unlocked_at is not None
                                    and now - unlocked_at < GUARD_RESCUE_WINDOW)
 
@@ -2332,12 +2648,21 @@ def run_guard(args, cfg):
                 quick, quick_done = None, False     # 一动，之前那次快测就作废了
             # 没锁着才需要看记忆：锁着的时候只关心「它还能不能撑住」
             memo, memo_why = (None, "") if locked else guard_memory_band(st)
+            # 记忆里的最优现在信号是不是已经不行了（比当前驻留差一截）。
+            # 这一刻就要算出来：既决定「要不要先快测当前」，也决定「准不准锁它」。
+            memo_rsrp = (guard_memo_rsrp(_site_key(st), memo)
+                         if memo is not None else None)
+            memo_weak = bool(
+                memo is not None and memo_rsrp is not None and rsrp is not None
+                and str(serving) != str(memo)
+                and memo_rsrp <= rsrp - GUARD_LOCK_RSRP_DROP)
 
             # ② 停下 quick_sec 秒：快测当前这条。只测、不锁、不动设备。
             # 目的有两个：万一只是路过，什么都没发生；真久坐的话，10 分钟那一步
             # 就能凭「够用 + 频段没变」直接锁，省掉一次 5 分钟体检。
+            # memo_weak 时也要测：记忆那条不可用了，得看当前这条顶不顶得住。
             if (not moving and not locked and not quick_done and not bad_now
-                    and still >= quick_sec and memo is None):
+                    and still >= quick_sec and (memo is None or memo_weak)):
                 if speed_url is None:
                     speed_url = probe.resolve_speed_url(cfg.get("speed_url"),
                                                         verbose=False)
@@ -2345,10 +2670,15 @@ def run_guard(args, cfg):
                 quick = guard_quick_probe(speed_url, host)
                 quick["band"] = serving
                 quick_done = True
-                print(f"      {quick['mbps']:.0f} Mbps ｜ 延迟 {quick['avg']}ms ｜ "
-                      f"丢包 {quick['loss']}% → "
-                      f"{'够用' if quick['ok'] else '不够用'}"
-                      f"（{'路过就路过，不锁' if quick['ok'] else '坐久了会重新选'}）",
+                grade_cn = {"good": "明确够用", "fair": "勉强够用",
+                            "unknown": "测不准（两次差太多）",
+                            "poor": "不够用"}
+                g = quick.get("grade") or ("good" if quick["ok"] else "poor")
+                sam = " / ".join(f"{x:.0f}" for x in (quick.get("samples") or []))
+                lat = f"{quick['avg']}ms" if quick["avg"] is not None else "不通"
+                print(f"      {quick['mbps']:.0f} Mbps（两次 {sam}）｜ 延迟 {lat} ｜ "
+                      f"丢包 {quick['loss']}% → {grade_cn.get(g, g)}"
+                      f"（{'先不动它' if quick['ok'] else '坐久了会重新选'}）",
                       flush=True)
 
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
@@ -2362,6 +2692,10 @@ def run_guard(args, cfg):
                 tag = f"静止 {int(still / 60)} 分钟（够久了{'，已锁定' if locked else ''}）"
             else:
                 tag = f"静止 {int(still / 60)}/{max(1, int(settle / 60))} 分钟"
+            if pci_changed and not moving:
+                # 让人看得懂「为什么 PCI 变了却还在计时」：是设备自己换的小区。
+                tag += ("（换小区·设备重选，信号掉了）" if dropped_rsrp
+                        else "（换小区·设备重选）")
             print(f"{_now_hm()}  {who:<18} PCI {pci if pci is not None else '—':<4} "
                   f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
                   flush=True)
@@ -2401,10 +2735,26 @@ def run_guard(args, cfg):
                     if getattr(args, "guard_fast", False):
                         _guard_lock_current(dev, serving)
                     else:
-                        memo_best = (guard_memo_speed(_site_key(st), memo)
-                                     if memo else 0.0)
-                        band, kind = guard_pick_lock(memo, memo_best, serving, quick)
-                        if kind == "keep":
+                        key_now = _site_key(st)
+                        memo_best = guard_memo_speed(key_now, memo) if memo else 0.0
+                        band, kind = guard_pick_lock(
+                            memo, memo_best, serving, quick,
+                            memo_rsrp=memo_rsrp, cur_rsrp=rsrp)
+                        if kind == "weak_keep":
+                            print(f"      → 记忆里 BAND {memo} 当时只有 {memo_rsrp:.0f}dBm，"
+                                  f"当前的 BAND {serving} 是 {rsrp:.0f}dBm"
+                                  f"（差 {abs(rsrp - memo_rsrp):.0f}dB，超过 "
+                                  f"{GUARD_LOCK_RSRP_DROP}dB 就不锁它了），锁当前这条",
+                                  flush=True)
+                            _guard_lock_band(dev, band)
+                            mark_site_provisional(key_now, band, force_best=True)
+                        elif kind == "blind_keep":
+                            print(f"      → 记忆里 BAND {memo} 是 {memo_best:.0f} Mbps，"
+                                  f"但当时没记信号，说不准它现在还能不能用；"
+                                  f"当前这条够用，先不赌，锁当前 BAND {serving}", flush=True)
+                            _guard_lock_band(dev, band)
+                            mark_site_provisional(key_now, band, force_best=True)
+                        elif kind == "keep":
                             # 记忆里的最优可能是几天前、甚至换了 PCI 测的；
                             # 当前这条是几分钟前刚量的。差得不多就别切。
                             gap = int(round((1 - GUARD_QUICK_KEEP_RATIO) * 100))
@@ -2422,10 +2772,14 @@ def run_guard(args, cfg):
                                   f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
                                   flush=True)
                             _guard_lock_band(dev, band)
-                            mark_site_provisional(_site_key(st), band)
+                            mark_site_provisional(key_now, band)
                         else:
-                            print(f"      → {memo_why or '没有可信依据'}，"
-                                  f"跑一次完整体检再锁", flush=True)
+                            why = ("记忆里的最优现在信号差太多、当前这条也不够用"
+                                   if kind == "weak" else
+                                   "记忆里没有信号记录、当前这条也不够用"
+                                   if kind == "blind" else
+                                   (memo_why or "没有可信依据"))
+                            print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None
                             _guard_measure(args)
                     stable_since = time.time()

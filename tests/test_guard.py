@@ -248,27 +248,33 @@ class PickLockBand(unittest.TestCase):
     def _q(self, band=40, mbps=32.0, ok=True):
         return {"band": band, "ok": ok, "mbps": mbps, "avg": 65, "loss": 0}
 
+    # 这几条都假设「记忆里记过信号」，所以统一给一对差不多的 RSRP，
+    # 让判据落在「速度」而不是信号闸门上。信号闸门另有 LockSignalGate 专门测。
+
     def test_close_enough_keeps_current(self):
         band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
-                                       quick=self._q(40, 32.0))
+                                       quick=self._q(40, 32.0),
+                                       memo_rsrp=-80, cur_rsrp=-78)
         self.assertEqual((band, kind), (40, "keep"))
 
     def test_much_slower_current_switches_to_memory(self):
         # 当前只有 20，记忆里 44.6 —— 这个差距值得断几秒换过去
         band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
-                                       quick=self._q(40, 20.0))
+                                       quick=self._q(40, 20.0),
+                                       memo_rsrp=-78, cur_rsrp=-80)
         self.assertEqual((band, kind), (3, "memo"))
 
     def test_memory_without_quick_still_used(self):
         # 快测没做（停的时间不够）→ 只能听记忆的
         band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
-                                       quick=None)
+                                       quick=None, memo_rsrp=-78, cur_rsrp=-80)
         self.assertEqual((band, kind), (3, "memo"))
 
     def test_quick_measuring_other_band_is_ignored(self):
         # 快测的是 BAND 8，人后来跳到 40 了 —— 那个数字不能拿来给 40 作证
         band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
-                                       quick=self._q(8, 50.0))
+                                       quick=self._q(8, 50.0),
+                                       memo_rsrp=-78, cur_rsrp=-80)
         self.assertEqual((band, kind), (3, "memo"))
 
     def test_no_memory_quick_enough_locks_current(self):
@@ -314,6 +320,157 @@ class MemoSpeed(unittest.TestCase):
         self.assertAlmostEqual(A.guard_memo_speed("236-CMCC", 3), 0.0)
         self.assertAlmostEqual(A.guard_memo_speed("", 3), 0.0)
         self.assertAlmostEqual(A.guard_memo_speed("236-CMCC", None), 0.0)
+
+
+class MovingDetection(unittest.TestCase):
+    """PCI 变 ≠ 人在动。实机 2026-10-30 17:43：坐在宿舍里，锁着 BAND 41，
+    PCI 自己从 477 跳到 252（-89 → -105dBm），延迟 57ms、丢包 0%。
+    原来这个会被判「检测到移动」并解锁，还顺手把静止计时清零。"""
+
+    def _move(self, **kw):
+        base = dict(churn=False, pci_changed=False, bad_now=False)
+        base.update(kw)
+        return A.guard_is_moving(**base)
+
+    def test_weak_signal_reselection_is_not_moving(self):
+        # 静止 + 换小区 + 信号掉了，但链路还通 → 设备自己重选，人没动
+        self.assertFalse(self._move(pci_changed=True, bad_now=False))
+
+    def test_reselection_with_outage_is_moving(self):
+        # 换了小区、同时链路垮了 → 走出覆盖了
+        self.assertTrue(self._move(pci_changed=True, bad_now=True))
+
+    def test_many_changes_is_moving_even_if_link_ok(self):
+        # 25 分钟换 8 个小区，哪怕网还行，人就是在走
+        self.assertTrue(self._move(churn=True))
+
+    def test_link_bad_without_pci_change_is_not_moving(self):
+        # 基站自己抽风（PCI 没变）不该解锁 —— 那不是位置问题
+        self.assertFalse(self._move(bad_now=True))
+
+    def test_still_here(self):
+        self.assertFalse(self._move())
+
+
+class QuickGrade(unittest.TestCase):
+    """快测分档：8 Mbps 以下才算「不够用」，两次差 3 倍算「测不准」。"""
+
+    def _g(self, **kw):
+        base = {"mbps": 20, "loss": 0, "avg": 60}
+        base.update(kw)
+        return A._quick_grade(base)
+
+    def test_grades(self):
+        self.assertEqual(self._g(mbps=A.GUARD_QUICK_GOOD_MBPS + 1), "good")
+        self.assertEqual(self._g(mbps=A.GUARD_QUICK_MIN_MBPS), "fair")
+        self.assertEqual(self._g(mbps=A.GUARD_QUICK_MIN_MBPS - 1), "poor")
+
+    def test_noisy_is_unknown(self):
+        # 实机：同一张桌子前后 22 分钟，快测 32、体检 17.8/10.8
+        self.assertEqual(self._g(mbps=32, noisy=True), "unknown")
+        self.assertTrue(A._quick_ok({"mbps": 32, "loss": 0, "avg": 60,
+                                     "noisy": True}))
+
+    def test_unknown_does_not_touch_the_device(self):
+        # 测不准时按「够用」处理：宁可放过，不要凭一个不可信的数字断网体检
+        self.assertTrue(A._quick_ok({"mbps": 12, "loss": 0, "avg": 60,
+                                     "noisy": True}))
+
+    def test_12_mbps_now_counts_as_enough(self):
+        # 老阈值 15 会把宿舍晚高峰的常态判成「不够用」，从而反复触发体检
+        self.assertTrue(A._quick_ok({"mbps": 12, "loss": 0, "avg": 70}))
+
+
+class LockSignalGate(unittest.TestCase):
+    """锁之前先看信号：记忆说它快，不等于它现在能用。
+
+    实机 2026-10-30 宿舍：记忆里 BAND 3 有 46.8 Mbps，可那天 BAND 3 只有
+    -105dBm、当前驻留的 BAND 40 是 -77dBm。照记忆锁 = 8 分钟掉线。
+    """
+
+    def _q(self, band=40, mbps=30.0, ok=True):
+        return {"band": band, "ok": ok, "mbps": mbps, "avg": 65, "loss": 0}
+
+    def test_weak_memory_keeps_current(self):
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40, quick=self._q(40, 30.0),
+            memo_rsrp=-105, cur_rsrp=-77)
+        self.assertEqual((band, kind), (40, "weak_keep"))
+
+    def test_weak_memory_and_weak_current_means_measure(self):
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40,
+            quick=self._q(40, 5.0, ok=False),
+            memo_rsrp=-105, cur_rsrp=-77)
+        self.assertEqual((band, kind), (None, "weak"))
+
+    def test_drop_just_under_the_line_is_allowed(self):
+        # 差 9dB 还没到 10dB 的线：记忆仍可用，但速度只差一点 → 留在当前
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40, quick=self._q(40, 40.0),
+            memo_rsrp=-86, cur_rsrp=-77)
+        self.assertEqual((band, kind), (40, "keep"))
+
+    def test_stronger_memory_still_wins(self):
+        # 记忆那条信号更好（-70 对 -95）→ 照旧按记忆切
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40, quick=self._q(40, 10.0),
+            memo_rsrp=-70, cur_rsrp=-95)
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_unknown_rsrp_does_not_gamble(self):
+        # 老记忆没记过信号：说不准那条现在还能不能用。当前够用就别赌。
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40, quick=self._q(40, 20.0),
+            memo_rsrp=None, cur_rsrp=-77)
+        self.assertEqual((band, kind), (40, "blind_keep"))
+
+    def test_unknown_rsrp_and_weak_current_means_measure(self):
+        # 两头都没把握 → 跑体检，顺手把每条频段的 RSRP 记下来
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=46.8, serving=40,
+            quick=self._q(40, 3.0, ok=False),
+            memo_rsrp=None, cur_rsrp=-77)
+        self.assertEqual((band, kind), (None, "blind"))
+
+    def test_same_band_never_gated(self):
+        # 当前驻留就是记忆里那条时，比「差多少 dB」没有意义
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=44.6, serving=40, quick=self._q(40, 44.0),
+            memo_rsrp=-105, cur_rsrp=-77)
+        self.assertEqual((band, kind), (40, "memo"))
+
+
+class MemoRsrp(unittest.TestCase):
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        self.SITES = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.SITES)
+        self._p.start()
+        self.json = json
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_reads_median(self):
+        self.SITES.write_text(self.json.dumps(
+            {"236-CMCC": {"seen": 2, "last": "2026-10-30T17:00:00", "best": 3,
+                          "bands": {"3": {"ok": 2, "best": 44.6,
+                                          "rsrp": -104, "rsrp_med": -101}}}}),
+            encoding="utf-8")
+        self.assertAlmostEqual(A.guard_memo_rsrp("236-CMCC", 3), -101)
+
+    def test_old_record_without_rsrp_is_none(self):
+        # 老数据没记过信号 → None（不参与比较），不能返回 0 当成信号极好
+        self.SITES.write_text(self.json.dumps(
+            {"236-CMCC": {"seen": 2, "last": "2026-10-30T17:00:00", "best": 3,
+                          "bands": {"3": {"ok": 2, "best": 44.6}}}}),
+            encoding="utf-8")
+        self.assertIsNone(A.guard_memo_rsrp("236-CMCC", 3))
+        self.assertIsNone(A.guard_memo_rsrp("", 3))
 
 
 if __name__ == "__main__":
