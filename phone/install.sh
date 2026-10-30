@@ -89,6 +89,16 @@ fi
 
 # ---- 3. 解包 ----
 say "[3/4] 解包…"
+# 升级不能顺手把「位置记忆」和上次体检结论删掉。mifi --update 用的就是 -f，
+# 原来直接 rm -rf 整个目录，于是每更新一次历史就清空一次 —— 而位置记忆要
+# 攒几次才有用，等于永远攒不起来。先把这几个本机文件挪出来，装完再放回去。
+KEEP="$HOME/.mifi-keep"
+rm -rf "$KEEP"
+mkdir -p "$KEEP"
+for _f in sites.json plan.json state.json config.json .panel-token; do
+  [ -f "$DEST/$_f" ] && cp -f "$DEST/$_f" "$KEEP/$_f" 2>/dev/null
+done
+unset _f
 rm -rf "$EXTRACT" "$DEST"
 mkdir -p "$EXTRACT"
 python -m zipfile -e "$TMP" "$EXTRACT" || die "[×] 解包失败（安装包可能不完整）"
@@ -101,7 +111,11 @@ done
 [ -n "$SRC" ] || die "[×] 解包后没找到 autotune.py，安装包内容不对。"
 
 mv "$SRC" "$DEST"
-rm -rf "$EXTRACT" "$TMP"
+for _f in sites.json plan.json state.json config.json .panel-token; do
+  [ -f "$KEEP/$_f" ] && cp -f "$KEEP/$_f" "$DEST/$_f" 2>/dev/null
+done
+unset _f
+rm -rf "$KEEP" "$EXTRACT" "$TMP"
 chmod +x "$DEST"/phone/*.sh 2>/dev/null || true
 
 # ---- 4. 建 mifi 命令 ----

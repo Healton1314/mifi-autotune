@@ -64,6 +64,18 @@ class TestPhonePackage(unittest.TestCase):
         self.assertIn("mifi-autotune/phone/tips.txt", names)
         self.assertNotIn("mifi-autotune/tests/test_scoring.py", names)
 
+    def test_update_keeps_local_history(self):
+        """mifi --update 会 rm -rf 整个目录，不能顺手把位置记忆和上次结论删了。
+
+        位置记忆要攒几次才敢跳过频段，每更新一次清一次等于永远攒不起来
+        （用户 2026-10-30 的手机上就踩到了）。
+        """
+        body = self.zip.read("mifi-autotune/phone/install.sh").decode("utf-8")
+        self.assertIn('KEEP="$HOME/.mifi-keep"', body)
+        self.assertIn('cp -f "$KEEP/$_f" "$DEST/$_f"', body)
+        for f in ("sites.json", "plan.json", "state.json", "config.json"):
+            self.assertIn(f, body, f"升级后 {f} 会被删掉")
+
     def test_output_log_has_a_path_the_pc_can_read(self):
         """输出要能复盘：优先落到 ~/storage/downloads（电脑数据线能读到），
         没给存储权限时退回 Termux 自己的目录，两种情况都不能崩。"""
