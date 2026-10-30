@@ -237,15 +237,17 @@ def _scan_termux():
         return []
     aps = []
     for ap in data:
-        ssid = (ap.get("ssid") or "").strip()
         # 字段名有两套，必须都认：
         #   旧版 Termux:API → frequency / level
         #   新版（Android 10+ 直接转 WifiScanner 的 ScanResult）→ frequency_mhz / rssi
         # 只读 frequency 的话，新版机器上每个 AP 都会被当成「没有频率」扔掉 ——
         # 表现就是「明明扫到了，工具却说一个都没扫到」（2026-10-29 用户实机踩到）。
         freq = ap.get("frequency_mhz") or ap.get("frequency")
-        if not ssid or not freq:
+        if not freq:
             continue
+        # 隐藏网络（不广播 SSID）照样占着这条信道。原来「没名字就丢掉」，
+        # 等于把它的干扰算成 0，正好把最该避开的信道说成「最干净」。
+        ssid = (ap.get("ssid") or "").strip() or _HIDDEN_SSID
         ch = freq_to_channel(int(freq))
         if not ch:
             continue
@@ -275,11 +277,12 @@ def _scan_nmcli():
         parts = re.split(r"(?<!\\):", line)
         if len(parts) < 3:
             continue
-        ssid = _nmcli_unescape(parts[0]).strip()
         ch = _num(parts[1])
         sig = _num(parts[2])
-        if not ssid or ch is None:
+        if ch is None:
             continue
+        # 隐藏网络照样占信道，别因为没名字就丢（理由同 Termux 那处）
+        ssid = _nmcli_unescape(parts[0]).strip() or _HIDDEN_SSID
         aps.append({"ssid": ssid, "bssid": "", "ch": ch,
                     "sig": max(0, min(100, sig or 0)), "band": None})
     return aps
@@ -595,11 +598,14 @@ def score_channels(aps, channels=None, width_mhz=20):
                 continue
             total += (ap["sig"] / 100.0) ** 2 * (ov / width_mhz)
             detail.append((ap["ssid"], ap["ch"], ap["sig"], ov))
-        rows.append({"ch": ch, "score": round(total, 2), "detail": detail})
+        max_ov = max((d[3] for d in detail), default=0)
+        rows.append({"ch": ch, "score": round(total, 2), "detail": detail,
+                     "max_overlap": round(max_ov)})
     rows.sort(key=lambda r: r["score"])
     return rows
 
 
+_HIDDEN_SSID = "(隐藏网络)"          # 不广播名字的 AP，照样占着信道
 STANDARD_2G_CHANNELS = (1, 6, 11)   # 2.4G 真正互不重叠的三个
 CHANNEL_PREF_MARGIN = 0.15          # 干扰分差在这个范围内时，标准信道优先
 

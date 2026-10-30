@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1660,28 +1660,47 @@ def main():
         if own:
             print(f"（已排除自己的 AP：{own}）")
         rows = scanner.score_channels(aps)
-        print(f"\n扫到 {len(aps)} 个 AP。各信道干扰分（0 最好，越低越干净）：")
-        shown = rows[:5]
-        for r in shown:
-            print(f"  信道 {r['ch']:>2}   干扰分 {r['score']}")
         best = scanner.pick_best_channel(rows)
-        # 最干净的信道经常不在上面几条里（那正是它干净的原因）。
-        # 不说明的话，用户会以为「7 号没扫到」或「工具算错了」——实机反馈过。
-        if best["ch"] not in {r["ch"] for r in shown}:
-            print(f"  …只列干扰最高的 5 个；最干净的 {best['ch']} 号不在其中，"
-                  f"正因为附近没人用")
-        if rows and best["ch"] != rows[0]["ch"]:
+        std = scanner.STANDARD_2G_CHANNELS
+
+        # 列出**全部** 13 条信道。原来只印前 5 条，用户以为「没印出来的 = 没检测到
+        # = 最干净」，实际上每条都算过、0 分的就在里面（2026-10-30 用户提问）。
+        print(f"\n扫到 {len(aps)} 个 AP。全部 {len(rows)} 条信道的干扰分"
+              f"（0 最好，越低越干净）：")
+        for r in sorted(rows, key=lambda x: x["ch"]):
+            note = "标准信道" if r["ch"] in std else ""
+            if r["ch"] == best["ch"]:
+                note = (note + "  ← 推荐").strip()
+            print(f"  信道 {r['ch']:>2}   {r['score']:>5}   {note}")
+
+        zeros = [r["ch"] for r in rows if r["score"] == 0]
+        if zeros:
+            print(f"\n  {zeros} 号一条邻居都没听到（0 分）。")
+            print("  但「没听到」不等于「没人用」：扫描在每个信道只停几十毫秒，")
+            print("  信号弱的 AP 和隐藏网络（不广播名字）很容易漏；而且 2.4G 只有")
+            print("  1/6/11 三条互不重叠，其余信道都和邻居部分重叠 —— 邻居一活跃，")
+            print("  它的分数就跟着涨。所以 0 分是「现在没人用」，不是「永远干净」。")
+        else:
+            print(f"\n  这次 {len(rows)} 条信道全都有邻居压着，一条 0 分的都没有 ——")
+            print("  「挑一条没人用的」这个选项其实不存在，只能在被占用的里面选相对干净的。")
+
+        if best["ch"] != rows[0]["ch"]:
             # 被「标准信道优先」改选过，得说清为什么不是分最低的那个。
             # 注意分数可能并列（都是 0.0），这时说「更低」就是错话 —— 实机出现过。
             low = rows[0]
             if abs(low["score"] - best["score"]) < 0.01:
-                print(f"  （{low['ch']} 号与 {best['ch']} 号分数并列（{low['score']}）；"
-                      f"同等条件下优先 1/6/11，所以选 {best['ch']}）")
+                print(f"\n  {low['ch']} 号与 {best['ch']} 号分数并列（{low['score']}）；"
+                      f"同等条件下优先 1/6/11，所以选 {best['ch']}。")
             else:
-                print(f"  （{low['ch']} 号分更低（{low['score']}），但它和 1/6/11 不共用一个"
-                      f"20MHz 频段、会和相邻信道重叠；差距不到 "
-                      f"{scanner.CHANNEL_PREF_MARGIN} 时优先标准信道）")
-        print(f"\n最干净：信道 {best['ch']}（干扰分 {best['score']}）")
+                print(f"\n  {low['ch']} 号分更低（{low['score']}），但它是夹缝信道：")
+                ov = low.get("max_overlap") or 0
+                print(f"  它和邻居只重叠 {ov}MHz（一条 20MHz 信道的大半是空的），"
+                      f"分数低是因为「错开了几 MHz」，不是因为「真的空」。")
+                print(f"  那条邻居一换信道、或者只是流量变忙，它的优势立刻消失 ——")
+                print(f"  而 1/6/11 是结构性优势：邻居在标准信道上就是完全重叠，")
+                print(f"  分数如实反映。差距不到 {scanner.CHANNEL_PREF_MARGIN} 时优先标准信道。")
+
+        print(f"\n推荐：信道 {best['ch']}（干扰分 {best['score']}）")
         print("这里只扫描，不会改设备。想连频段一起优化就跑 `mifi`。")
         return 0
 
