@@ -91,6 +91,17 @@ SITE_TTL_DAYS = 30                  # 这么久没来过的位置，连记录一
 FAST_LEAD_RATIO = 1.2               # 历史最优比第二名快这么多倍，才敢只测它俩
 FAST_MIN_SEEN = 2                   # 至少来过这么多次，历史才可信（一次不算）
 
+# 滚动样本：每个频段留最近几次「几点、多快、丢包多少、延迟多少」。
+# 为什么光有 best 不够：54 秒的体检碰不到「每 3~5 分钟掉一次包」这种事
+# （用户实机 2026-10-30 宿舍：BAND 40 跑 41Mbps，三五分钟就丢包 30~50%），
+# 而「晚上八点比凌晨慢一半」也只有按时段攒样本才看得出来。
+# 只留最近 SITE_SAMPLES 次，文件不会随运行次数膨胀。
+SITE_SAMPLES = 8                    # 每个频段保留几个样本
+SITE_LOSS_BAD = 20                  # 单次丢包 ≥ 这个值算「这次掉包了」
+SITE_FLAP_RATIO = 0.3               # 历史样本里掉包占比 ≥ 30% → 判为「会周期性掉包」
+FLAP_SWAP_RATIO = 0.85              # 稳的那个只要不慢过 15%，就优先它
+SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分钟内 → 算同一个地方
+
 # 全自动守护（--guard）：按「人在不在动」决定锁不锁频段。
 #
 # 为什么用 PCI 判断移动：PCI 是服务小区的物理标识，换基站/换扇区它必变。
@@ -866,6 +877,76 @@ def band_plan(rec, bands, serving=None, now=None):
     return keep, dead_list, slow, best
 
 
+def band_flap(v):
+    """这个频段是不是「会周期性掉包」。返回 (是否掉包, 掉包占比, 样本数)。
+
+    只看攒下来的历史样本：一次 54 秒的体检根本碰不到「每 3~5 分钟掉一次」
+    那个窗口，所以这个判断只能靠跨次记录，靠不了单次测量。
+    """
+    rows = [s for s in ((v or {}).get("samples") or [])
+            if isinstance(s, (list, tuple)) and len(s) >= 4]
+    if len(rows) < 2:
+        return False, 0.0, len(rows)
+    bad = sum(1 for s in rows if (_num(s[2]) or 0) >= SITE_LOSS_BAD)
+    ratio = bad / float(len(rows))
+    return ratio >= SITE_FLAP_RATIO, ratio, len(rows)
+
+
+def prefer_stable_over_flap(usable, hist, fastest):
+    """最快的那个如果历史上老是掉包，而另一个只慢一点点，就选稳的那个。
+
+    返回 (最终选中的频段, 一句解释或 None)。判据写死成「备选不慢过 15%」：
+    差太多就别换，掉包固然烦，但慢一半更难受，这种事让用户自己决定。
+    """
+    if fastest is None or not hist:
+        return fastest, None
+    flap, ratio, n = band_flap(hist.get(str(fastest)))
+    if not flap:
+        return fastest, None
+    fast_mbps = next((r["mbps"] for r in usable if r["band"] == fastest), 0) or 0
+    alt = None
+    for r in usable:
+        if r["band"] == fastest:
+            continue
+        if band_flap(hist.get(str(r["band"])))[0]:
+            continue
+        if fast_mbps and r["mbps"] >= fast_mbps * FLAP_SWAP_RATIO:
+            alt = r
+            break
+    pct = int(round(ratio * 100))
+    if alt:
+        slower = int(round((1 - alt["mbps"] / fast_mbps) * 100)) if fast_mbps else 0
+        return alt["band"], (f"BAND {fastest} 过去 {n} 次里有 {pct}% 丢包 ≥{SITE_LOSS_BAD}%，"
+                             f"会时不时掉一下；BAND {alt['band']} 只慢 {slower}%，这次选它")
+    return fastest, (f"BAND {fastest} 过去 {n} 次里有 {pct}% 丢包 ≥{SITE_LOSS_BAD}%，"
+                     f"可能隔几分钟掉一次；这次没有差不多快的备选，切过去要有心理准备")
+
+
+def find_site(data, key, now=None):
+    """认出「刚切过频段、PCI 变了但人没挪窝」还是同一个地方。
+
+    设备锁到哪个频段，服务小区就跟着换 —— 实测同一张桌子（2026-10-30）：
+    锁 BAND 40 是 PCI 236，切到 BAND 3 变成 350。按 PCI 一条一条记的话，
+    工具每切一次频段就把自己「搬了家」，记忆永远攒不起来，而它偏偏一直在切。
+    判据只有一条：同一运营商，且上一条记录是 SITE_MERGE_MIN 分钟内留下的。
+    人真走到另一个小区，通常不会二十分钟内又测一遍；切频段就几十秒。
+    """
+    if not key or key in data:
+        return key
+    op = key.split("-", 1)[1] if "-" in key else key
+    best_key, best_age = None, None
+    for k, v in (data or {}).items():
+        k_op = k.split("-", 1)[1] if "-" in k else k
+        if k_op != op:
+            continue
+        age = site_age_hours(v, now)
+        if age is None or age > SITE_MERGE_MIN / 60.0:
+            continue
+        if best_age is None or age < best_age:
+            best_key, best_age = k, age
+    return best_key or key
+
+
 def record_site(key, results, best_band=None, reset_best=False):
     """把这次的结果记到位置上。只记「有没有信号」和「最好跑到多少」。
 
@@ -875,9 +956,17 @@ def record_site(key, results, best_band=None, reset_best=False):
     if not key:
         return
     data = load_sites()
-    rec = data.setdefault(key, {"seen": 0, "bands": {}})
+    real = find_site(data, key)
+    rec = data.setdefault(real, {"seen": 0, "bands": {}})
+    if real != key:
+        # 记下这个位置还出现过哪些 PCI，顺便让人能看懂「为什么只有一条记录」
+        al = rec.setdefault("aliases", [])
+        if key not in al:
+            al.append(key)
+            del al[:-8]
+    now = datetime.now()
     rec["seen"] = int(rec.get("seen") or 0) + 1
-    rec["last"] = datetime.now().isoformat(timespec="seconds")
+    rec["last"] = now.isoformat(timespec="seconds")
     for r in results:
         b = str(r.get("band"))
         v = rec["bands"].setdefault(b, {"dead": 0, "ok": 0})
@@ -887,7 +976,13 @@ def record_site(key, results, best_band=None, reset_best=False):
             now_mbps = float(r.get("mbps") or 0)
             v["best"] = now_mbps if reset_best else max(
                 float(v.get("best") or 0), now_mbps)
-            v["last_ok"] = datetime.now().isoformat(timespec="seconds")
+            v["last_ok"] = now.isoformat(timespec="seconds")
+            # 滚动样本：[小时, 速度, 丢包%, 延迟ms]。只留最近几次，文件不会长大。
+            samples = v.setdefault("samples", [])
+            samples.append([now.hour, round(now_mbps, 1),
+                            int(_num(r.get("loss")) or 0),
+                            int(_num(r.get("avg")) or 0)])
+            del samples[:-SITE_SAMPLES]
         elif r.get("reason") == "no_signal":
             v["dead"] = int(v.get("dead") or 0) + 1
     if best_band:
@@ -1124,6 +1219,8 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     lte = []
     best_band = None
     state = "none"                      # 记忆年龄档位；没有记忆/没测频段时都是 none
+    flap_note = None                    # 「这个频段历史上会周期性掉包」的说明
+    demoted = None                      # 因为掉包被让位的那条（后面要从候选里排除）
     if not args.wifi_only and caps.get("can_lock_band"):
         bands = resolve_bands(caps, args, cfg)
         if not bands:
@@ -1133,10 +1230,14 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             # 用户实机（2026-10-30 宿舍）：测了十几二十次，38/41 每次都没覆盖，
             # 却每次都白等 15 秒 × 2，剩下的也是从头重排。
             site = _site_key(st0)
+            cur_site = site
             if site:
                 # 太久没来的位置连记录一起清掉，免得拿着「搬家前」的历史当参考。
                 prune_sites()
-            rec = load_sites().get(site) if site else None
+            data = load_sites()
+            # 切过频段之后 PCI 会变（同一张桌子 236 ↔ 350），那不算搬家。
+            site = find_site(data, site) if site else ""
+            rec = data.get(site) if site else None
             if getattr(args, "fresh", False):
                 rec = None
             state = site_memory_state(rec)
@@ -1150,8 +1251,12 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 def _hist_v(b):
                     return (hist.get(str(b)) or {}).get("best") or 0
 
-                print(f"\n[2/2] 这个位置（PCI {site.split('-')[0]}）之前测过 {seen} 次，"
+                print(f"\n[2/2] 这个位置（PCI {cur_site.split('-')[0]}）之前测过 {seen} 次，"
                       f"上次来是 {_fmt_age(site_age_hours(rec))}")
+                alias = [a for a in (rec.get("aliases") or []) if a != cur_site]
+                if alias:
+                    print(f"      同一处还见过 {'、'.join('PCI ' + a.split('-')[0] for a in alias)}"
+                          f"（切频段会换小区，算同一个地方）")
                 if state == "stale":
                     print(f"      隔了 {SITE_STALE_DAYS} 天以上没来，历史作废："
                           f"这次全部 {len(bands)} 个频段都重测（覆盖会变，速度更会变）")
@@ -1183,9 +1288,16 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                                 speed_url, ping_host, contest_band=cmp_band)
 
         usable = bands_worth_comparing(lte)
+        flap_note = None
         if usable:
             usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
-            best_band = usable[0]["band"]
+            fastest = usable[0]["band"]
+            # 历史样本说「这个快的会周期性掉包」，而旁边有个只慢一点点的，
+            # 就换稳的那个。单次 54 秒测不出掉包周期，只能靠攒下来的记录。
+            best_band, flap_note = prefer_stable_over_flap(
+                usable, (rec or {}).get("bands"), fastest)
+            if best_band != fastest:
+                demoted = fastest          # 后面选建议时把它排除掉，否则又会被选回来
         if args.bands in ("default", "all") and not args.wifi_only:
             # 记忆过期那次是全测，速度数字就是最新的：把「历史最好」换成这次的，
             # 否则 8 天前那个偏高的旧数字会一直压着，快速模式又会被它骗一次。
@@ -1209,6 +1321,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
     # 两者通常互斥（乱跳本身就会让速度结论不可信），所以不是二选一之后再二选一。
     # 三条建议：自动裁决（默认）+ 两条手动强制的单线
     cands = bands_worth_comparing(lte)
+    if demoted is not None:
+        # 会周期性掉包的那条已经从「最优」里让位了，这里也要把它从候选里拿掉，
+        # 否则自动裁决按速度又把它选回来，等于白判。
+        cands = [r for r in cands if r["band"] != demoted]
     auto, auto_why = decide_band(cur_res, cands, cmp_band)
     options = {
         "auto": auto,
@@ -1236,6 +1352,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         "auto_reason": (picked.get("reason") if picked else auto_why),
         "reliable": reliable,
         "caveats": caveats,
+        "flap": flap_note,
         "lte": lte,
         "wifi": wifi,
         "signal": diag,
@@ -1278,6 +1395,8 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         best_s = f"{best_mbps} Mbps" if best_mbps is not None else "—"
         print(f"  频段：{cur_label} {now_s}"
               f"  →  最优 {_band_label(best_band) if best_band else '—'} {best_s}")
+        if flap_note:
+            print(f"  [!] 掉包记录：{flap_note}")
 
     # 自动裁决放第一行（默认就按它走），两条单线列在旁边当参考/强制用。
     # 只显示其中一条会让人以为工具「没建议」。

@@ -259,14 +259,16 @@ class PreviewUsesSiteMemory(unittest.TestCase):
         description = "假设备"
         band = 0
         channel = 6
+        serving = "3"
+        pci = "236"
 
         def set_band(self, band):
             self.band = band
 
         def get_state(self):
             return {"band": self.band, "channel": self.channel,
-                    "signal": {"rsrp": "-90dBm", "pci": "236", "operator": "CMCC",
-                               "band": "3"}}
+                    "signal": {"rsrp": "-90dBm", "pci": self.pci, "operator": "CMCC",
+                               "band": self.serving}}
 
         def capabilities(self):
             return {"bands": [3, 8, 38, 40], "channels": list(range(1, 14)),
@@ -285,23 +287,27 @@ class PreviewUsesSiteMemory(unittest.TestCase):
         for p in self._p:
             p.stop()
 
-    def _run(self, rec):
+    def _run(self, rec, speeds=None, serving="3", pci="236"):
         self.sites.write_text(json.dumps({"236-CMCC": rec,
                                           "999-OLD": {"seen": 4,
                                                       "last": "2019-01-01T00:00:00"}}),
                               encoding="utf-8")
         measured = []
+        speeds = speeds or {}
 
         def fake_measure(dev, band, **kw):
             measured.append(band)
-            return {"band": band, "ok": True, "mbps": 20, "mbps_all": [20],
-                    "mbps_min": 20, "mbps_max": 20, "avg": 50, "max": 60,
+            mbps = speeds.get(band, 20)
+            return {"band": band, "ok": True, "mbps": mbps, "mbps_all": [mbps],
+                    "mbps_min": mbps, "mbps_max": mbps, "avg": 50, "max": 60,
                     "jitter": 5, "loss": 0, "rounds": 1}
 
         args = type("Args", (), dict(wifi_only=False, lte_only=True, rounds=1,
                                      bands="default", ssid=None, scan_rounds=1,
                                      fresh=False))()
         dev = self.FakeDev()
+        dev.serving = serving
+        dev.pci = pci
         with mock.patch.object(A, "measure_band", fake_measure), \
                 mock.patch.object(A.time, "sleep", lambda s: None):
             A.run_preview(dev, dev.capabilities(), dev.get_state(), args, {}, None, None)
@@ -322,6 +328,162 @@ class PreviewUsesSiteMemory(unittest.TestCase):
         self.assertEqual(sorted(set(measured)), [3, 8, 38, 40])   # 20 天没来 → 全测
         self.assertNotIn("999-OLD", data)                   # 3 年前的位置被清掉
         self.assertIn("236-CMCC", data)
+
+    def test_pci_change_after_band_switch_reuses_memory(self):
+        """切过频段 PCI 变了，但人没动：仍然沿用同一份记忆（不白等死频段）。"""
+        measured, data = self._run({"seen": 3, "best": 40, "last": ago(minutes=5),
+                                    "bands": {"38": {"dead": 5, "ok": 0},
+                                              "40": {"dead": 0, "ok": 3, "best": 43},
+                                              "3": {"dead": 0, "ok": 3, "best": 42}}},
+                                   pci="350")     # 设备现在报 350，记忆存在 236 上
+        self.assertNotIn(38, measured)
+        self.assertEqual(list(data), ["236-CMCC"])
+        self.assertIn("350-CMCC", data["236-CMCC"]["aliases"])
+
+    def test_flappy_band_is_demoted_for_a_close_alternative(self):
+        """走真实入口：BAND 3 更快但历史老掉包，BAND 40 只慢一点 → 选 40 并说明。"""
+        bad = [[12, 46, 55, 90], [12, 45, 40, 88], [12, 44, 0, 70]]
+        _, _ = self._run({"seen": 6, "best": 3, "last": ago(hours=2),
+                          "bands": {"3": {"dead": 0, "ok": 6, "best": 46, "samples": bad},
+                                    "40": {"dead": 0, "ok": 6, "best": 42,
+                                           "samples": [[12, 41, 0, 60], [12, 42, 0, 58]]}}},
+                         speeds={3: 46.0, 40: 41.0, 8: 10.0}, serving="8")
+        plan = json.loads(self.plan.read_text(encoding="utf-8"))
+        self.assertEqual(plan["target"]["band"], 40)
+        self.assertIn("丢包", plan["flap"])
+
+
+class RollingSamples(unittest.TestCase):
+    """滚动样本：记住「几点、多快、丢包多少」，用来发现看不见的周期性掉包。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _samples(self, key="k", band="40"):
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))[key]
+        return rec["bands"][band]["samples"]
+
+    def test_sample_has_hour_speed_loss_ping(self):
+        A.record_site("k", [{"band": 40, "ok": True, "mbps": 31.5,
+                             "loss": 40, "avg": 88}])
+        hour, mbps, loss, ping = self._samples()[0]
+        self.assertEqual(mbps, 31.5)
+        self.assertEqual((loss, ping), (40, 88))
+        self.assertEqual(hour, datetime.now().hour)   # 跨时段比较要用
+
+    def test_samples_are_capped(self):
+        # 只留最近几次：文件不能随运行次数一直长
+        for i in range(20):
+            A.record_site("k", [{"band": 40, "ok": True, "mbps": i, "loss": 0, "avg": 50}])
+        rows = self._samples()
+        self.assertEqual(len(rows), A.SITE_SAMPLES)
+        self.assertEqual(rows[-1][1], 19)             # 最新的在最后
+
+    def test_no_signal_does_not_add_sample(self):
+        # 没信号是「覆盖」问题，dead 计数管；样本只记测得出速度的那次
+        A.record_site("k", [{"band": 38, "ok": False, "reason": "no_signal"}])
+        self.assertNotIn("samples", json.loads(
+            self.tmp.read_text(encoding="utf-8"))["k"]["bands"]["38"])
+
+
+class FlapDetection(unittest.TestCase):
+    def _v(self, losses):
+        return {"samples": [[12, 30.0, loss, 60] for loss in losses]}
+
+    def test_periodic_loss_is_detected(self):
+        # 宿舍实测：BAND 40 三五分钟掉一次，54 秒的体检根本碰不到
+        flap, ratio, n = A.band_flap(self._v([0, 45, 0, 50, 0]))
+        self.assertTrue(flap)
+        self.assertEqual(n, 5)
+        self.assertAlmostEqual(ratio, 0.4)
+
+    def test_occasional_loss_is_not_flap(self):
+        flap, _, _ = A.band_flap(self._v([0, 0, 0, 30, 0]))
+        self.assertFalse(flap)          # 5 次里 1 次，还不够格
+
+    def test_single_sample_is_not_enough(self):
+        flap, _, n = A.band_flap(self._v([60]))
+        self.assertFalse(flap)
+        self.assertEqual(n, 1)
+
+    def test_missing_or_broken_samples(self):
+        self.assertFalse(A.band_flap({})[0])
+        self.assertFalse(A.band_flap({"samples": [[1, 2]]})[0])   # 短数组忽略
+
+
+class PreferStable(unittest.TestCase):
+    def _usable(self, *pairs):
+        return [{"band": b, "mbps": m, "avg": 50} for b, m in pairs]
+
+    def test_swaps_when_alternative_is_close(self):
+        hist = {"3": {"samples": [[12, 46, 50, 90], [12, 45, 40, 88], [12, 44, 0, 70]]},
+                "40": {"samples": [[12, 41, 0, 60], [12, 42, 0, 58]]}}
+        best, note = A.prefer_stable_over_flap(self._usable((3, 46.0), (40, 41.0)), hist, 3)
+        self.assertEqual(best, 40)
+        self.assertIn("丢包", note)
+
+    def test_keeps_fast_one_when_alternative_is_much_slower(self):
+        hist = {"3": {"samples": [[12, 46, 50, 90], [12, 45, 40, 88], [12, 44, 0, 70]]},
+                "8": {"samples": [[12, 10, 0, 60], [12, 11, 0, 58]]}}
+        best, note = A.prefer_stable_over_flap(self._usable((3, 46.0), (8, 10.7)), hist, 3)
+        self.assertEqual(best, 3)        # 慢一半就别换，宁可提醒一句
+        self.assertIn("心理准备", note)
+
+    def test_no_change_without_history(self):
+        best, note = A.prefer_stable_over_flap(self._usable((3, 46.0)), {}, 3)
+        self.assertEqual(best, 3)
+        self.assertIsNone(note)
+
+    def test_both_flappy_keeps_fastest(self):
+        bad = [[12, 40, 50, 90], [12, 40, 30, 88], [12, 40, 40, 70]]
+        hist = {"3": {"samples": bad}, "40": {"samples": bad}}
+        best, _ = A.prefer_stable_over_flap(self._usable((3, 46.0), (40, 44.0)), hist, 3)
+        self.assertEqual(best, 3)
+
+
+class SiteMerge(unittest.TestCase):
+    """切频段会换服务小区：同一张桌子 236 ↔ 350，不能记成两个地方。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _data(self, last_hours_ago=0.1):
+        return {"236-CMCC": {"seen": 3, "last": ago(hours=last_hours_ago),
+                             "bands": {"40": {"dead": 0, "ok": 3, "best": 40.0}}}}
+
+    def test_recent_same_operator_is_the_same_place(self):
+        data = self._data(0.1)                       # 6 分钟前刚测过
+        self.assertEqual(A.find_site(data, "350-CMCC"), "236-CMCC")
+
+    def test_long_ago_is_a_new_place(self):
+        data = self._data(3)
+        self.assertEqual(A.find_site(data, "350-CMCC"), "350-CMCC")
+
+    def test_different_operator_is_a_new_place(self):
+        data = self._data(0.1)
+        self.assertEqual(A.find_site(data, "350-CTCC"), "350-CTCC")
+
+    def test_existing_key_is_itself(self):
+        data = self._data(0.1)
+        self.assertEqual(A.find_site(data, "236-CMCC"), "236-CMCC")
+
+    def test_record_site_merges_and_remembers_alias(self):
+        self.tmp.write_text(json.dumps(self._data(0.1)), encoding="utf-8")
+        A.record_site("350-CMCC", [{"band": 40, "ok": True, "mbps": 33.0}])
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["236-CMCC"])   # 没多出一条「新地方」
+        self.assertEqual(data["236-CMCC"]["seen"], 4)
+        self.assertIn("350-CMCC", data["236-CMCC"]["aliases"])
 
 
 if __name__ == "__main__":
