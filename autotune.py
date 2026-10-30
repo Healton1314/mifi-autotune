@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -116,6 +116,26 @@ GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
 # 挂上，窗口就已经关了，后面那条「解锁仍不通 → 跑体检」永远走不到。
 GUARD_RESCUE_WINDOW = 900
+
+# 新地方（从没测过）第一次久坐时怎么处理：不现场跑 5 分钟体检，先把「当前
+# 驻留的那条」锁住（设备本来就在上面，几秒、几乎不断网），并给这个位置打个
+# provisional 标记；下次再来才补一次完整体检。理由：新地方多半只待一两小时，
+# 花 15 分钟找全局最优不划算，而「别让它自己乱跳」当场就有收益。
+GUARD_NEW_SITE = "这个位置没测过"
+
+# 停下多久先「快测」当前这条（只测不锁）。用户 2026-10-30 的规则：人从老地方
+# 走到新地方，路上本来就是解锁状态（按信号保底有网）；停下来的地方很可能只是
+# 路过，这时候把频段锁死，后面走到没覆盖的地方就是断网。所以先只「看看这条够不够用」。
+GUARD_QUICK_SEC = 180               # 停 3 分钟就先快测一次
+GUARD_QUICK_MIN_MBPS = 15           # 「够用」的速度下限
+GUARD_QUICK_MAX_LOSS = 5            # 「够用」的丢包上限
+GUARD_QUICK_MAX_MS = 150            # 「够用」的延迟上限
+GUARD_QUICK_PROBE_SEC = 5           # 快测只下 5 秒，判断量级足够
+
+# 锁定之后判「这条不行」的线。原来是丢包 ≥20%，太敏感：宿舍 BAND 40 每 3~5 分钟
+# 掉 30~50%，会导致守护反复解锁 —— 越解越像「厂商的自动」，而这正是要治的病。
+# 只有「完全不通」或「丢包过半」才算真的撑不住。
+GUARD_BAD_LOSS = 50
 
 # 决赛：第二名和第一名的差距小于这个比例时，两个都要复测。
 # 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
@@ -2035,6 +2055,84 @@ def _guard_unlock(dev, cur_band):
     return ok
 
 
+def _quick_ok(q):
+    """快测结果算不算「够用」。"""
+    if not q:
+        return False
+    loss = q.get("loss")
+    loss = 100 if loss is None else loss
+    return ((q.get("mbps") or 0) >= GUARD_QUICK_MIN_MBPS
+            and loss < GUARD_QUICK_MAX_LOSS
+            and (q.get("avg") or 9999) <= GUARD_QUICK_MAX_MS)
+
+
+def guard_quick_probe(speed_url, ping_host, secs=GUARD_QUICK_PROBE_SEC):
+    """在当前连接上快测一次：短下载 + ping，**完全不碰设备**。
+
+    为什么不复用 measure_band：那个第一件事就是 dev.set_band()，哪怕锁的正是
+    同一条频段也可能让射频重启一下。而这一步恰恰发生在「可能只是路过」的时候，
+    不该有任何断网风险。
+    """
+    try:
+        p = probe.ping_stats(10, ping_host)
+    except Exception:  # noqa: BLE001
+        p = {"avg": None, "jitter": None, "loss": 100}
+    mbps = 0.0
+    if p.get("avg") is not None and (p.get("loss") or 0) < GUARD_BAD_LOSS:
+        try:
+            mbps = float(probe.throughput(secs=secs, url=speed_url) or 0)
+        except Exception:  # noqa: BLE001
+            mbps = 0.0
+    q = {"mbps": mbps, "avg": p.get("avg"), "loss": p.get("loss")}
+    q["ok"] = _quick_ok(q)
+    return q
+
+
+def guard_alt_band(st, skip=None):
+    """锁定频段判为「不行」时，先在记忆里找第二条，别急着交还给设备。
+
+    交还给设备的下场，多半是「按信号最强又选回刚才那条」——用户 2026-10-30
+    的实际体感就是这样，也是守护看起来像厂商自动的原因之一。
+    """
+    key = _site_key(st)
+    if not key:
+        return None
+    data = load_sites()
+    rec = data.get(find_site(data, key))
+    if not rec or rec.get("provisional") or site_memory_state(rec) != "fresh":
+        return None
+    rows = []
+    for b, v in (rec.get("bands") or {}).items():
+        if skip is not None and str(b) == str(skip):
+            continue
+        if (v.get("dead") or 0) >= DEAD_SKIP_MIN and not (v.get("ok") or 0):
+            continue
+        if band_flap(v)[0]:
+            continue
+        rows.append((float(v.get("best") or 0), int(b)))
+    rows.sort(reverse=True)
+    return rows[0][1] if rows else None
+
+
+def mark_site_provisional(key, band):
+    """记一笔「这个位置只是先锁住，没实测过」：下次来要补一次完整体检。
+
+    用户 2026-10-30 提的：这套记忆逻辑默认「你去过的地方」，可人也会去新地方。
+    新地方第一次不该当场花 5 分钟体检 + 断网四五次 —— 先锁当前驻留的（设备
+    本来就在上面，几秒），记住「这只是权宜」，下次再来才认真测。
+    """
+    if not key:
+        return
+    data = load_sites()
+    real = find_site(data, key)
+    rec = data.setdefault(real, {"seen": 0, "bands": {}})
+    rec["provisional"] = True
+    rec["last"] = datetime.now().isoformat(timespec="seconds")
+    if band:
+        rec["best"] = int(band)
+    save_sites(data)
+
+
 def guard_memory_band(st):
     """久坐时：能不能凭「这个位置的历史」直接锁定？返回 (频段 or None, 说明)。
 
@@ -2053,7 +2151,10 @@ def guard_memory_band(st):
     data = load_sites()
     rec = data.get(find_site(data, key))
     if not rec:
-        return None, "这个位置没测过"
+        return None, GUARD_NEW_SITE
+    if rec.get("provisional"):
+        # 上次只是「先锁住别乱跳」，没真测过：这次补一次完整体检再谈最优
+        return None, "这个位置只做过快速判断（没实测速度）"
     state = site_memory_state(rec)
     if state != "fresh":
         return None, ("位置记忆已过期" if state == "stale"
@@ -2114,16 +2215,17 @@ def run_guard(args, cfg):
     """全自动守护：打开一次就一直在，按「人在不在动」管频段锁定。"""
     interval = max(15, args.guard_interval)
     settle = max(interval * 4, args.guard_settle)
+    quick_sec = max(interval * 2, min(GUARD_QUICK_SEC, settle / 2.0))
     host = cfg["ping_host"]
     dry = args.guard_dry_run
 
     print("=" * 62)
     print("全自动守护")
-    print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包，10 个 ping 还要十几秒），不测速")
+    print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包），平时不测速")
     print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次 → 解锁，保证有网")
-    print(f"  不动：连续 {settle}s PCI 不变 → 先选优，再锁定最优频段"
-          + ("（--guard-fast：直接锁当前驻留的，跳过选优）" if args.guard_fast else ""))
-    print("  锁了之后连续不通 → 先解锁自救；解锁还不通 → 才跑体检换频段")
+    print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
+    print(f"  坐满 {int(settle)}s：才锁 —— 有记忆就锁记忆里的最优，没记忆才跑体检")
+    print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通或丢包≥{GUARD_BAD_LOSS}% → 先换备选，没有才解锁")
     print(f"  Ctrl+C 停止{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
     print("=" * 62, flush=True)
 
@@ -2131,6 +2233,8 @@ def run_guard(args, cfg):
     last_pci, stable_since, pci_log = None, time.time(), deque()
     bad_streak, next_allowed = 0, 0.0
     unlocked_at = None
+    quick, quick_done = None, False      # 快测结果与「这次停留已经测过没」
+    speed_url = None
 
     try:
         while True:
@@ -2169,10 +2273,33 @@ def run_guard(args, cfg):
 
             moving = len(pci_log) >= GUARD_MOVE_HITS
             still = now - stable_since
-            bad_now = ping["avg"] is None or (ping["loss"] or 0) >= 20
+            bad_now = ping["avg"] is None or (ping["loss"] or 0) >= GUARD_BAD_LOSS
             bad_streak = bad_streak + 1 if bad_now else 0
             outage_after_unlock = (unlocked_at is not None
                                    and now - unlocked_at < GUARD_RESCUE_WINDOW)
+
+            if moving:
+                quick, quick_done = None, False     # 一动，之前那次快测就作废了
+            # 没锁着才需要看记忆：锁着的时候只关心「它还能不能撑住」
+            memo, memo_why = (None, "") if locked else guard_memory_band(st)
+
+            # ② 停下 quick_sec 秒：快测当前这条。只测、不锁、不动设备。
+            # 目的有两个：万一只是路过，什么都没发生；真久坐的话，10 分钟那一步
+            # 就能凭「够用 + 频段没变」直接锁，省掉一次 5 分钟体检。
+            if (not moving and not locked and not quick_done and not bad_now
+                    and still >= quick_sec and memo is None):
+                if speed_url is None:
+                    speed_url = probe.resolve_speed_url(cfg.get("speed_url"),
+                                                        verbose=False)
+                print(f"{_now_hm()}  先快测当前这条（不锁，只看够不够用）…", flush=True)
+                quick = guard_quick_probe(speed_url, host)
+                quick["band"] = serving
+                quick_done = True
+                print(f"      {quick['mbps']:.0f} Mbps ｜ 延迟 {quick['avg']}ms ｜ "
+                      f"丢包 {quick['loss']}% → "
+                      f"{'够用' if quick['ok'] else '不够用'}"
+                      f"（{'路过就路过，不锁' if quick['ok'] else '坐久了会重新选'}）",
+                      flush=True)
 
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
             who = (f"锁定 BAND {locked_band}" if locked
@@ -2198,34 +2325,57 @@ def run_guard(args, cfg):
                 print(f"      → {why}", flush=True)
                 if dry:
                     print("      （演练模式，未改动设备）", flush=True)
+                elif action == "unlock" and bad_streak >= GUARD_BAD_HITS and not moving:
+                    # 锁着但真的不行了：先换记忆里的备选，别直接交还给设备 ——
+                    # 设备只会按信号最强又选回刚才那条（用户的真实体验）。
+                    alt = guard_alt_band(st, skip=locked_band)
+                    if alt:
+                        print(f"      换到记忆里的备选 BAND {alt}（不交还给设备）…", flush=True)
+                        _guard_lock_band(dev, alt)
+                        unlocked_at = None
+                    else:
+                        _guard_unlock(dev, locked_band)
+                        unlocked_at = time.time()
+                        pci_log.clear()
+                    bad_streak = 0
+                    quick, quick_done = None, False
                 elif action == "unlock":
                     _guard_unlock(dev, locked_band)
                     unlocked_at = time.time()
                     pci_log.clear()
                     bad_streak = 0
+                    quick, quick_done = None, False
                 elif action == "lock":
-                    # 久坐 → 锁定。顺序很重要：
-                    #   ① 这个位置 3 天内测过、历史最优还站得住 → 直接锁它（几秒，几乎不断网）
-                    #   ② 没可信历史 → 才跑一次体检选优
-                    #   ③ --guard-fast → 只锁当前驻留的
-                    # 用户 2026-10-30 的体感：手动测一次锁上比设备自动好，但守护
-                    # 每次久坐都重测 5 分钟、断网几次，用起来反而像「厂商的自动」——
-                    # 因为它一直在重新决策，而不是用已经知道的答案。
-                    memo, memo_why = guard_memory_band(st)
+                    # 久坐才走到这里（路过不锁）。顺序：
+                    #   ① 有可信记忆 → 直接锁记忆里的最优（几秒，几乎不断网）
+                    #   ② 没记忆、但刚才快测「够用」且频段没变 → 锁当前这条，
+                    #      标「只做过快速判断」，下次来补一次完整体检
+                    #   ③ 其余 → 跑完整体检再锁
                     if memo:
                         print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
                         _guard_lock_band(dev, memo)
-                    elif args.guard_fast:
+                    elif getattr(args, "guard_fast", False):
                         _guard_lock_current(dev, serving)
+                    elif (quick and quick.get("ok") and serving
+                          and quick.get("band") == serving):
+                        print(f"      → 当前 BAND {serving} 快测够用"
+                              f"（{quick['mbps']:.0f} Mbps / {quick['avg']}ms），直接锁它；"
+                              f"其余频段下次来再比", flush=True)
+                        _guard_lock_band(dev, serving)
+                        mark_site_provisional(_site_key(st), serving)
                     else:
-                        print(f"      → {memo_why}，跑一次完整体检再锁", flush=True)
+                        print(f"      → {memo_why or '没有可信依据'}，跑一次完整体检再锁",
+                              flush=True)
                         dev = None
                         _guard_measure(args)
                     stable_since = time.time()
-                else:  # measure
+                    quick, quick_done = None, False
+                else:  # measure：解锁后仍然不通，说明不是「锁错了」
                     dev = None
                     _guard_measure(args)
                     stable_since = time.time()
+                    quick, quick_done = None, False
+
                 next_allowed = time.time() + GUARD_COOLDOWN
             time.sleep(interval)
     except KeyboardInterrupt:

@@ -163,5 +163,78 @@ class GuardMemoryFirst(unittest.TestCase):
         self.assertIn("PCI", why)
 
 
+class QuickProbe(unittest.TestCase):
+    """停在半路先「只看不锁」—— 用户 2026-10-30：停下来的地方很可能只是路过，
+    这时候锁死频段，后面走到没覆盖的地方就是断网。"""
+
+    def test_good_enough(self):
+        self.assertTrue(A._quick_ok({"mbps": 20, "loss": 0, "avg": 60}))
+
+    def test_too_slow(self):
+        self.assertFalse(A._quick_ok({"mbps": A.GUARD_QUICK_MIN_MBPS - 1,
+                                      "loss": 0, "avg": 60}))
+
+    def test_lossy(self):
+        self.assertFalse(A._quick_ok({"mbps": 40, "loss": A.GUARD_QUICK_MAX_LOSS,
+                                      "avg": 60}))
+
+    def test_slow_ping(self):
+        self.assertFalse(A._quick_ok({"mbps": 40, "loss": 0,
+                                      "avg": A.GUARD_QUICK_MAX_MS + 1}))
+
+    def test_missing_numbers_are_not_ok(self):
+        self.assertFalse(A._quick_ok({"mbps": 0, "loss": None, "avg": None}))
+        self.assertFalse(A._quick_ok(None))
+
+
+class AltBand(unittest.TestCase):
+    """锁定的频段不行时，先换记忆里的第二条，别把决定权交还给设备。"""
+
+    def setUp(self):
+        import json
+        import tempfile
+        from datetime import datetime, timedelta
+        from pathlib import Path
+        from unittest import mock
+        self.json = json
+        self.SITES = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.SITES)
+        self._p.start()
+        self._ago = lambda **kw: (datetime.now() - timedelta(**kw)).isoformat()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _write(self, bands, **extra):
+        rec = {"seen": 5, "last": self._ago(hours=1), "best": 3, "bands": bands}
+        rec.update(extra)
+        self.SITES.write_text(self.json.dumps({"236-CMCC": rec}), encoding="utf-8")
+
+    def _st(self):
+        return {"signal": {"pci": "236", "operator": "CMCC"}}
+
+    def test_picks_fastest_remaining(self):
+        self._write({"3": {"dead": 0, "ok": 5, "best": 40.0},
+                     "40": {"dead": 0, "ok": 5, "best": 42.0},
+                     "8": {"dead": 0, "ok": 5, "best": 9.0}})
+        self.assertEqual(A.guard_alt_band(self._st(), skip=3), 40)
+
+    def test_skips_dead_and_flappy(self):
+        self._write({"3": {"dead": 0, "ok": 5, "best": 40.0},
+                     "40": {"dead": 6, "ok": 0},                       # 没覆盖
+                     "8": {"dead": 0, "ok": 5, "best": 30.0,
+                           "samples": [[12, 30, 60, 90], [12, 30, 55, 88]]},   # 会掉包
+                     "39": {"dead": 0, "ok": 5, "best": 12.6}})
+        self.assertEqual(A.guard_alt_band(self._st(), skip=3), 39)
+
+    def test_no_memory_no_alt(self):
+        self.assertIsNone(A.guard_alt_band(self._st(), skip=3))
+
+    def test_provisional_record_is_not_trusted(self):
+        # 只做过快速判断的位置，不该拿它的 best 去换
+        self._write({"40": {"dead": 0, "ok": 5, "best": 42.0}}, provisional=True)
+        self.assertIsNone(A.guard_alt_band(self._st(), skip=3))
+
+
 if __name__ == "__main__":
     unittest.main()
