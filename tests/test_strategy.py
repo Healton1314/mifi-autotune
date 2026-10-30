@@ -243,7 +243,8 @@ class ApplyPlanStrategy(unittest.TestCase):
             self.tmp.unlink()
 
     def _args(self, **kw):
-        d = dict(strategy=None, dry_run=False)
+        # observe=0：应用后的观察期会真的 ping，单元测试里不跑它
+        d = dict(strategy=None, dry_run=False, observe=0)
         d.update(kw)
         return argparse.Namespace(**d)
 

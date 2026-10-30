@@ -38,7 +38,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -54,6 +54,7 @@ STABILITY_SIMILAR_RATIO = 1.25      # 波动倍数差 25% 以内算「稳定性�
 SPEED_FLOOR_MBPS = 3                # 最优频段都低于这个值，说明网络太差、结论不可信
 MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也不能选
 MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
+OBSERVE_SEC = 90                    # 应用后盯多久，确认「能一直通」
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
 
 # 守护模式（--watch）的劣化判定阈值。
@@ -789,15 +790,24 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
                 print("      [!] 没切回去，复测结果可能偏低")
 
             usable.sort(key=lambda r: (-r["mbps"], r["avg"] or 999))
+            # 候选池摊开打印。2026-10-30 用户实机出现「只复测了当前频段、
+            # 29.4 Mbps 的那条反而没复测」，而列表只有一行「补 1 轮确认」，
+            # 从输出里根本看不出它凭什么入选 —— 以后遇到直接看这一行。
+            print("[决赛] 候选池（按速度）：" + "、".join(
+                f"BAND {r['band']} {r['mbps']}Mbps" for r in usable))
             # 候选和「当前」要分开说。之前把两者塞进一个列表打印「各补 1 轮确认」，
             # 而当前频段刚被上面判过「质量不可接受、不参与最优评选」——
             # 用户当场就问：说好不参评，怎么又进决赛了？（2026-10-29 实机截图）
             # 真相是：它确实还会被复测一次，但它不参评，只是给「提升多少」当基准。
-            pairs = [(usable[0]["band"], "候选")]
-            if contest_band is not None and str(contest_band) != str(usable[0]["band"]):
+            fastest = usable[0]
+            pairs = [(fastest["band"], "候选")]
+            if contest_band is not None and str(contest_band) != str(fastest["band"]):
                 pairs.append((contest_band, "当前·只作对照，不参评"))
-            print("\n[决赛] 补 1 轮确认：" +
+            print(f"\n[决赛] 补 1 轮确认：" +
                   "、".join(f"BAND {b}（{role}）" for b, role in pairs))
+            if len(pairs) == 1:
+                print(f"      最快的 {_band_label(fastest['band'])} 就是当前驻留的，"
+                      f"只复测它（没有别的候选值得比）")
             by_band = {r["band"]: r for r in results}
             for b, role in pairs:
                 prev = by_band.get(b)
@@ -1221,6 +1231,48 @@ def wait_device_back(dev, timeout=45, poll=5):
     return False
 
 
+def observe_after_apply(ping_host, seconds=OBSERVE_SEC, every=15, per=5):
+    """切完之后盯一段时间，抓「刚切能通、过一会儿就断」的情况。
+
+    用户实机（2026-10-30 12:34）：切到 BAND 40 后 3~5 分钟手机弹「没网」，
+    几秒后自己恢复。而体检时它 20 秒跑出 29.4 Mbps（当时的 BAND 3 只有 12.0），
+    完全看不出这种模式；切完只 ping 6 个包（几秒）同样看不出来。
+
+    「峰值多高」和「能不能久待」是两件事。体检回答前者，这里回答后者。
+
+    seconds=0 表示跳过（--observe 0）。返回 {"rounds","bad","avg"}，跳过时 None。
+    """
+    if not seconds or seconds <= 0:
+        return None
+    print(f"\n[观察] 盯 {seconds} 秒，确认切过去之后稳不稳"
+          f"（这几分钟里断一下是正常的，不用管）…")
+    t0 = time.time()
+    lat, bad, rounds = [], 0, 0
+    while time.time() - t0 < seconds:
+        s = probe.ping_stats(per, ping_host)
+        rounds += 1
+        if s["avg"] is None:
+            bad += 1
+            state = "完全不通"
+        elif s["loss"] and s["loss"] >= 50:
+            bad += 1
+            state = f"丢包 {s['loss']}%"
+        else:
+            lat.append(s["avg"])
+            state = f"延迟 {s['avg']}ms  抖动 {s['jitter']}ms  丢包 {s['loss']}%"
+        print(f"      {time.strftime('%H:%M:%S')}  {state}")
+        time.sleep(max(2, every - per * 1.2))
+    if not rounds:
+        return None
+    if bad >= 2:
+        print(f"      [!] {rounds} 次里 {bad} 次不通 —— 这个配置不适合久待")
+    else:
+        med = round(statistics.median(lat), 1) if lat else "—"
+        print(f"      [√] {rounds} 次都通（延迟中位 {med}ms）")
+    return {"rounds": rounds, "bad": bad,
+            "avg": round(statistics.median(lat), 1) if lat else None}
+
+
 def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     if not PLAN.exists():
         print("[×] 还没有体检结论。先跑一次：python autotune.py --preview")
@@ -1395,6 +1447,17 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
         return 1
     _mark_applied(plan, end["band"], end["channel"], "ok")
     print(f"原始设置已存 {STATE}，可用 --restore 还原")
+
+    verdict = observe_after_apply(ping_host, getattr(args, "observe", OBSERVE_SEC))
+    if verdict and verdict["bad"] >= 2:
+        print(f"\n[!] 切过去之后多次不通，说明这个配置在你这个位置撑不住。")
+        print(f"    建议回滚：{_cli()} --restore（还原成不锁频段 + 自动信道）")
+        _mark_applied(plan, end["band"], end["channel"], "unstable")
+        return 1
+    if verdict:
+        # 说实话：90 秒只能覆盖「切完就出问题」，更晚的抖动靠用户自己回来看。
+        print(f"      （头几分钟最容易出问题。若之后出现短暂断网，"
+              f"跑 {_cli()} --restore 回原配置）")
     return 0
 
 
@@ -1600,6 +1663,8 @@ def main():
     ap.add_argument("--bands", default="default",
                     help="default=设备声明的全部频段 / preferred=配置里的子集 / 逗号分隔如 3,40")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
+    ap.add_argument("--observe", type=int, default=OBSERVE_SEC, metavar="秒",
+                    help=f"应用后盯多少秒确认稳定（0 = 不盯，默认 {OBSERVE_SEC}）")
     ap.add_argument("--clean", action="store_true",
                     help="清掉历史运行记录与缓存（保留 config.json 和面板令牌）")
     ap.add_argument("--mtu", action="store_true",
