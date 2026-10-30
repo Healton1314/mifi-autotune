@@ -2066,7 +2066,7 @@ def run_guard(args, cfg):
 
     print("=" * 62)
     print("全自动守护")
-    print(f"  每 {interval}s 采样一次（PCI + 延迟/丢包），不测速，几乎不占流量")
+    print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包，10 个 ping 还要十几秒），不测速")
     print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次 → 解锁，保证有网")
     print(f"  不动：连续 {settle}s PCI 不变 → 先选优，再锁定最优频段"
           + ("（--guard-fast：直接锁当前驻留的，跳过选优）" if args.guard_fast else ""))
@@ -2124,8 +2124,14 @@ def run_guard(args, cfg):
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
             who = (f"锁定 BAND {locked_band}" if locked
                    else f"未锁（驻留 {serving or '?'}）")
-            tag = ("移动中" if moving
-                   else f"静止 {int(still / 60)}/{int(settle / 60)} 分钟")
+            if moving:
+                tag = "移动中"
+            elif still >= settle:
+                # 已经达标就别再印「2/1 分钟」——分母不动、分子一直涨，看着像坏了。
+                # 达标后没动作只有一种原因：已经锁着了（锁定状态下不再重复锁）。
+                tag = f"静止 {int(still / 60)} 分钟（够久了{'，已锁定' if locked else ''}）"
+            else:
+                tag = f"静止 {int(still / 60)}/{max(1, int(settle / 60))} 分钟"
             print(f"{_now_hm()}  {who:<18} PCI {pci if pci is not None else '—':<4} "
                   f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
                   flush=True)
