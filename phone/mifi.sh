@@ -11,10 +11,9 @@
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
 #   mifi --help     显示上面这段；mifi --help --all 看全部参数
 #
-# 输出会同时留一份在手机存储（Download/mifi-last.log），方便用数据线连电脑
-# 把完整文字拉走看 —— 安卓 11 起 /data/data 下的 Termux 私有目录外部读不到，
-# 只有 /sdcard 能读。Termux 里执行过一次 termux-setup-storage 之后才会生效，
-# 没授权就照常只打到屏幕上，不影响使用。
+# 输出会同时留一份在 Termux 自己的目录里（$DIR/last-run.log），跑完可以
+# `cat last-run.log` 把完整文字复制出来。**不写手机存储**：/sdcard 属于用户
+# 的私人空间，工具没必要碰，也不该碰。
 #
 # 为什么默认不再用网页面板：手机上跑网页服务需要一个常驻进程，安卓会为省电把它杀掉，
 # 于是浏览器打不开、用户以为工具坏了。终端里跑没有这个问题——进程在前台，
@@ -30,19 +29,14 @@ cd "$DIR" 2>/dev/null || { red "[×] 找不到 $DIR，请先运行 phone/install
 PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null)"
 [ -n "$PY" ] || { red "[×] 没找到 python，先执行：pkg install python"; exit 1; }
 
-# ---- 输出留一份到手机存储（能读到的位置只有 /sdcard） ----
-# 用途：手机上跑出来的东西，人只能看见最后十几行，出问题时也没法复制。
-# 留一份在 Download/ 就能用数据线（MTP 或 adb pull）把完整日志拿走。
-# 没给存储权限时 LOG 为空，一切照旧，不影响任何功能。
-LOG=""
-for _d in "$HOME/storage/downloads" /sdcard/Download; do
-  if [ -d "$_d" ] && [ -w "$_d" ]; then LOG="$_d/mifi-last.log"; break; fi
-done
-unset _d
+# ---- 输出留一份在 Termux 目录里（不外写任何其它位置） ----
+# 用途：手机上人只能看见最后十几行，想复盘早先的频段结果就没料了。
+# 写在 $DIR/last-run.log，跑完 `cat last-run.log | head -100` 就能复制出来。
+# 只落在 Termux 自己的家目录，不碰手机存储、不碰相册、不经网络。
+LOG="$DIR/last-run.log"
 
 log_head() {
-  [ -n "$LOG" ] || return 0
-  # 单次运行超过 2MB 就换一份，别让 --guard 挂一天把存储写满
+  # 单次运行超过 2MB 就换一份，别让 --guard 挂一天把目录写满
   if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
     mv -f "$LOG" "$LOG.1" 2>/dev/null
   fi
@@ -53,7 +47,8 @@ log_head() {
 # 不用 exec，因为 --guard 之后还要放 wake lock。
 run() {
   log_head "$@"
-  if [ -z "$LOG" ]; then
+  if ! : >>"$LOG" 2>/dev/null; then
+    LOG=""                      # 目录不可写（只读安装等）：退回纯打屏
     "$PY" -u autotune.py "$@"
     return $?
   fi
