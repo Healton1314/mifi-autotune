@@ -11,6 +11,11 @@
 #   mifi --update   更新到最新代码（先试电脑面板，再试 GitHub）
 #   mifi --help     显示上面这段；mifi --help --all 看全部参数
 #
+# 输出会同时留一份在手机存储（Download/mifi-last.log），方便用数据线连电脑
+# 把完整文字拉走看 —— 安卓 11 起 /data/data 下的 Termux 私有目录外部读不到，
+# 只有 /sdcard 能读。Termux 里执行过一次 termux-setup-storage 之后才会生效，
+# 没授权就照常只打到屏幕上，不影响使用。
+#
 # 为什么默认不再用网页面板：手机上跑网页服务需要一个常驻进程，安卓会为省电把它杀掉，
 # 于是浏览器打不开、用户以为工具坏了。终端里跑没有这个问题——进程在前台，
 # 系统不会静默杀掉，也不用记地址、不用浏览器。
@@ -24,6 +29,38 @@ cd "$DIR" 2>/dev/null || { red "[×] 找不到 $DIR，请先运行 phone/install
 
 PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null)"
 [ -n "$PY" ] || { red "[×] 没找到 python，先执行：pkg install python"; exit 1; }
+
+# ---- 输出留一份到手机存储（能读到的位置只有 /sdcard） ----
+# 用途：手机上跑出来的东西，人只能看见最后十几行，出问题时也没法复制。
+# 留一份在 Download/ 就能用数据线（MTP 或 adb pull）把完整日志拿走。
+# 没给存储权限时 LOG 为空，一切照旧，不影响任何功能。
+LOG=""
+for _d in "$HOME/storage/downloads" /sdcard/Download; do
+  if [ -d "$_d" ] && [ -w "$_d" ]; then LOG="$_d/mifi-last.log"; break; fi
+done
+unset _d
+
+log_head() {
+  [ -n "$LOG" ] || return 0
+  # 单次运行超过 2MB 就换一份，别让 --guard 挂一天把存储写满
+  if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+    mv -f "$LOG" "$LOG.1" 2>/dev/null
+  fi
+  printf '\n===== %s  mifi %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null
+}
+
+# 所有真正跑 autotune.py 的地方都走这里：屏幕照常输出，同时追加到日志。
+# 不用 exec，因为 --guard 之后还要放 wake lock。
+run() {
+  log_head "$@"
+  if [ -z "$LOG" ]; then
+    "$PY" -u autotune.py "$@"
+    return $?
+  fi
+  "$PY" -u autotune.py "$@" 2>&1 | tee -a "$LOG"
+  local rc=${PIPESTATUS[0]}
+  return "$rc"
+}
 
 case "${1:-}" in
   --help|-h)
@@ -79,18 +116,20 @@ PYCHK
     exit 0
     ;;
   "")
-    exec "$PY" -u autotune.py --interactive
+    run --interactive
+    exit $?
     ;;
   --guard)
     # 全自动守护要长时间挂着，安卓会为省电把后台进程杀掉 —— 先拿 wake lock。
     # 用 exec 的话 trap 不会跑，锁就一直不放，所以这里等它结束再释放。
     command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null
-    "$PY" -u autotune.py --guard "${@:2}"
+    run --guard "${@:2}"
     RC=$?
     command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null
     exit $RC
     ;;
   *)
-    exec "$PY" -u autotune.py "$@"
+    run "$@"
+    exit $?
     ;;
 esac
