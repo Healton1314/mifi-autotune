@@ -64,6 +64,22 @@ class TestPhonePackage(unittest.TestCase):
         self.assertIn("mifi-autotune/phone/tips.txt", names)
         self.assertNotIn("mifi-autotune/tests/test_scoring.py", names)
 
+    def test_output_can_be_pulled_off_the_phone(self):
+        """手机上只看得到最后十几行，出问题没法复制 —— 输出要能落到 /sdcard 被拉走。
+
+        但存储权限是用户手动给的（termux-setup-storage），没给时必须一切照旧，
+        所以这两半都得在：找可写目录 + 找不到就纯打屏。
+        """
+        body = self.zip.read("mifi-autotune/phone/mifi.sh").decode("utf-8")
+        self.assertIn('for _d in "$HOME/storage/downloads" /sdcard/Download; do', body)
+        self.assertIn('LOG="$_d/mifi-last.log"', body)
+        self.assertIn('if [ -d "$_d" ] && [ -w "$_d" ]', body)
+        self.assertIn('tee -a "$LOG"', body)
+        # 空 LOG 时必须还能跑（没授权的情况）
+        self.assertIn("if [ -z \"$LOG\" ]; then", body)
+        # --guard 之后要放 wake lock，所以不能 exec 掉
+        self.assertIn("run --guard", body)
+
 
 if __name__ == "__main__":
     unittest.main()
