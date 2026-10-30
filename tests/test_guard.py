@@ -550,5 +550,62 @@ class MemoRsrp(unittest.TestCase):
         self.assertIsNone(A.guard_memo_rsrp("", 3))
 
 
+class GuardPlanBand(unittest.TestCase):
+    """体检跑完，守护该锁哪条。
+
+    实机 2026-10-30 22:53：坐满 10 分钟 → 体检 7.5 分钟、断网 6 次 → 结论
+    「BAND 3 最优（22 Mbps），按 auto 保持现状」→ 守护什么都没锁就走了。
+    用户最后自己手动锁的。体检结论「不必切换」≠「不必锁」。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        self.json = json
+        self.PLAN = Path(tempfile.mkdtemp()) / "plan.json"
+        self._p = mock.patch.object(A, "PLAN", self.PLAN)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _plan(self, lte, target=0):
+        self.PLAN.write_text(self.json.dumps(
+            {"lte": lte, "target": {"band": target}}), encoding="utf-8")
+
+    def test_picks_fastest_usable(self):
+        # 22:53 那次体检的真实数字：BAND 40 带宽不低但丢包 80%，不能选
+        self._plan([
+            {"band": 3, "ok": True, "mbps": 22.0, "avg": 66, "loss": 0},
+            {"band": 8, "ok": True, "mbps": 10.5, "avg": 65, "loss": 0},
+            {"band": 40, "ok": True, "mbps": 17.5, "avg": 79, "loss": 80},
+            {"band": 38, "ok": False},
+        ])
+        self.assertEqual(A._guard_plan_band(), 3)
+
+    def test_keep_current_still_returns_a_band(self):
+        # 结论是「没必要换」时，也得返回当前这条 —— 锁上它才是守护的活
+        self._plan([{"band": 3, "ok": True, "mbps": 22.0, "avg": 66, "loss": 0}], target=3)
+        self.assertEqual(A._guard_plan_band(), 3)
+
+    def test_all_dead_falls_back_to_target(self):
+        self._plan([{"band": 38, "ok": False}, {"band": 41, "ok": False}], target=8)
+        self.assertEqual(A._guard_plan_band(), 8)
+
+    def test_missing_plan_is_none(self):
+        # 读不到结论不能瞎猜，交给调用方退化成「锁当前驻留」
+        self.assertIsNone(A._guard_plan_band())
+
+    def test_unreliable_data_locks_current(self):
+        # 数字不可信时照它跳到「最快的」是 0.6.9 才修过的老毛病，这里同理
+        self.PLAN.write_text(self.json.dumps(
+            {"lte": [{"band": 40, "ok": True, "mbps": 40.0, "avg": 60, "loss": 0},
+                     {"band": 3, "ok": True, "mbps": 12.0, "avg": 70, "loss": 0}],
+             "reliable": False, "target": {"band": 40}}), encoding="utf-8")
+        self.assertEqual(A._guard_plan_band(prefer=3), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

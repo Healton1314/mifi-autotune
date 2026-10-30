@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.6.9"
+__version__ = "0.7.0"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2632,16 +2632,48 @@ def _guard_lock_current(dev, serving):
     return _guard_lock_band(dev, serving)
 
 
-def _guard_measure(args):
-    """跑一次完整体检。
+def _guard_plan_band(prefer=None):
+    """从体检留下的 plan.json 里取出「该锁哪条频段」。
+
+    守护的目的是「把最优那条锁住，别让设备自己乱跳」，所以体检结论哪怕是
+    「保持现状、没必要换」，也得把当前这条锁上 —— 不锁等于什么都没做。
+
+    实机 2026-10-30 22:53：原地坐满 10 分钟 → 跑体检 7.5 分钟、断网 6 次 →
+    结论「BAND 3 最优（22 Mbps），按 auto 保持现状」→ 于是**一条都没锁**，
+    设备继续 auto，用户只能自己手动锁。这条路径原来只打印不动作。
+
+    prefer：当前驻留频段。数据不可信（波动太大/测速源抽风）时就用它 ——
+    0.6.9 的教训是「拿不可信的数据切频段」，这里同理：宁可锁现在这条，
+    也别照着过山车一样的数字跳。
+
+    返回 None 表示连退路都没有，调用方应如实说「没锁上」。
+    """
+    try:
+        plan = json.loads(PLAN.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return prefer
+    if plan.get("reliable") is False and prefer:
+        return prefer
+    usable = bands_worth_comparing(plan.get("lte") or [])
+    if usable:
+        usable.sort(key=lambda r: (-(r.get("mbps") or 0), r.get("avg") or 999))
+        return usable[0].get("band") or prefer
+    # 一个都没测出来（全无覆盖）：退回落盘的目标频段；那也可能是 0（自动）。
+    band = (plan.get("target") or {}).get("band")
+    return band or prefer
+
+
+def _guard_measure(args, prefer=None):
+    """跑一次完整体检，返回它选出的最优频段（读不到就是 None）。
 
     另起子进程，会自己登录设备 —— 和守护进程的长连接互相顶掉（KICKOFF），
     所以调用方必须先把 dev 放掉，跑完重连。
     """
     print("      跑完整体检选最优（会断网几次，约 5 分钟）…", flush=True)
     code = run_cycle(args)
+    band = _guard_plan_band(prefer) if code == 0 else prefer
     print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
-    return code
+    return band
 
 
 def _install_stop_signals():
@@ -2712,6 +2744,8 @@ def run_guard(args, cfg):
     unlocked_at = None
     quick, quick_done = None, False      # 快测结果与「这次停留已经测过没」
     speed_url = None
+    pending_lock = None                  # 体检跑完后要落地的频段（见下面 after-exam 分支）
+    pending_tries = 0                    # 落地失败的重试次数（3 次就认，别无限折腾设备）
 
     try:
         while True:
@@ -2744,6 +2778,53 @@ def run_guard(args, cfg):
             locked_band = st.get("band") or 0
             serving = locked_band or _serving_band(st)
             locked = locked_band != 0
+
+            # 体检刚跑完：把它的结论真的落到设备上。
+            # 这段必须在「重连成功 + 读到状态」之后做 —— 体检子进程要抢登录，
+            # 体检期间 dev 已经放掉了。
+            # 实机 2026-10-30 22:53 的教训：体检 7.5 分钟、断网 6 次，结论是
+            # 「BAND 3 最优，保持现状」，然后守护什么都没锁就走了 —— 白等、白断网，
+            # 最后靠用户手动锁。
+            if pending_lock:
+                want, pending_lock = pending_lock, None
+                if locked_band and str(want) == str(locked_band):
+                    # 已经是这条了（体检还原时设备自己又锁上了），不用再动
+                    print(f"{_now_hm()}  体检结论就是当前锁着的 BAND {want}，不用动", flush=True)
+                else:
+                    print(f"{_now_hm()}  按体检结论锁到 BAND {want}"
+                          f"（当前驻留 {serving or '?'}）…", flush=True)
+                    # 位置键在锁之前取：锁完 PCI 会变（换频段必换小区），
+                    # 拿新 PCI 去算 key 会把信号写到「另一个地方」的账上。
+                    key_now = _site_key(st)
+                    if _guard_lock_band(dev, want):
+                        serving = locked_band = want
+                        locked, bad_streak = True, 0
+                        stable_since = now
+                        # 锁完把状态重新读一遍：信号/PCI 都要按新频段显示，
+                        # 否则下一行会拿旧频段的 -99dBm 说新频段的事。
+                        try:
+                            st = dev.get_state()
+                            sig = st.get("signal") or {}
+                            pci = _pci_num(sig.get("pci"))
+                            rsrp = _num(sig.get("rsrp"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        last_serving, last_pci = serving, pci
+                        if rsrp is not None:
+                            note_band_rsrp(key_now, want, rsrp)
+                        pending_tries = 0
+                    else:
+                        # 失败就别默默放弃：体检花了 7 分钟断网 6 次，锁不上等于又一次白干。
+                        # 30 秒后重试，最多 3 次；再不行就如实说，别假装在等。
+                        pending_tries += 1
+                        if pending_tries < 3:
+                            pending_lock = want
+                            print(f"{_now_hm()}  [!] 没锁上 BAND {want}，30 秒后重试"
+                                  f"（第 {pending_tries}/3 次）", flush=True)
+                        else:
+                            pending_tries = 0
+                            print(f"{_now_hm()}  [!] BAND {want} 连续 3 次没锁上，"
+                                  f"这次放弃；下一轮按记忆重新判断", flush=True)
 
             # 「这条链路现在还撑得住吗」。除了不通和丢包过半，延迟离谱也算：
             # 实机 17:24 延迟 4402ms、只丢 10%，原来会被当成完全正常。
@@ -2951,12 +3032,16 @@ def run_guard(args, cfg):
                                    (memo_why or "没有可信依据"))
                             print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None
-                            _guard_measure(args)
+                            pending_lock = _guard_measure(args, prefer=serving) or serving
+                            print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
+                                  f"（体检结论「保持现状」不等于「别锁」）", flush=True)
                     stable_since = time.time()
                     quick, quick_done = None, False
                 else:  # measure：解锁后仍然不通，说明不是「锁错了」
                     dev = None
-                    _guard_measure(args)
+                    # 这条路径不是「选最优」，是「救火」：体检完照样得锁回去，
+                    # 否则下一轮又会因为「没有记忆」再跑一次体检，无限断网。
+                    pending_lock = _guard_measure(args, prefer=serving) or None
                     stable_since = time.time()
                     quick, quick_done = None, False
 
