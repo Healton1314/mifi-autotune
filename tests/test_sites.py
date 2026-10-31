@@ -1037,6 +1037,28 @@ class StatusSiteLine(unittest.TestCase):
         self.assertIn("2 个小区", text)
         self.assertNotIn("还没起名", text)
 
+    def test_flappy_best_says_which_band_guard_will_use(self):
+        """状态行必须和守护说同一件事。
+
+        实机 2026-10-31 22:07：BAND 40 当场快测 23 Mbps / 0% 丢包、信号还强
+        21dB，守护却锁了 BAND 3 —— 因为记忆里 40 会周期性掉包。这时 `--status`
+        要是还写「记忆里最优 BAND 40」，用户只会以为工具又没听话。
+        """
+        self.tmp.write_text(json.dumps({"236-CMCC": {
+            "seen": 2, "last": ago(minutes=50), "best": 40, "name": "宿舍",
+            "cells": [{"pci": "236", "band": 40}, {"pci": "350", "band": 3}],
+            "bands": {"40": {"dead": 0, "ok": 2, "best": 20.0,
+                             "samples": [[21, None, 0, 70, -79],
+                                         [21, None, 50, 154, -78],
+                                         [21, None, 50, 211, -77],
+                                         [21, None, 100, 0, -80]]},
+                      "3": {"dead": 0, "ok": 3, "best": 23.0}}}},
+            ensure_ascii=False), encoding="utf-8")
+        text = " ".join(A.describe_site_memory(self._st()))
+        self.assertIn("最优 BAND 40", text)          # 最快的那条照实写
+        self.assertIn("会周期性掉包", text)
+        self.assertIn("改用稳定的 BAND 3", text)      # 和守护的实际选择一致
+
     def test_unnamed_place_gets_a_hint(self):
         A.record_site("350-CMCC", [{"band": 3, "ok": True, "mbps": 22.0,
                                     "pci": 350}], best_band=3)
