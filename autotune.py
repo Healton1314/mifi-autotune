@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2564,6 +2564,15 @@ def note_pin_failure(band):
                          "已取消这个指定（不再强锁，按记忆重新挑）")
 
 
+def pin_overrides_lock(locked_band, pin_goal):
+    """设备锁着的频段不是人指定的那条 → 该按「没锁对」处理，不是「已锁好」。
+
+    只判「有锁定值且和指定值不同」。设备没锁（locked_band=0）时由正常流程接管；
+    人没指定（pin_goal=None）时不动它 —— 别把用户自己手动锁的频段随便改掉。
+    """
+    return bool(locked_band and pin_goal and str(locked_band) != str(pin_goal))
+
+
 def guard_pick_lock(memo, memo_mbps, serving, quick,
                     memo_rsrp=None, cur_rsrp=None, pinned_band=None):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
@@ -3010,6 +3019,19 @@ def run_guard(args, cfg):
             locked_band = st.get("band") or 0
             serving = locked_band or _serving_band(st)
             locked = locked_band != 0
+
+            # 设备锁着「不是人要的那条」时，不能当成「我已经锁好了」。
+            # 实机 2026-10-31 17:11：「--lock-band 3」写下了设备级 pin=3，随后
+            # 设备被外部锁到 BAND 40（模拟断电后固件自己恢复的老设置）。守护
+            # 读到 st["band"]=40，就认定「锁定 BAND 40」开始纯监控 —— 屏幕写着
+            # 锁定，用户要的却是 3，pinned 连读都没读到。
+            # 这里把「锁错」降级成「没锁」，让它走正常的选带流程（pin 优先）。
+            pin_goal = site_pinned(st) or device_pin()
+            if locked and pin_overrides_lock(locked_band, pin_goal):
+                print(f"{_now_hm()}  设备当前锁在 BAND {locked_band}，"
+                      f"但你指定过 BAND {pin_goal} —— 按「没锁对」处理",
+                      flush=True)
+                locked = False
 
             # 体检刚跑完：把它的结论真的落到设备上。
             # 这段必须在「重连成功 + 读到状态」之后做 —— 体检子进程要抢登录，
