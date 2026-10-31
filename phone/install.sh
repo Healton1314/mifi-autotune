@@ -11,7 +11,7 @@
 
 set -u
 
-PANEL="${PANEL:-http://192.168.0.100:8787}"
+PANEL="${PANEL:-http://192.168.1.23:8787}"
 DEST="$HOME/mifi-autotune"
 TMP="$HOME/.mifi-pkg.zip"
 EXTRACT="$HOME/.mifi-extract"

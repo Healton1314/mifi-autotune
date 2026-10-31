@@ -143,7 +143,7 @@ class TermuxFieldNames(unittest.TestCase):
     def test_new_style_fields(self):
         now = time.time() * 1000
         aps = self._parse([
-            {"bssid": "aa:bb", "ssid": "月亮糖", "frequency_mhz": 2437,
+            {"bssid": "aa:bb", "ssid": "MyMiFi-2.4G", "frequency_mhz": 2437,
              "rssi": -55, "timestamp": now},
             {"bssid": "cc:dd", "ssid": "邻居", "frequency_mhz": 2462,
              "rssi": -70, "timestamp": now},
