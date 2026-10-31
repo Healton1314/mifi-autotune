@@ -606,6 +606,22 @@ class SiteCells(unittest.TestCase):
         self.assertEqual(sorted(after), sorted(before))
         self.assertEqual(after["236-CMCC"]["bands"]["40"]["best"], 12.0)
 
+    def test_cell_change_anchors_on_measured_record_not_shell(self):
+        """old_key 是空壳、new_key 才是本体时，锚点跟数据走，别把记忆挂到空壳上。
+
+        守护的真实顺序：先在陌生 PCI 350 下写信号（建空壳记录），下一拍才发现
+        「设备换小区了」，于是 note_cell_change 的 old_key 正是那条空壳 ——
+        锚点若还是「old_key 的记录」，有数据的 236 就会被留在外面。
+        """
+        self.tmp.write_text(json.dumps(self._no_bridge(30)), encoding="utf-8")
+        A.note_band_rsrp("236-CMCC", 3, -96)       # 空壳 236（新 PCI）
+        A.note_cell_change("236-CMCC", "350-CMCC")  # 设备换回 350，人没动
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["350-CMCC"])
+        self.assertEqual(data["350-CMCC"]["bands"]["3"]["rsrp"], -96)
+        self.assertEqual(data["350-CMCC"]["bands"]["3"]["best"], 46.8)
+        self.assertEqual({c["pci"] for c in data["350-CMCC"]["cells"]}, {"350", "236"})
+
     def test_absorb_keeps_cells_and_count_but_not_speeds(self):
         self.tmp.write_text(json.dumps(self._rich(30)), encoding="utf-8")
         A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 12.0}])
