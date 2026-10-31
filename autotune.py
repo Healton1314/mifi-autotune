@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -3174,6 +3174,16 @@ def describe_site_memory(st):
         head_line = (f"位置：{head}｜记忆里最优 BAND {int(best)}"
                      f"（{_fmt_age(site_age_hours(rec))}测过 "
                      f"{int(rec.get('seen') or 0)} 次）")
+        # 记忆里的「最优」会周期性掉包时，守护不会锁它，而是换记忆里另一条稳的。
+        # 状态行得跟着说同一件事，否则用户看到「最优 BAND 40」、守护却锁了 3，
+        # 只会以为工具又没听话。（2026-10-31 22:07 实机：BAND 40 当场测出
+        # 23 Mbps / 0% 丢包，守护仍然锁 BAND 3 —— 因为记忆里 40 会周期性掉包。）
+        v = (rec.get("bands") or {}).get(str(int(best))) or {}
+        if band_flap(v)[0]:
+            alt = guard_alt_band(st, skip=int(best))
+            tail = (f"｜但它会周期性掉包，守护会改用稳定的 BAND {alt}"
+                    if alt else "｜但它会周期性掉包")
+            head_line += tail
     out = [head_line]
     if faces:
         out.append(faces)
