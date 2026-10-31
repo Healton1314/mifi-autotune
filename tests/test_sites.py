@@ -988,5 +988,79 @@ class Here(unittest.TestCase):
         self.assertEqual(A.site_memory_state(data["350-CMCC"]), "stale")
 
 
+class StatusSiteLine(unittest.TestCase):
+    """`mifi --status` 里的「位置：」那行。
+
+    用户反复问的是「守护有没有用上记忆」。这句话如果只能去 sites.json 里
+    核，等于每次都要人去翻文件 —— 状态里就该能直接读到。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _st(self, pci="350"):
+        return {"band": 3, "signal": {"pci": pci, "operator": "CMCC"}}
+
+    def test_shows_name_best_and_faces(self):
+        A.record_site("236-CMCC", [
+            {"band": 3, "ok": True, "mbps": 22.0, "pci": 350},
+            {"band": 40, "ok": True, "mbps": 40.0, "pci": 236},
+        ], best_band=3)
+        with mock.patch("builtins.print"):
+            A.run_here(self._dev(), mock.Mock(here="宿舍"))
+        text = " ".join(A.describe_site_memory(self._st()))
+        self.assertIn("宿舍", text)
+        self.assertIn("最优 BAND 3", text)
+        self.assertIn("测过 1 次", text)
+        self.assertIn("2 个小区", text)
+        self.assertNotIn("还没起名", text)
+
+    def test_unnamed_place_gets_a_hint(self):
+        A.record_site("350-CMCC", [{"band": 3, "ok": True, "mbps": 22.0,
+                                    "pci": 350}], best_band=3)
+        lines = A.describe_site_memory(self._st())
+        self.assertIn("350-CMCC", lines[0])
+        self.assertTrue(any("--here" in x for x in lines))
+
+    def test_no_memory_says_so(self):
+        lines = A.describe_site_memory(self._st())
+        self.assertIn("还没测过", " ".join(lines))
+
+    def test_observation_only_record_is_not_a_memory(self):
+        """守护路过写下的纯观测记录（有 observed、没 last）不能冒充记忆。"""
+        self.tmp.write_text(json.dumps({"350-CMCC": {
+            "observed": ago(minutes=3), "seen": 0,
+            "cells": [{"pci": "350", "band": 3}]}}, ensure_ascii=False),
+            encoding="utf-8")
+        text = " ".join(A.describe_site_memory(self._st()))
+        self.assertIn("还没测过", text)
+        self.assertNotIn("最优", text)
+
+    def test_expired_memory_says_it_will_retest(self):
+        self.tmp.write_text(json.dumps({"350-CMCC": {
+            "seen": 4, "last": ago(days=40), "best": 3, "name": "宿舍",
+            "bands": {"3": {"ok": 4, "best": 22.0, "dead": 0}},
+            "cells": [{"pci": "350", "band": 3}]}}, ensure_ascii=False),
+            encoding="utf-8")
+        text = " ".join(A.describe_site_memory(self._st()))
+        self.assertIn("记忆已过期", text)
+        # 过期就别再报「最优 BAND 3」—— 那数字已经不可信了
+        self.assertNotIn("最优", text)
+
+    def test_no_pci_prints_nothing(self):
+        self.assertEqual(A.describe_site_memory({"band": 3, "signal": {}}), [])
+
+    def _dev(self, pci="350", band=3):
+        dev = mock.MagicMock()
+        dev.get_state.return_value = {"band": band,
+                                      "signal": {"pci": pci, "operator": "CMCC"}}
+        return dev
+
+
 if __name__ == "__main__":
     unittest.main()

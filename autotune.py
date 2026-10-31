@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.7"
+__version__ = "0.7.8"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2866,6 +2866,51 @@ def site_name(key):
     return str(rec.get("name") or "").strip()
 
 
+def describe_site_memory(st):
+    """一句话说清「这是什么地方、记忆里怎么说」—— 给 `mifi --status` 用。
+
+    用户反复问的其实是同一件事：「守护到底有没有用上记忆」。以前这条信息只
+    活在日志和 sites.json 里，`--status` 只看得到设备、看不到记忆，于是每次
+    都得由人去翻文件核对。把记忆摊在状态里，他自己一眼就能对：这里叫什么、
+    记忆里的最优是哪条、多久前测的、工具一共见过这处的几副面孔。
+
+    「还没有记忆」也要说出来 —— 那不是「没东西可显示」，而是一句结论：
+    这地方工具还没数，下次坐久了会跑一次体检。
+    """
+    key = _site_key(st)
+    if not key:
+        return []
+    data = load_sites()
+    real = find_site(data, key)
+    rec = data.get(real) or {}
+    place = str(rec.get("name") or "").strip()
+    head = place or real
+    cells = [str(c.get("pci")) for c in (rec.get("cells") or []) if c.get("pci")]
+
+    state = site_memory_state(rec)
+    best = rec.get("best")
+    faces = ""
+    if cells:
+        more = "…" if len(cells) > 6 else ""
+        faces = f"      这处见过 {len(cells)} 个小区：{'/'.join(cells[:6])}{more}"
+
+    if not best:
+        head_line = f"位置：{head}｜这处还没测过（坐久了会自动跑一次体检）"
+    elif state == "stale":
+        head_line = (f"位置：{head}｜记忆已过期"
+                     f"（上次 {_fmt_age(site_age_hours(rec))}），下次会全部重测")
+    else:
+        head_line = (f"位置：{head}｜记忆里最优 BAND {int(best)}"
+                     f"（{_fmt_age(site_age_hours(rec))}测过 "
+                     f"{int(rec.get('seen') or 0)} 次）")
+    out = [head_line]
+    if faces:
+        out.append(faces)
+    if not place and best:
+        out.append("      还没起名：mifi --here 宿舍（只是加个标签，不影响选带）")
+    return out
+
+
 def note_band_loss(key, band, loss, avg=None, rsrp=None):
     """守护采样里出现高丢包 → 记进这个位置该频段的滚动样本。
 
@@ -3365,10 +3410,15 @@ def run_guard(args, cfg):
                 who += f"·{place}"
             if moving:
                 tag = "移动中"
+            elif locked:
+                # 锁着的时候这个倒计时不驱动任何事（锁定的分支里根本不读记忆、
+                # 也不会再锁一次），印「静止 0/10 分钟」只会让人以为「再过十分钟
+                # 还有动作」。实机 2026-10-31 19:42 用户就是这么看的。
+                # 只有真要等到点才决策的状态才值得倒计时。
+                tag = "监控中"
             elif still >= settle:
                 # 已经达标就别再印「2/1 分钟」——分母不动、分子一直涨，看着像坏了。
-                # 达标后没动作只有一种原因：已经锁着了（锁定状态下不再重复锁）。
-                tag = f"静止 {int(still / 60)} 分钟（够久了{'，已锁定' if locked else ''}）"
+                tag = f"静止 {int(still / 60)} 分钟（够久了）"
             else:
                 tag = f"静止 {int(still / 60)}/{max(1, int(settle / 60))} 分钟"
             if band_changed and not moving:
@@ -3971,6 +4021,8 @@ def main():
             print("网络：测不到回应（可能正在注册或没有数据通路）")
         else:
             print(f"网络：延迟 {p['avg']}ms ｜ 抖动 {p['jitter']}ms ｜ 丢包 {p['loss']}%")
+        for line in describe_site_memory(st0):
+            print(line)
         diag = diagnose_signal(st0.get("signal") or {})
         if diag:
             print(f"\n信号判读：{diag['text']}")
