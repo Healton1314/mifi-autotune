@@ -877,6 +877,29 @@ class DevicePin(unittest.TestCase):
         A.clear_device_pin()          # --restore 就是「我要自动」
         self.assertIsNone(A.device_pin())
 
+    def test_restore_must_clear_the_site_level_pin_too(self):
+        """只清设备级不够：位置级那份还在，守护一启动又照着它锁回去。
+
+        2026-10-31 20:56 实测：`--restore` 打印了「已取消之前指定的频段」，
+        紧接着的守护演练却报「本来会锁 BAND 3 —— 依据 pinned」。设备级清了、
+        位置级没清，而守护优先读位置级（pinned_site or device_pin）。
+        """
+        self._sites(**{"350-CMCC": {"seen": 2, "last": "2026-10-31T20:00:00",
+                                    "best": 3, "pinned": 3},
+                       "236-CMCC": {"seen": 2, "last": "2026-10-31T20:10:00",
+                                    "best": 40}})
+        self.assertEqual(A.site_pinned({"signal": {"pci": 350, "operator": "CMCC"}}), 3)
+        hits = A.clear_site_pins()
+        self.assertEqual(hits, ["350-CMCC"])
+        self.assertIsNone(A.site_pinned({"signal": {"pci": 350, "operator": "CMCC"}}))
+        # 别的地方的「来过」记录不许被顺手删掉
+        self.assertEqual(sorted(A.load_sites()), ["236-CMCC", "350-CMCC"])
+
+    def test_clear_site_pins_is_a_noop_when_nothing_is_pinned(self):
+        self._sites(**{"236-CMCC": {"seen": 1, "last": "2026-10-31T20:10:00",
+                                    "best": 40}})
+        self.assertEqual(A.clear_site_pins(), [])
+
     def test_cleared_after_two_failures(self):
         """指定的那条锁上就不通：第一次记一笔，连续两次才放弃。
 

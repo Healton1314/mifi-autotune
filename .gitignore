@@ -31,3 +31,6 @@ Thumbs.db
 
 # 实机位置记忆的临时备份（含真实 PCI/速度），别提交
 sites.json.bak*
+
+# 导出的位置记忆（含真实 PCI / 速度），只在本机之间搬，别提交
+mifi-memory*.json
