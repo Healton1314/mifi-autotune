@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -169,7 +169,15 @@ GUARD_QUICK_NOISY_RATIO = 3.0       # 两次差这么多倍 → 测不准，别�
 # 另一个 PCI（350）下测的；当时实测当前 BAND 40 有 32 Mbps，延迟 65ms 正常。
 # 差 30% 以内就别折腾 —— 切一次频段要断几秒、要重新注册，而"记忆里的最优"
 # 本身可能是别的扇区、别的时段测出来的，未必代表现在。只有明显快得多才值得切。
-GUARD_QUICK_KEEP_RATIO = 0.7        # 当前 ≥ 历史最优 × 这个比例 → 就留在当前
+# 2026-10-31 实机改判：这个比例原来是 0.7（当前达到记忆最优的七成就别切），
+# 结果 13:0x 的体检刚把「BAND 3 = 21.4 Mbps」写进记忆，14:12 快测当前 BAND 40
+# 有 30 Mbps（30 ≥ 21.4×0.7）就判 keep、锁了 40，把「这个位置的最优」留在了 3
+# 却锁住 40。用户的原话是「熟悉的地方要优先锁历史记录里最优的」—— 20 秒快测
+# 没资格推翻多轮体检的结论，尤其是 BAND 40 当晚体检只有 1.3 Mbps / 678ms、
+# 丢包 80% 那条链路。
+# 所以比例改成 1.5：当前这条要不切换，必须**明显**快过记忆最优（快 50% 以上），
+# 「差不多」不再算理由。
+GUARD_QUICK_KEEP_RATIO = 1.5        # 当前必须 ≥ 历史最优 × 1.5 才留在当前
 
 # 锁之前先看信号，这是「记忆说它快」和「它现在能不能用」的区别。
 # 用户实机（2026-10-30 宿舍）：记忆里 BAND 3 有 46.8 Mbps，可那天在这个位置
@@ -2260,10 +2268,16 @@ def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False):
       · 剩下那种「PCI 变了、频段没变、链路垮了」才当移动 —— 真走出覆盖时，
         这两件事一定同时发生。
     """
-    if churn:
-        return True
     if band_changed:
+        # 先判这一条，再判「换了几次小区」。设备自己换频段时 PCI 必变、
+        # churn 必定累积，人却坐着没动 —— 2026-10-31 15:59 就是这么被解锁的。
         return False
+    if churn and bad_now:
+        # 光「换了几次小区」不够：2026-10-31 实机在宿舍坐了 144 分钟，
+        # 设备在两个扇区之间自己重选，5 分钟内变 2 次 → churn 成立 → 判「移动中」，
+        # 于是解锁、静止计时清零、白等 10 分钟。那一刻丢包 0%、延迟 110ms，
+        # 链路好好的 —— 人根本没走。真走出覆盖时，换小区和链路垮一定同时发生。
+        return True
     return bool(pci_changed and bad_now)
 
 
@@ -2458,8 +2472,32 @@ def guard_memo_rsrp(key, band):
         return None
 
 
+def site_pinned(st):
+    """用户亲手指定过的频段（`--lock-band N` 留下的 pinned）。None = 没指定过。
+
+    和 best 的分工：best 是程序算出来的「这个位置最优」，会过期、会被体检覆盖、
+    也参与信号闸门；pinned 只由人的一条命令写入，只有人能改。用户已经明说
+    「BAND 40 丢包严重，就要 BAND 3」的时候，再拿 RSRP 去反驳他毫无意义。
+    """
+    key = _site_key(st)
+    if not key:
+        return None
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key))
+    except (OSError, ValueError):
+        return None
+    if not rec:
+        return None
+    try:
+        p = rec.get("pinned")
+        return int(p) if p else None
+    except (TypeError, ValueError):
+        return None
+
+
 def guard_pick_lock(memo, memo_mbps, serving, quick,
-                    memo_rsrp=None, cur_rsrp=None):
+                    memo_rsrp=None, cur_rsrp=None, pinned_band=None):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
     依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind}。
 
@@ -2478,8 +2516,15 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       keep      记忆有值，但当前这条刚量出来不比它差多少 → 留在当前，不切
       memo      记忆里的最优明显更快且信号不差 → 切过去（值得断那几秒）
       quick     没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
+      pinned    用户用 --lock-band 亲手指定过 → 照办，不过信号闸门
     返回 (None, None) 表示信息不够，该老老实实跑一次完整体检。
     """
+    # ⓪ 用户亲手钉的优先。放在所有启发式之前：那些规则是「程序猜」，而
+    #    --lock-band 是「人已经测过、比过了、不想再被劝」。
+    if pinned_band:
+        if str(serving) != str(pinned_band):
+            return int(pinned_band), "pinned"
+        return int(serving), "pinned"
     cur_ok = bool(quick and quick.get("ok") and serving
                   and quick.get("band") == serving)
     cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
@@ -2824,7 +2869,11 @@ def guard_still_reset(pci_changed, moving, bad_now, band_changed=False):
     """
     if band_changed:
         return False
-    return bool(pci_changed or (moving and bad_now))
+    # 「PCI 变了」本身也不清。设备会在两个扇区之间自己重选，人还坐在原处：
+    # 2026-10-31 实机静止 144 分钟（早够 10 分钟了），15:59 设备换了个小区，
+    # 计时直接归零、回到「未锁 0/10」，等于白等。真正人在动时 pci_changed 与
+    # moving 会同时成立，链路垮了则由 bad_now 兜底。
+    return bool((pci_changed and moving) or bad_now)
 
 
 def run_guard(args, cfg):
@@ -3000,6 +3049,12 @@ def run_guard(args, cfg):
                 quick, quick_done = None, False     # 一动，之前那次快测就作废了
             # 没锁着才需要看记忆：锁着的时候只关心「它还能不能撑住」
             memo, memo_why = (None, "") if locked else guard_memory_band(st)
+            # 「用户亲手指定过这条」优先级最高：--lock-band 3 是人的判断，
+            # 不是程序猜的。信号闸门（差 10dB 就不锁）在这里必须让路 ——
+            # 实机 2026-10-31 16:13：BAND 3 是 -103dBm、BAND 40 是 -82dBm，
+            # 差 21dB，但 BAND 40 实测丢包 80%、BAND 3 延迟 55ms 丢包 0%。
+            # 只看 RSRP 会把用户反复踢回那条烂链路。
+            pinned = None if locked else site_pinned(st)
             # 记忆里的最优现在信号是不是已经不行了（比当前驻留差一截）。
             # 这一刻就要算出来：既决定「要不要先快测当前」，也决定「准不准锁它」。
             memo_rsrp = (guard_memo_rsrp(_site_key(st), memo)
@@ -3108,7 +3163,8 @@ def run_guard(args, cfg):
                         memo_best = guard_memo_speed(key_now, memo) if memo else 0.0
                         band, kind = guard_pick_lock(
                             memo, memo_best, serving, quick,
-                            memo_rsrp=memo_rsrp, cur_rsrp=rsrp)
+                            memo_rsrp=memo_rsrp, cur_rsrp=rsrp,
+                            pinned_band=pinned)
                         # 记忆里的最优「没记过信号」时，不能永远绕过去。
                         # 用户 2026-10-31：「在一个熟悉的地方要优先锁历史记录里
                         # 最优的，最近这几次锁定看起来没有验证记忆」。
@@ -3158,6 +3214,14 @@ def run_guard(args, cfg):
                                   f"但刚才实测当前 BAND {serving} 有 "
                                   f"{float(quick.get('mbps') or 0):.0f} Mbps"
                                   f"（差不到 {gap}%），锁当前这条，不切换", flush=True)
+                            _guard_lock_band(dev, band)
+                            note_band_rsrp(key_now, band, rsrp)
+                        elif kind == "pinned":
+                            # 人已经替它做过决定了。这里不再比速度、不再看
+                            # RSRP 差几 dB、不再问「当前够不够用」。
+                            print(f"      → 你亲手指定的 BAND {band}"
+                                  f"（--lock-band 记着的），按它锁，不再比",
+                                  flush=True)
                             _guard_lock_band(dev, band)
                             note_band_rsrp(key_now, band, rsrp)
                         elif kind == "memo":

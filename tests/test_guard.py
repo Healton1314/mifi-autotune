@@ -272,10 +272,35 @@ class PickLockBand(unittest.TestCase):
     # 让判据落在「速度」而不是信号闸门上。信号闸门另有 LockSignalGate 专门测。
 
     def test_close_enough_keeps_current(self):
+        # 2026-10-31 改判：比例从 0.7 提到 1.5。记忆里 44.6、当前 32（差 28%）
+        # 已不再算「差不多」—— 熟悉的地方要锁记忆最优，20 秒快测没资格推翻体检。
         band, kind = A.guard_pick_lock(memo=3, memo_mbps=44.6, serving=40,
                                        quick=self._q(40, 32.0),
                                        memo_rsrp=-80, cur_rsrp=-78)
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_much_faster_current_keeps_current(self):
+        # 当前真的快得多（40 对记忆的 20，翻倍）→ 才值得留在当前
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=20.0, serving=40,
+                                       quick=self._q(40, 40.0),
+                                       memo_rsrp=-80, cur_rsrp=-78)
         self.assertEqual((band, kind), (40, "keep"))
+
+    def test_pinned_beats_signal_gate(self):
+        # 2026-10-31 16:13 实机：BAND 3 = -103dBm、BAND 40 = -82dBm，差 21dB，
+        # 但 BAND 40 实测丢包 80%、BAND 3 延迟 55ms 丢包 0%。用户用 --lock-band 3
+        # 明确指定过 —— 信号闸门不能再把他踢回烂链路。
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=21.4, serving=40, quick=self._q(40, 30.0),
+            memo_rsrp=-103, cur_rsrp=-82, pinned_band=3)
+        self.assertEqual((band, kind), (3, "pinned"))
+
+    def test_pinned_while_already_there(self):
+        # 已经驻留在指定频段上：锁住就行，别切来切去
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=21.4, serving=3, quick=self._q(3, 20.0),
+            memo_rsrp=-103, cur_rsrp=-103, pinned_band=3)
+        self.assertEqual((band, kind), (3, "pinned"))
 
     def test_much_slower_current_switches_to_memory(self):
         # 当前只有 20，记忆里 44.6 —— 这个差距值得断几秒换过去
@@ -360,9 +385,15 @@ class MovingDetection(unittest.TestCase):
         # 换了小区、同时链路垮了 → 走出覆盖了
         self.assertTrue(self._move(pci_changed=True, bad_now=True))
 
-    def test_many_changes_is_moving_even_if_link_ok(self):
-        # 25 分钟换 8 个小区，哪怕网还行，人就是在走
-        self.assertTrue(self._move(churn=True))
+    def test_many_changes_alone_is_not_moving(self):
+        # 2026-10-31 改判：光「换了几次小区」不再算移动。实机在宿舍坐了 144 分钟，
+        # 设备自己在两个扇区之间重选 2 次就判了「移动中」，解锁白等 10 分钟；
+        # 那一刻丢包 0%、延迟 110ms。链路没垮就不是位置变了。
+        self.assertFalse(self._move(churn=True))
+
+    def test_many_changes_with_bad_link_is_moving(self):
+        # 真的走出覆盖：换小区 + 链路垮，两件事同时发生才算走
+        self.assertTrue(self._move(churn=True, pci_changed=True, bad_now=True))
 
     def test_link_bad_without_pci_change_is_not_moving(self):
         # 基站自己抽风（PCI 没变）不该解锁 —— 那不是位置问题
@@ -378,10 +409,14 @@ class MovingDetection(unittest.TestCase):
         self.assertFalse(self._move(pci_changed=True, bad_now=True,
                                     band_changed=True))
 
-    def test_band_switch_with_churn_still_moving(self):
-        """真在路上走，换频段也会换小区好几次 —— churn 说了算。"""
-        self.assertTrue(self._move(churn=True, pci_changed=True, bad_now=True,
-                                   band_changed=True))
+    def test_band_switch_is_not_moving_even_with_churn(self):
+        """设备自己换频段时 PCI 必变、churn 必累积，人却坐着。
+
+        2026-10-31 实机：BAND 40→3 那一拍 churn 成立，被判「检测到移动」→
+        解锁归位回 BAND 40。band_changed 现在优先于 churn。
+        """
+        self.assertFalse(self._move(churn=True, pci_changed=True, bad_now=True,
+                                    band_changed=True))
 
 
 class StillReset(unittest.TestCase):
@@ -482,11 +517,12 @@ class LockSignalGate(unittest.TestCase):
         self.assertEqual((band, kind), (None, "weak"))
 
     def test_drop_just_under_the_line_is_allowed(self):
-        # 差 9dB 还没到 10dB 的线：记忆仍可用，但速度只差一点 → 留在当前
+        # 差 9dB 还没到 10dB 的线：记忆那条并非不可用，但它也没比当前快 50%
+        # （40 对 46.8）→ 2026-10-31 起按记忆锁，不再「差不多就留当前」
         band, kind = A.guard_pick_lock(
             memo=3, memo_mbps=46.8, serving=40, quick=self._q(40, 40.0),
             memo_rsrp=-86, cur_rsrp=-77)
-        self.assertEqual((band, kind), (40, "keep"))
+        self.assertEqual((band, kind), (3, "memo"))
 
     def test_stronger_memory_still_wins(self):
         # 记忆那条信号更好（-70 对 -95）→ 照旧按记忆切
