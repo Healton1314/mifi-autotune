@@ -422,6 +422,27 @@ class FlapDetection(unittest.TestCase):
         flap, _, _ = A.band_flap(self._v([0, 0, 0, 30, 0]))
         self.assertFalse(flap)          # 5 次里 1 次，还不够格
 
+    def test_single_bad_sample_never_convicts(self):
+        """3 条里 1 条坏 = 33%，刚过占比线，但只有 1 次 → 不判掉包。
+
+        2026-10-31 实测发现的敏感度问题：守护只要连续两分钟丢包 ≥20% 就写
+        一条坏样本，而样本池只有 8 条。若只看占比，隔壁开一会儿微波炉、
+        电梯里过一下留下的那一条，就能把一条好频段打成「会周期性掉包」；
+        洗掉它又要等 8 次体检（守护链路正常时不写样本）。一次偶发不能定罪。
+        """
+        flap, ratio, n = A.band_flap(self._v([0, 0, 40]))
+        self.assertFalse(flap)
+        self.assertAlmostEqual(ratio, 1 / 3)
+        self.assertEqual(n, 3)
+
+    def test_two_bad_samples_do_convict(self):
+        # 反过来也要保住：真的反复掉包，样本再少也得抓出来，不能因为加门槛
+        # 就把「今晚这事」放过去（BAND 40 两条样本都 100% 丢包）。
+        flap, ratio, n = A.band_flap(self._v([100, 100]))
+        self.assertTrue(flap)
+        self.assertEqual(ratio, 1.0)
+        self.assertEqual(n, 2)
+
     def test_single_sample_is_not_enough(self):
         flap, _, n = A.band_flap(self._v([60]))
         self.assertFalse(flap)
