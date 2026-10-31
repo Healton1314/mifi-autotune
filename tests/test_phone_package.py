@@ -76,15 +76,21 @@ class TestPhonePackage(unittest.TestCase):
         for f in ("sites.json", "plan.json", "state.json", "config.json"):
             self.assertIn(f, body, f"升级后 {f} 会被删掉")
 
-    def test_output_log_has_a_path_the_pc_can_read(self):
-        """输出要能复盘：优先落到 ~/storage/downloads（电脑数据线能读到），
-        没给存储权限时退回 Termux 自己的目录，两种情况都不能崩。"""
+    def test_output_log_stays_inside_termux(self):
+        """输出要能复盘，但只写 Termux 自己的目录。
+
+        曾经优先写 ~/storage/downloads（即手机 /sdcard/Download），好处是插数据线
+        能直接拷出来；用户 2026-10-31 明确要求「将日志放到 termux 目录」——
+        那是他的私人空间，工具不该拿它当调试通道。这里把「不许再写手机存储」
+        钉成断言，免得以后为了图方便又改回去。
+        """
         body = self.zip.read("mifi-autotune/phone/mifi.sh").decode("utf-8")
-        self.assertIn('LOG="$DIR/last-run.log"', body)          # 兜底位置
-        self.assertIn('for _d in "$HOME/storage/downloads"; do', body)   # 首选位置
-        self.assertIn('LOG="$_d/mifi-last.log"', body)
+        self.assertIn('LOG="$DIR/last-run.log"', body)
         self.assertIn('tee -a "$LOG"', body)
         self.assertIn("run --guard", body)          # guard 之后要放 wake lock，不能 exec
+        # 只钉「代码里还有没有往手机存储写的分支」，注释里提历史不算
+        self.assertNotIn('for _d in "$HOME/storage/downloads"', body)
+        self.assertNotIn('LOG="$_d/mifi-last.log"', body)
 
 
 
