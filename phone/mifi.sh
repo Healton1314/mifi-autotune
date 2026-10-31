@@ -31,15 +31,12 @@ PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null)"
 [ -n "$PY" ] || { red "[×] 没找到 python，先执行：pkg install python"; exit 1; }
 
 # ---- 输出留一份到文件（手机上只能看见最后十几行，早先的频段结果就没了） ----
-# 日志位置：优先放 Termux 的存储链接（~/storage/downloads → 手机 Download 目录），
-# 电脑接数据线才读得到（Termux 私有目录外部读不了）。没给存储权限就退回
-# Termux 自己的目录，纯打屏也照常能用。这是用户 2026-10-30 同意开的口子，
-# 只为调试期看输出用，调完就删。
+# 日志只写 Termux 自己的目录（~/mifi-autotune/last-run.log）。
+# 原来优先写 ~/storage/downloads（即手机 Download 目录），好处是插数据线能直接
+# 拷出来；但那是用户的私人目录，为了看日志去翻它并不合适。2026-10-31 用户
+# 明确要求「将日志放到 termux 目录」，于是改成固定写这里 —— 在 Termux 里
+# tail/grep 都方便，也不需要外部存储权限。
 LOG="$DIR/last-run.log"
-for _d in "$HOME/storage/downloads"; do
-  [ -d "$_d" ] && [ -w "$_d" ] && LOG="$_d/mifi-last.log" && break
-done
-unset _d
 
 log_head() {
   # 单次运行超过 2MB 就换一份，别让 --guard 挂一天把目录写满
