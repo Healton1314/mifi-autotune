@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1060,6 +1060,29 @@ def band_flap(v):
     if bad < SITE_FLAP_MIN_BAD:
         return False, ratio, len(rows)
     return ratio >= SITE_FLAP_RATIO, ratio, len(rows)
+
+
+def site_band_flap(st, band):
+    """这个位置、这条频段在记忆里是不是「会周期性掉包」。
+
+    信号强度和「会不会周期性掉包」是两件独立的事，而且后者只在历史样本里
+    看得出来（见 band_flap 的注释：一次 54 秒的体检碰不到「每 3~5 分钟掉一次」
+    那个窗口）。所以选带时必须单独查一次，不能拿 RSRP 代替。
+    """
+    if not band:
+        return False
+    key = _site_key(st)
+    if not key:
+        return False
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key)) or {}
+    except (OSError, ValueError):
+        return False
+    v = (rec.get("bands") or {}).get(str(int(band)))
+    if not isinstance(v, dict):
+        return False
+    return band_flap(v)[0]
 
 
 def prefer_stable_over_flap(usable, hist, fastest):
@@ -2841,6 +2864,7 @@ _KIND_TEXT = {
     "blind_keep": "记忆里没记信号、当前够用",
     "memo_bad_alt": "记忆里的最优刚测出不够用，换次优",
     "memo_bad": "记忆里的最优刚测出不够用",
+    "flap_avoid": "当前这条在记忆里会周期性掉包，别被信号强度骗了",
     "weak": "记忆里那条信号差太多、当前也不够用",
     "blind": "记忆里没记信号、当前也不够用",
 }
@@ -2853,10 +2877,10 @@ def _kind_text(kind):
 
 def guard_pick_lock(memo, memo_mbps, serving, quick,
                     memo_rsrp=None, cur_rsrp=None, pinned_band=None,
-                    cur_loss=None, alt_band=None):
+                    cur_loss=None, alt_band=None, cur_flap=False):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
     依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind,
-            memo_bad, memo_bad_alt}。
+            memo_bad, memo_bad_alt, flap_avoid}。
 
       memo      记忆里的最优频段（None = 没有可信记忆）
       memo_mbps 记忆里那条的历史最好速度
@@ -2866,6 +2890,7 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       cur_rsrp  当前驻留频段此刻的 RSRP
       cur_loss  当前驻留频段此刻的丢包%；≥GUARD_BAD_LOSS 时「留在当前」
                 这个选项直接作废 —— 正在大量丢包的链路不能算「够用」
+      cur_flap  当前驻留这条在记忆里被判「会周期性掉包」
       alt_band  记忆里的次优频段（当前这条被证伪时用它；没有就是 None）
 
     依据的含义：
@@ -2887,6 +2912,13 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
         if str(serving) != str(pinned_band):
             return int(pinned_band), "pinned"
         return int(serving), "pinned"
+    # ⓪c 当前驻留这条在记忆里「会周期性掉包」→ 信号再强也不留。
+    #     2026-10-31 21:14 实机：BAND 40 是 -77dBm、比记忆里的 BAND 3 强 21dB，
+    #     信号闸门（差超过 10dB 就留在当前）当场放行，锁定 BAND 40；
+    #     21:16:31 它丢了 50% 的包。信号强度和「会不会周期性掉包」是两件
+    #     独立的事，而后者只有历史样本看得出来 —— RSRP 再漂亮也证明不了。
+    if (memo is not None and cur_flap and str(serving) != str(memo)):
+        return int(memo), "flap_avoid"
     # 「当前这条够用吗」。快测说够用还不够，得看**此刻**的链路：
     # 2026-10-31 17:34:21 实机，BAND 40 明明在丢 100% 的包，快测那个数字是
     # 几分钟前量的，于是照样判「当前够用」→ 17:45 锁回了这条烂频段。
@@ -2954,7 +2986,8 @@ def guard_plan_lock(st, memo, serving, quick, cur_rsrp, cur_loss, pinned,
     band, kind = guard_pick_lock(
         memo, memo_best, serving, quick,
         memo_rsrp=memo_rsrp, cur_rsrp=cur_rsrp,
-        pinned_band=pinned, cur_loss=cur_loss, alt_band=alt)
+        pinned_band=pinned, cur_loss=cur_loss, alt_band=alt,
+        cur_flap=site_band_flap(st, serving))
     return key, band, kind, memo_best
 
 
@@ -3790,6 +3823,13 @@ def run_guard(args, cfg):
                             # 换错了自有「连续 3 次不通 → 换备选/解锁」兜底。
                         elif kind == "memo":
                             print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
+                            _guard_lock_band(dev, band)
+                            note_band_rsrp(key_now, band, rsrp)
+                        elif kind == "flap_avoid":
+                            # 当前这条信号更强，但记忆里它会周期性掉包。
+                            # 强信号 + 周期性掉包 = 用起来一直在卡，不如稳的那条。
+                            print(f"      → 当前 BAND {serving} 信号更强，可它在记忆里"
+                                  f"会周期性掉包 —— 锁稳的 BAND {band}", flush=True)
                             _guard_lock_band(dev, band)
                             note_band_rsrp(key_now, band, rsrp)
                         elif kind == "quick":
