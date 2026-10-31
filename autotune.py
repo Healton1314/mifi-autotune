@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.6"
+__version__ = "0.7.7"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -113,7 +113,10 @@ SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分
 # 锁 BAND 3 时是 PCI 350（记着 BAND 3 有 46.8 Mbps），解锁后设备自己驻留 BAND 40
 # 变成 PCI 236，于是新建了一条空记录；下次再测，46.8 那条历史完全没被看到。
 # 所以位置改成「一组见过的小区」：只要当前 PCI 在这组里，就是同一处，跨天也认得出。
-SITE_CELL_KEEP = 8                  # 每个位置最多记几个见过的小区
+SITE_CELL_KEEP = 12                 # 每个位置最多记几个见过的小区
+# 为什么是 12：一次体检就会把这张桌子的 6 条频段（6 个 PCI）全记进来，再加上
+# 期间设备自己重选过的小区。原来 8 太紧 —— 截断时从最先记下的开始丢，而最先
+# 记下的往往正是最常用的那条频段。
 
 # 全自动守护（--guard）：按「人在不在动」决定锁不锁频段。
 #
@@ -478,7 +481,8 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """
     empty = {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
              "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
-             "jitter": None, "loss": 100, "rounds": 0, "rsrp": None}
+             "jitter": None, "loss": 100, "rounds": 0, "rsrp": None,
+             "pci": None}
 
     try:
         dev.set_band(band)
@@ -516,12 +520,17 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     samples = []
     # 记下这条频段此刻的信号强度。锁频段前要拿它跟当前驻留的比 ——
     # 「历史上很快」和「现在能不能用」是两件事（2026-10-30 实机教训）。
+    # 顺手把 PCI 也带回来：锁到哪条频段就换哪个服务小区，这一条是「同一个
+    # 地方的另一张脸」，是位置记忆唯一的桥（见 record_site 里的 cells）。
     rsrp = None
+    pci = None
     try:
         sig = (dev.get_state() or {}).get("signal") or {}
         rsrp = _num(sig.get("rsrp"))
+        pci = _pci_num(sig.get("pci"))
     except Exception:  # noqa: BLE001
         rsrp = None
+        pci = None
     # 注册完成不等于数据通道就绪：实测 ping 已经通了、下载还拿不到字节，
     # 这时候测出来就是 0 Mbps，会被误判成「该频段没有数据能力」。
     # 给 3 秒缓冲，再开始正式测量。
@@ -558,6 +567,7 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
         "loss": max(loss_list) if loss_list else 0,
         "rounds": len(samples),
         "rsrp": rsrp,
+        "pci": pci,
     }
 
 
@@ -1129,8 +1139,20 @@ def find_site(data, key, now=None):
     for k, v in (data or {}).items():
         if _split_key(k)[1] != op:
             continue
+        named = bool(str(v.get("name") or "").strip())
         age = site_age_hours(v, now)
-        if age is None or age > SITE_TTL_DAYS * 24:
+        if age is None and named:
+            # 命名过但还没测过（`--here` 之后没跑过体检）：用「来过」的时间算年龄。
+            # 否则一条记着名字的记录永远匹配不上，名字等于白起 —— 而名字恰恰是
+            # 唯一不依赖「见过几次切换」的锚点。
+            age = site_age_hours({"last": v.get("observed")}, now)
+        if age is None:
+            # 匿名观测记录（守护路过时建的）不参与认位置：它可能是任何一张桌子，
+            # 让它当锚点就会把两处混成一个。它靠 note_cell_change 桥接。
+            continue
+        if age > SITE_TTL_DAYS * 24 and not named:
+            # 隔太久作废；命名过的地方例外 —— 记忆该不该信由 site_memory_state
+            # 判（stale → 全测一遍），不认地方却会让名字彻底失联。
             continue
         seen = int(v.get("seen") or 0)
         cells = {str(c.get("pci")) for c in (v.get("cells") or [])}
@@ -1256,6 +1278,18 @@ def record_site(key, results, best_band=None, reset_best=False):
     now = datetime.now()
     rec["seen"] = int(rec.get("seen") or 0) + 1
     rec["last"] = now.isoformat(timespec="seconds")
+    # 体检是唯一「人在原地、把每条频段都锁一遍」的时刻，也就是唯一能一次性
+    # 采齐「这张桌子有几个服务小区」的机会：锁 BAND 3 是 PCI 350、BAND 40 是
+    # 236、BAND 41 又是 477……它们是同一个地方，只是设备驻留的频段不同。
+    # 以前只记了开始那一轮的 PCI，于是位置记忆只能靠「20 分钟并档窗口」或
+    # 「亲眼看到一次切换」把两张脸凑到一起，窗口一过就分家（用户实机上锁 3
+    # 之后守护认不出宿舍，就是这一条）。逐条记下来，同一个地方从此一次认全。
+    op = _split_key(key)[1]
+    for r in results:
+        band_of = r.get("band")
+        band_pci = _pci_num(r.get("pci"))
+        if band_pci is not None and op:
+            _remember_cell(rec, f"{band_pci}-{op}", band_of)
     for r in results:
         b = str(r.get("band"))
         v = rec["bands"].setdefault(b, {"dead": 0, "ok": 0})
@@ -1299,11 +1333,19 @@ def record_site(key, results, best_band=None, reset_best=False):
 
 
 def prune_sites(days=SITE_TTL_DAYS):
-    """清掉太久没去的记录：搬家、换城市之后旧记忆只会误导。"""
+    """清掉太久没去的记录：搬家、换城市之后旧记忆只会误导。
+
+    但**命名过的地方不删**：名字是你亲手给的（`--here 宿舍`），搬家也是「这处
+    以后用不上了」而不是「这个名字过期了」。留着它的代价只是 site_memory_state
+    判 stale、下次来全测一遍，跟删掉一样安全。
+    """
     data = load_sites()
     cutoff = datetime.now() - timedelta(days=days)
     keep = {}
     for k, v in data.items():
+        if str(v.get("name") or "").strip():
+            keep[k] = v
+            continue
         try:
             if datetime.fromisoformat(v.get("last", "")) >= cutoff:
                 keep[k] = v
@@ -1572,6 +1614,9 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                           if str(c.get("pci")) != pci_now]
                 others += [a.split("-")[0] for a in (rec.get("aliases") or [])
                            if a != cur_site and a.split("-")[0] not in others]
+                nm = str(rec.get("name") or "").strip()
+                if nm:
+                    print(f"      这里你命名过：{nm}")
                 if others:
                     print(f"      同一处还见过 {'、'.join('PCI ' + p for p in others[:6])}"
                           f"（切频段会换小区，算同一个地方）")
@@ -2807,6 +2852,20 @@ def mark_site_verified(key):
     save_sites(data)
 
 
+def site_name(key):
+    """这个位置叫什么名字（用户用 `--here` 起的）。没命名过返回空串。
+
+    名字只是给人和日志看的标签，不参与选带决策 —— 位置本身照旧靠「见过哪些
+    小区」来认。分开的理由：让「我记得这里是宿舍」变成一句可核对的话，
+    而不是藏在 PCI 数字里让人猜。
+    """
+    if not key:
+        return ""
+    data = load_sites()
+    rec = data.get(find_site(data, key)) or {}
+    return str(rec.get("name") or "").strip()
+
+
 def note_band_loss(key, band, loss, avg=None, rsrp=None):
     """守护采样里出现高丢包 → 记进这个位置该频段的滚动样本。
 
@@ -2876,7 +2935,9 @@ def guard_memory_band(st):
         return None, f"记忆里的最优 BAND {band} 现在没覆盖"
     if band_flap(v)[0]:
         return None, f"记忆里的最优 BAND {band} 会周期性掉包"
-    return band, (f"这个位置 {_fmt_age(site_age_hours(rec))}测过 "
+    nm = str(rec.get("name") or "").strip()
+    where = f"「{nm}」" if nm else "这个位置"
+    return band, (f"{where} {_fmt_age(site_age_hours(rec))}测过 "
                   f"{int(rec.get('seen') or 0)} 次，最优 BAND {band}")
 
 
@@ -3073,6 +3134,7 @@ def run_guard(args, cfg):
     pending_tries = 0                    # 落地失败的重试次数（3 次就认，别无限折腾设备）
     last_loss_note = 0.0                 # 上次把「高丢包」写进记忆的时刻
     last_rsrp_note = 0.0                 # 上次把「采样到的信号」写进记忆的时刻
+    place, place_key = "", ""            # 这地方叫什么（`--here` 起的名字），按 PCI 缓存
 
     try:
         while True:
@@ -3292,8 +3354,15 @@ def run_guard(args, cfg):
                       flush=True)
 
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
+            # 这地方你命名过的话，状态行带上名字 —— 日志里能一眼看出「现在说的是宿舍」，
+            # 而不是自己去比对一串 PCI。按 PCI 变化才重读一次，别每 30 秒读文件。
+            key_here = _site_key(st)
+            if key_here != place_key:
+                place_key, place = key_here, site_name(key_here)
             who = (f"锁定 BAND {locked_band}" if locked
                    else f"未锁（驻留 {serving or '?'}）")
+            if place:
+                who += f"·{place}"
             if moving:
                 tag = "移动中"
             elif still >= settle:
@@ -3573,6 +3642,57 @@ def pin_site_best(key, band):
         return
 
 
+def run_here(dev, args):
+    """给现在这个位置起个名字：`mifi --here 宿舍`。
+
+    为什么需要一条「人说了算」的命令：位置靠 `PCI + 运营商` 认，而锁哪条频段
+    就换哪个服务小区（宿舍锁 BAND 3 是 PCI 350、驻留 BAND 40 是 236）。工具
+    尽量靠「这一处见过哪些小区」把它们绑成同一处，但那要么得体检遍历过所有
+    频段、要么得亲眼看到一次频段切换。第一次到某地、或者手动锁 3 之后再没
+    切过频段，手上就只有一张脸 —— 这时唯一可靠的锚点是人自己的一句话。
+
+    名字只是标签，不参与选带：认位置照旧看小区。所以命名不会把两处混成一个，
+    最多是「认不出来时什么都没发生」。
+    """
+    name = str(args.here or "").strip()
+    if not name:
+        print("[!] 用法：mifi --here 宿舍   （给当前位置起个名字）")
+        return 2
+    try:
+        st = dev.get_state()
+    except Exception as e:  # noqa: BLE001
+        print(f"[×] 读不到设备状态：{type(e).__name__}: {e}")
+        return 1
+    key = _site_key(st)
+    if not key:
+        print("[!] 读不到 PCI / 运营商，现在没法给位置命名（等设备注册上再试）")
+        return 1
+    data = load_sites()
+    real = find_site(data, key)
+    _absorb_site(data, real, key)
+    rec = data.setdefault(real, {"seen": 0, "bands": {}})
+    old = str(rec.get("name") or "").strip()
+    rec["name"] = name
+    if not rec.get("last"):
+        # 命名不等于「测过」：只留一行「我来过」，别让 site_memory_state 误判新鲜
+        rec.setdefault("observed", datetime.now().isoformat(timespec="seconds"))
+    band = st.get("band") or _serving_band(st)
+    _remember_cell(rec, key, band)
+    save_sites(data)
+
+    pci, op = _split_key(key)
+    others = [str(c.get("pci")) for c in (rec.get("cells") or [])
+              if str(c.get("pci")) != pci]
+    print(f"\n[命名] 这里叫「{name}」")
+    print(f"  当前 PCI {pci}｜{op}｜驻留 {_band_label(st.get('band') or 0, band)}")
+    print(f"  记在 {real} 这条记忆上"
+          + (f"（同一处还见过 PCI {'、'.join(others[:6])}）" if others else ""))
+    if old and old != name:
+        print(f"  原来叫「{old}」，已改名")
+    print("  以后回到这里、认得出这组小区时，日志里就会带上这个名字")
+    return 0
+
+
 def run_lock_band(dev, args):
     """直接锁到指定频段：不测速、不裁决，只切一次。
 
@@ -3634,6 +3754,8 @@ def main():
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
     ap.add_argument("--lock-band", type=int, metavar="N",
                     help="直接锁到指定频段（只切一次，不测量）；出门前记得 --restore")
+    ap.add_argument("--here", metavar="名字",
+                    help="给当前位置起个名字（如 mifi --here 宿舍），日志里会带上它")
     ap.add_argument("--observe", type=int, default=OBSERVE_SEC, metavar="秒",
                     help=f"应用后盯多少秒确认稳定（0 = 不盯，默认 {OBSERVE_SEC}）")
     ap.add_argument("--fresh", action="store_true",
@@ -3797,7 +3919,7 @@ def main():
     # 实测踩过：整条链路 HTTPS 到 CDN 全失败（HTTP 正常），于是每个频段都测出
     # 0 Mbps，工具据此推荐了错误的频段。先选源能把这类假结论挡在源头。
     if not (args.watch or args.restore or args.apply_plan or args.list_drivers
-            or args.lock_band):
+            or args.lock_band or args.here):
         speed_url = probe.resolve_speed_url(speed_url)
 
     if args.guard:
@@ -3873,6 +3995,9 @@ def main():
 
     if args.lock_band:
         return run_lock_band(dev, args)
+
+    if args.here:
+        return run_here(dev, args)
 
     if args.restore:
         # 还原是「断网时救命」的命令，绝不能崩。切频段会让射频重启，紧接着

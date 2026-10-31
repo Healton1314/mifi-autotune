@@ -839,5 +839,154 @@ class NoteBandRsrp(unittest.TestCase):
         self.assertEqual(A.guard_memo_rsrp("350-CMCC", 40), -77.0)
 
 
+class ExamLearnsEveryBandPci(unittest.TestCase):
+    """一次体检 = 把这张桌子的每张面孔都记下来。
+
+    位置靠 `PCI + 运营商` 认，而锁哪条频段就换哪个服务小区（宿舍锁 BAND 3 是
+    350、驻留 BAND 40 是 236）。体检是唯一「人在原地、把每条频段都锁一遍」的
+    时刻 —— 每个频段测到的是一个不同的 PCI，全都是同一个地方。以前只记了开始
+    那一轮的 PCI，剩下的靠「20 分钟并档窗口」碰运气，窗口一过就分家。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_result_carries_pci(self):
+        dev = mock.MagicMock()
+        dev.get_state.return_value = {"band": 3,
+                                      "signal": {"rsrp": "-98dBm", "pci": "350"}}
+        with mock.patch.object(A, "wait_for_service", return_value=("ok", 1)), \
+                mock.patch.object(A.probe, "ping_stats",
+                                  return_value={"avg": 55, "max": 60,
+                                                "jitter": 3, "loss": 0}), \
+                mock.patch.object(A.probe, "throughput_any",
+                                  return_value=(22.0, "http://x")), \
+                mock.patch("time.sleep", return_value=None):
+            r = A.measure_band(dev, 3, rounds=1, speed_url="http://x")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["pci"], 350)
+
+    def test_dead_band_has_no_pci(self):
+        dev = mock.MagicMock()
+        with mock.patch.object(A, "wait_for_service",
+                               return_value=("no_signal", 15)), \
+                mock.patch("time.sleep", return_value=None):
+            r = A.measure_band(dev, 38, rounds=1, speed_url="http://x")
+        self.assertFalse(r["ok"])
+        self.assertIsNone(r["pci"])           # 没信号就没有小区可记
+
+    def test_one_exam_links_every_band_to_the_same_place(self):
+        A.record_site("236-CMCC", [
+            {"band": 3, "ok": True, "mbps": 22.0, "pci": 350},
+            {"band": 40, "ok": True, "mbps": 40.7, "pci": 236},
+            {"band": 41, "ok": True, "mbps": 30.0, "pci": 477},
+            {"band": 8, "ok": False, "reason": "no_signal", "pci": None},
+        ], best_band=40)
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual({c["pci"] for c in data["236-CMCC"]["cells"]},
+                         {"236", "350", "477"})
+        # 三天前测的：早过了 20 分钟并档窗口，但 cells 认得出 350 是同一处
+        data["236-CMCC"]["last"] = ago(days=3)
+        self.tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(A.find_site(data, "350-CMCC"), "236-CMCC")
+        self.assertEqual(A.find_site(data, "477-CMCC"), "236-CMCC")
+
+    def test_other_operator_is_still_a_different_place(self):
+        A.record_site("236-CMCC", [
+            {"band": 3, "ok": True, "mbps": 22.0, "pci": 350},
+        ])
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(A.find_site(data, "350-CTCC"), "350-CTCC")
+
+
+class Here(unittest.TestCase):
+    """`mifi --here 宿舍`：人给的一句话，用作位置标签。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _dev(self, pci="350", band=3):
+        dev = mock.MagicMock()
+        dev.get_state.return_value = {"band": band,
+                                      "signal": {"pci": pci, "operator": "CMCC"}}
+        return dev
+
+    def test_names_the_place_but_does_not_call_it_measured(self):
+        rc = A.run_here(self._dev(), mock.Mock(here="宿舍"))
+        self.assertEqual(rc, 0)
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]
+        self.assertEqual(rec["name"], "宿舍")
+        # 命名 ≠ 测过：没有 last，site_memory_state 照旧判 stale
+        self.assertNotIn("last", rec)
+        self.assertIn("observed", rec)
+
+    def test_name_shows_up_in_memory_hint(self):
+        with mock.patch.object(A, "SITES", self.tmp):
+            A.record_site("236-CMCC", [{"band": 3, "ok": True, "mbps": 22.0,
+                                        "pci": 236}], best_band=3)
+        A.run_here(self._dev(pci="236", band=3), mock.Mock(here="宿舍"))
+        band, why = A.guard_memory_band(
+            {"band": 0, "signal": {"pci": "236", "rsrp": "-98", "operator": "CMCC"}})
+        self.assertEqual(band, 3)
+        self.assertIn("宿舍", why)
+        self.assertEqual(A.site_name("236-CMCC"), "宿舍")
+
+    def test_empty_name_prints_usage_and_changes_nothing(self):
+        rc = A.run_here(self._dev(), mock.Mock(here="  "))
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.tmp.exists())
+
+    def test_no_pci_means_no_naming(self):
+        rc = A.run_here(self._dev(pci=""), mock.Mock(here="宿舍"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.tmp.exists())
+
+    def test_rename_reports_the_old_name(self):
+        A.run_here(self._dev(), mock.Mock(here="宿舍"))
+        A.run_here(self._dev(), mock.Mock(here="宿舍 6 楼"))
+        rec = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]
+        self.assertEqual(rec["name"], "宿舍 6 楼")
+
+    def test_prune_keeps_named_place(self):
+        """名字是你给的，搬家也不该被当成「过期数据」清掉。"""
+        A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 40.7,
+                                    "pci": 236}], best_band=40)
+        A.run_here(self._dev(pci="236", band=40), mock.Mock(here="宿舍"))
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        data["236-CMCC"]["last"] = ago(days=90)
+        self.tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with mock.patch("builtins.print"):
+            A.prune_sites()
+        kept = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertIn("236-CMCC", kept)
+
+    def test_named_place_is_found_even_without_any_exam(self):
+        """刚命名、还没体检的地方，下次也要认得出 —— 否则名字白起。"""
+        A.run_here(self._dev(pci="350", band=3), mock.Mock(here="宿舍"))
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertNotIn("last", data["350-CMCC"])      # 只有 observed
+        self.assertEqual(A.find_site(data, "350-CMCC"), "350-CMCC")
+        self.assertEqual(A.site_name("350-CMCC"), "宿舍")
+
+    def test_named_place_survives_the_30_day_ttl(self):
+        A.run_here(self._dev(pci="350", band=3), mock.Mock(here="宿舍"))
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        data["350-CMCC"]["observed"] = ago(days=60)
+        self.tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(A.find_site(data, "350-CMCC"), "350-CMCC")
+        # 认得出，但记忆照旧判过期 —— 名字不等于「这里还跟上次一样」
+        self.assertEqual(A.site_memory_state(data["350-CMCC"]), "stale")
+
+
 if __name__ == "__main__":
     unittest.main()
