@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -105,6 +105,7 @@ FAST_MIN_SEEN = 2                   # 至少来过这么多次，历史才可信
 SITE_SAMPLES = 8                    # 每个频段保留几个样本
 SITE_LOSS_BAD = 20                  # 单次丢包 ≥ 这个值算「这次掉包了」
 SITE_FLAP_RATIO = 0.3               # 历史样本里掉包占比 ≥ 30% → 判为「会周期性掉包」
+SITE_FLAP_MIN_BAD = 2               # 坏样本至少这么多条才定罪：单次偶发不算
 FLAP_SWAP_RATIO = 0.85              # 稳的那个只要不慢过 15%，就优先它
 SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分钟内 → 算同一个地方
 # 一个位置「见过哪些小区」。为什么不能只靠上面那条时间窗：20 分钟一过，
@@ -1028,6 +1029,12 @@ def band_flap(v):
 
     只看攒下来的历史样本：一次 54 秒的体检根本碰不到「每 3~5 分钟掉一次」
     那个窗口，所以这个判断只能靠跨次记录，靠不了单次测量。
+
+    定罪要**至少 SITE_FLAP_MIN_BAD 条坏样本**，不能只看占比。只看占比时
+    3 条样本里 1 条掉包就是 33%，刚好越过 30% 的线 —— 隔壁开一会儿微波炉、
+    电梯里过一下，就能把一条好频段打成「会周期性掉包」。而洗掉这个污点很慢：
+    守护链路正常时不写样本，只有体检每次给每个频段写 1 条，得攒够 8 次
+    体检才把它挤出样本池。等于一次偶发 = 长期判死刑。
     """
     rows = [s for s in ((v or {}).get("samples") or [])
             if isinstance(s, (list, tuple)) and len(s) >= 4]
@@ -1035,6 +1042,8 @@ def band_flap(v):
         return False, 0.0, len(rows)
     bad = sum(1 for s in rows if (_num(s[2]) or 0) >= SITE_LOSS_BAD)
     ratio = bad / float(len(rows))
+    if bad < SITE_FLAP_MIN_BAD:
+        return False, ratio, len(rows)
     return ratio >= SITE_FLAP_RATIO, ratio, len(rows)
 
 
@@ -2574,7 +2583,8 @@ def pin_overrides_lock(locked_band, pin_goal):
 
 
 def guard_pick_lock(memo, memo_mbps, serving, quick,
-                    memo_rsrp=None, cur_rsrp=None, pinned_band=None):
+                    memo_rsrp=None, cur_rsrp=None, pinned_band=None,
+                    cur_loss=None):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
     依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind}。
 
@@ -2584,6 +2594,8 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       quick     刚才的快测结果 dict（可能为 None，或测的是别的频段）
       memo_rsrp 记忆里那条频段的典型 RSRP（没记过就是 None）
       cur_rsrp  当前驻留频段此刻的 RSRP
+      cur_loss  当前驻留频段此刻的丢包%；≥GUARD_BAD_LOSS 时「留在当前」
+                这个选项直接作废 —— 正在大量丢包的链路不能算「够用」
 
     依据的含义：
       weak_keep 记忆那条现在信号差一截，但当前这条够用 → 留在当前
@@ -2602,8 +2614,13 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
         if str(serving) != str(pinned_band):
             return int(pinned_band), "pinned"
         return int(serving), "pinned"
+    # 「当前这条够用吗」。快测说够用还不够，得看**此刻**的链路：
+    # 2026-10-31 17:34:21 实机，BAND 40 明明在丢 100% 的包，快测那个数字是
+    # 几分钟前量的，于是照样判「当前够用」→ 17:45 锁回了这条烂频段。
+    # 正在大量丢包的链路不能算够用，哪怕它刚才测出来挺快。
+    dropped = cur_loss is not None and cur_loss >= GUARD_BAD_LOSS
     cur_ok = bool(quick and quick.get("ok") and serving
-                  and quick.get("band") == serving)
+                  and quick.get("band") == serving and not dropped)
     cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
     # ① 先看信号，再看速度。记忆里的速度是过去某个时刻量的，而 RSRP 差
     #    10dB 是结构性的（穿墙、距离），锁上去今天的下场就是一路掉到掉线。
@@ -2933,24 +2950,29 @@ def _install_stop_signals():
             pass                        # 非主线程装不了，忽略
 
 
-def guard_still_reset(pci_changed, moving, bad_now, band_changed=False):
+def guard_still_reset(*, pci_changed, moving, band_changed=False):
     """这一拍要不要把「静止计时」清零。
 
-    只在真发生事的时候清：PCI 真变了，或者链路垮了。**不能写 if moving** ——
+    只在**位置信息真的变了**时清：人在动、且 PCI 确实换了。**不能写 if moving** ——
     moving 在最后一次换小区之后还会保持整整 GUARD_MOVE_WINDOW（300s），
     每一拍都清零等于把起点一直往后推，把「坐满 10 分钟」拖成最多 15 分钟。
     实机 2026-10-30：19:30 人就坐下了，19:34:55 才开始计时，19:44:29 才锁上。
 
     换频段（band_changed）也不清：那是设备自己重选，人还坐在原处。实机 21:46
     换了 BAND 3→40，计时被清零白等 2 分钟；要是设备爱换，就会永远坐不满 10 分钟。
+
+    **丢包/延迟（原来那个 bad_now）也不再清零**。2026-10-31 17:39 用户实机：
+    锁着 BAND 40，40 丢包 100%，第一拍就把已经攒够的静止时间清零回 0/10，
+    人还坐在原处没动。链路垮是链路的事，它该走「换备选 / 解锁自救」那条路；
+    顺手把「我在这儿坐够了」这个已经成立的结论作废，只是让人白等。
     """
     if band_changed:
         return False
     # 「PCI 变了」本身也不清。设备会在两个扇区之间自己重选，人还坐在原处：
     # 2026-10-31 实机静止 144 分钟（早够 10 分钟了），15:59 设备换了个小区，
     # 计时直接归零、回到「未锁 0/10」，等于白等。真正人在动时 pci_changed 与
-    # moving 会同时成立，链路垮了则由 bad_now 兜底。
-    return bool((pci_changed and moving) or bad_now)
+    # moving 必然同时成立，所以这一条就够了。
+    return bool(pci_changed and moving)
 
 
 def run_guard(args, cfg):
@@ -3123,12 +3145,14 @@ def run_guard(args, cfg):
                 # 人没动、设备自己换的小区 → 记进同一处，这地方以后认得它
                 note_cell_change(last_key, _site_key(st))
             last_key = _site_key(st)
-            # 静止计时只在「这一刻真发生了事」时归零：PCI 真的变了，或者链路垮了。
+            # 静止计时只在「位置真的变了」时归零：人在动、且 PCI 确实换了。
             # 原来写的是 if moving —— 而 moving 在最后一次换小区之后还会继续保持
             # 整整 GUARD_MOVE_WINDOW（300s），于是每一轮都把起点往后推，把「坐满
             # 10 分钟」拖成最多 15 分钟。实机 2026-10-30 19:30 人就坐下了，
             # 19:34:55 才开始计时，19:44:29 才锁上。
-            if guard_still_reset(pci_changed, moving, bad_now,
+            # 丢包/延迟也不清了：2026-10-31 17:39 锁着 BAND 40、40 丢包 100%，
+            # 第一拍就把坐够的时间作废，人还在原地。
+            if guard_still_reset(pci_changed=pci_changed, moving=moving,
                                  band_changed=band_changed):
                 stable_since = now
             still = now - stable_since
@@ -3241,12 +3265,18 @@ def run_guard(args, cfg):
                         pci_log.clear()
                     bad_streak = 0
                     quick, quick_done = None, False
+                    # 自救之后要给它一点时间落地。静止计时现在不再被丢包清零，
+                    # 解锁后的下一拍 still 早就 >= settle，不拦一下就会「解锁 →
+                    # 立刻锁回刚被证伪的那条 → 又 100% 丢包」，白断一轮网。
+                    # 冷却只挡「主动锁」，不挡自救（unlock/measure 都在它前面判）。
+                    next_allowed = time.time() + GUARD_COOLDOWN
                 elif action == "unlock":
                     _guard_unlock(dev, locked_band)
                     unlocked_at = time.time()
                     pci_log.clear()
                     bad_streak = 0
                     quick, quick_done = None, False
+                    next_allowed = time.time() + GUARD_COOLDOWN
                 elif action == "lock":
                     # 久坐才走到这里（路过不锁）。锁哪一条交给 guard_pick_lock：
                     # 它会把「记忆里的历史最优」和「刚才快测到的当前速度」放在一起比。
@@ -3258,7 +3288,7 @@ def run_guard(args, cfg):
                         band, kind = guard_pick_lock(
                             memo, memo_best, serving, quick,
                             memo_rsrp=memo_rsrp, cur_rsrp=rsrp,
-                            pinned_band=pinned)
+                            pinned_band=pinned, cur_loss=ping["loss"])
                         # 记忆里的最优「没记过信号」时，不能永远绕过去。
                         # 用户 2026-10-31：「在一个熟悉的地方要优先锁历史记录里
                         # 最优的，最近这几次锁定看起来没有验证记忆」。

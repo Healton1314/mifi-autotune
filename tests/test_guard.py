@@ -339,6 +339,41 @@ class PickLockBand(unittest.TestCase):
                                        quick=self._q(40, 44.0))
         self.assertEqual((band, kind), (40, "memo"))
 
+    # ---- 当前这条正在大量丢包时，「留在当前」这个选项必须作废 ----
+    # 2026-10-31 17:34:21 实机：BAND 40 丢包 100%，快测那个数字是几分钟前量的，
+    # 于是判「当前够用」→ 17:45 锁回这条正在掉包的频段。
+
+    def test_losing_current_band_is_not_kept(self):
+        # 快测说 40 有 32 Mbps（本来够格「留在当前」），但此刻正在丢 100% 的包
+        # → 不能算够用，改走记忆里的最优
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=20.0, serving=40,
+                                       quick=self._q(40, 32.0),
+                                       memo_rsrp=-80, cur_rsrp=-78, cur_loss=100)
+        self.assertEqual((band, kind), (3, "memo"))
+
+    def test_losing_current_without_memory_means_measure(self):
+        # 记忆没记信号（blind）+ 当前在丢包 → 该老实体检，不是「先不赌、锁当前」
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=23.0, serving=40,
+                                       quick=self._q(40, 32.0),
+                                       memo_rsrp=None, cur_rsrp=-78, cur_loss=100)
+        self.assertIsNone(band)
+        self.assertEqual(kind, "blind")
+
+    def test_clean_current_band_is_still_kept(self):
+        # 对照组：同样条件、丢包 0% → 照旧留在当前，别把正常情况也推翻
+        band, kind = A.guard_pick_lock(memo=3, memo_mbps=20.0, serving=40,
+                                       quick=self._q(40, 32.0),
+                                       memo_rsrp=-80, cur_rsrp=-78, cur_loss=0)
+        self.assertEqual((band, kind), (40, "keep"))
+
+    def test_pin_beats_lossy_current(self):
+        # 人指定过的优先级最高：当前在丢包也不改结论
+        band, kind = A.guard_pick_lock(memo=40, memo_mbps=44.6, serving=40,
+                                       quick=self._q(40, 32.0),
+                                       memo_rsrp=-78, cur_rsrp=-78,
+                                       pinned_band=3, cur_loss=100)
+        self.assertEqual((band, kind), (3, "pinned"))
+
 
 class MemoSpeed(unittest.TestCase):
     def setUp(self):
@@ -428,22 +463,25 @@ class StillReset(unittest.TestCase):
     """
 
     def test_no_reset_while_only_the_window_lags(self):
-        # moving 为真、但这一拍 PCI 没变、链路也正常 → 不能清零
-        self.assertFalse(A.guard_still_reset(False, True, False))
+        # moving 为真、但这一拍 PCI 没变 → 不能清零（链路垮了也一样）
+        self.assertFalse(A.guard_still_reset(pci_changed=False, moving=True))
 
     def test_reset_on_real_change(self):
-        self.assertTrue(A.guard_still_reset(True, True, False))
+        self.assertTrue(A.guard_still_reset(pci_changed=True, moving=True))
 
-    def test_reset_when_link_dies(self):
-        self.assertTrue(A.guard_still_reset(False, True, True))
+    def test_link_death_does_not_reset(self):
+        """链路垮了不清零（连带把「安静的一拍不清零」一起覆盖了）。
 
-    def test_quiet_sample_does_not_reset(self):
-        self.assertFalse(A.guard_still_reset(False, False, False))
+        2026-10-31 17:39 用户实机：锁着 BAND 40，40 丢包 100%，第一拍就把
+        已经攒够的静止时间清零回「0/10」，而人还坐在原处。丢包是链路的事，
+        该走「换备选 / 解锁自救」，不该把「我在这儿坐够了」这个结论作废。
+        """
+        self.assertFalse(A.guard_still_reset(pci_changed=False, moving=False))
 
     def test_band_switch_does_not_reset(self):
         # 设备自己换频段：PCI 变了、链路也断了，但人坐在原处，计时接着数。
         # 实机 21:46 这一下白等了 2 分钟；设备要是爱换，就永远坐不满 10 分钟。
-        self.assertFalse(A.guard_still_reset(True, False, True,
+        self.assertFalse(A.guard_still_reset(pci_changed=True, moving=False,
                                             band_changed=True))
 
     def test_ten_minutes_means_ten_minutes(self):
@@ -455,7 +493,7 @@ class StillReset(unittest.TestCase):
         while t <= 1200:
             moving = (t - last_change) < window          # 尾巴
             pci_changed = False
-            if A.guard_still_reset(pci_changed, moving, False):
+            if A.guard_still_reset(pci_changed=pci_changed, moving=moving):
                 stable_since = t
             if t - stable_since >= settle and lock_at is None:
                 lock_at = t
