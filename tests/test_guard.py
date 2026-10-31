@@ -946,5 +946,66 @@ class PinOverridesLock(unittest.TestCase):
         self.assertFalse(A.pin_overrides_lock(40, None))
 
 
+class FlapAvoid(unittest.TestCase):
+    """当前这条信号更强、速度也还行，但记忆里它会周期性掉包 —— 别锁它。
+
+    2026-10-31 21:14 实测：BAND 40 是 -77dBm、比记忆里的 BAND 3 强 21dB，
+    信号闸门（差超过 10dB 就留在当前）当场放行，锁定 BAND 40；21:16:31 它
+    丢掉 50% 的包。信号强度和「会不会周期性掉包」是两件独立的事，而后者只有
+    历史样本看得出来 —— RSRP 再漂亮也证明不了。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+        self._json = json
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _q(self):
+        return {"band": 40, "ok": True, "mbps": 16.0, "avg": 56, "loss": 0}
+
+    def test_flap_beats_signal_strength(self):
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=22.0, serving=40, quick=self._q(),
+            memo_rsrp=-98, cur_rsrp=-77, cur_flap=True)
+        self.assertEqual((band, kind), (3, "flap_avoid"))
+
+    def test_clean_current_still_wins_on_signal(self):
+        # 当前这条没掉包前科：原来那条「信号差 21dB 就留在当前」照旧生效
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=22.0, serving=40, quick=self._q(),
+            memo_rsrp=-98, cur_rsrp=-77, cur_flap=False)
+        self.assertEqual((band, kind), (40, "weak_keep"))
+
+    def test_flap_does_not_touch_the_band_already_locked(self):
+        # 已经在记忆最优上时不需要「避免」什么
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=22.0, serving=3, quick={"band": 3, "ok": True,
+                                                      "mbps": 20.0, "avg": 60, "loss": 0},
+            memo_rsrp=-98, cur_rsrp=-98, cur_flap=True)
+        self.assertEqual(band, 3)
+
+    def test_site_band_flap_reads_history(self):
+        # 样本格式 [小时, 速度, 丢包%, 延迟, RSRP]
+        rows = [[9, 16.0, 0, 60, -77], [10, 16.0, 50, 154, -78],
+                [11, 16.0, 0, 65, -77], [12, 16.0, 80, 600, -78]]
+        self.tmp.write_text(self._json.dumps({"236-CMCC": {
+            "seen": 4, "last": "2026-10-31T21:00:00", "best": 3,
+            "bands": {"3": {"ok": 4, "best": 22.0, "dead": 0},
+                      "40": {"ok": 4, "best": 40.7, "dead": 0, "samples": rows}}}},
+            ensure_ascii=False), encoding="utf-8")
+        st = {"band": 40, "signal": {"pci": "236", "operator": "CMCC"}}
+        self.assertTrue(A.site_band_flap(st, 40))
+        self.assertFalse(A.site_band_flap(st, 3))     # 没样本 → 不定罪
+        self.assertFalse(A.site_band_flap(st, None))
+
+
 if __name__ == "__main__":
     unittest.main()
