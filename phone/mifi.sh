@@ -75,7 +75,23 @@ case "${1:-}" in
     [ -f "$DIR/phone/install.sh" ] || { red "[×] 找不到 phone/install.sh"; exit 1; }
     # 先拷一份再执行：install.sh 会 rm -rf 整个目录，脚本自己也在里面
     cp "$DIR/phone/install.sh" "$HOME/.mifi-install.sh"
-    exec bash "$HOME/.mifi-install.sh" -f
+    # 升级会把 $DIR 整个删掉重建。如果动手时 shell 正站在这个目录里，它脚下
+    # 的 inode 就没了 —— 之后每条命令都会先刷一行
+    # `getcwd: cannot access parent directories: No such file or directory`。
+    # 子进程改不了父 shell 的 cwd，所以这里不 exec（exec 掉就没机会说话了），
+    # 装完判断一下再明确告诉用户敲 cd ~。
+    # 2026-10-31 实机：升级完 mifi --lock-band 3 前就出现了这行，容易让人以为
+    # 命令本身出错。
+    _was_in_dir=0
+    [ "$PWD" = "$DIR" ] && _was_in_dir=1
+    bash "$HOME/.mifi-install.sh" -f
+    _upd_rc=$?
+    if [ "$_was_in_dir" = "1" ]; then
+      printf '\n\033[33m[提示] 升级重建了 %s，而你正站在里面。\033[0m\n' "$DIR"
+      printf '\033[33m       执行 cd ~ 恢复（这条报错 getcwd 之后出现是正常的，\033[0m\n'
+      printf '\033[33m       mifi 命令本身没受影响）。\033[0m\n'
+    fi
+    exit "$_upd_rc"
     ;;
   --stop)
     # 守护可能开在另一个窗口/后台，Ctrl+C 未必按得到（手机上要先进扩展键栏
