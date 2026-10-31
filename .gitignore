@@ -28,3 +28,6 @@ build/
 Thumbs.db
 .idea/
 .vscode/
+
+# 实机位置记忆的临时备份（含真实 PCI/速度），别提交
+sites.json.bak*
