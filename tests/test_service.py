@@ -56,16 +56,24 @@ class TestSignalUsable(unittest.TestCase):
 class TestWaitForService(unittest.TestCase):
     def test_registers_immediately(self):
         dev = FakeDev([state(band=40, rsrp="-88dBm")])
-        status, waited = autotune.wait_for_service(dev, 40, **FAST)
+        status, waited = autotune.wait_for_service(dev, 40, step=0.05, timeout=5.0)
         self.assertEqual(status, "ok")
-        self.assertLess(waited, 0.3)
+        self.assertLess(waited, 1.0)
 
     def test_dead_band_skipped_early(self):
-        """一直报无效 RSRP → 应该判 no_signal，而不是耗到 timeout。"""
+        """一直报无效 RSRP → 应该判 no_signal，而不是耗到 timeout。
+
+        timeout 特意给到 5 秒：要证明的是「提前跳过」，那就得让 timeout 和
+        「3 轮轮询本身的耗时」拉开量级。原来用 FAST 的 timeout=0.3，跟 3 次
+        轮询同一个量级 —— macOS runner 上 sleep 稍慢一点就变成
+        `AssertionError: 0.3 not less than 0.3`，2026-10-31 CI 唯一失败的用例。
+        真实设备上 timeout 是 SETTLE_SEC+10（几十秒），这里只要明显小于它即可。
+        """
         dev = FakeDev([state(band=38, rsrp="0")])
-        status, waited = autotune.wait_for_service(dev, 38, **FAST)
+        status, waited = autotune.wait_for_service(
+            dev, 38, step=0.05, timeout=5.0, dead_confirm=3)
         self.assertEqual(status, "no_signal")
-        self.assertLess(waited, 0.3)
+        self.assertLess(waited, 2.0)      # 5 秒的四成，留足慢机器余量
 
     def test_wrong_band_times_out(self):
         """有信号但一直停在别的频段 → 说明锁频段没生效，判 timeout。"""
