@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -183,6 +183,15 @@ GUARD_LOCK_RSRP_DROP = 10           # 记忆最优比当前驻留差这么多 dB
 # 掉 30~50%，会导致守护反复解锁 —— 越解越像「厂商的自动」，而这正是要治的病。
 # 只有「完全不通」或「丢包过半」才算真的撑不住。
 GUARD_BAD_LOSS = 50
+
+# 「去验一次记忆里的最优」的最短间隔。记忆里那条最优没记过信号时只能实测，
+# 但实测 = 切两次频段 ≈ 2~3 分钟断网，所以每处限频，绝不能变成周期性测速
+# （用户明确反对：发热、卡顿）。实机 2026-10-31 一整早都没验过，就是因为
+# 压根没有这条路 —— 只有「不敢锁」和「干脆锁当前」两个选项。
+GUARD_VERIFY_HOURS = 20
+# 丢包留档的最小间隔：样本槽只有 8 个，30 秒一条会四分钟就填满，
+# 全被同一次掉包占满，反而看不出「周期性」。
+GUARD_LOSS_NOTE_SEC = 120
 
 # 决赛：第二名和第一名的差距小于这个比例时，两个都要复测。
 # 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
@@ -2563,6 +2572,67 @@ def note_band_rsrp(key, band, rsrp):
         return
 
 
+def site_verify_due(key, now=None, hours=GUARD_VERIFY_HOURS):
+    """这个位置该不该「去验一次记忆里的最优」。
+
+    只在这种情况问：记忆里那条最优没记过信号 —— 靠猜永远猜不出它现在值不值得锁，
+    只能切过去实测一次。限频是为了别把「验证」变成用户最烦的周期性测速。
+    """
+    if not key:
+        return False
+    data = load_sites()
+    rec = data.get(find_site(data, key)) or {}
+    ts = rec.get("verified_at")
+    if not ts:
+        return True
+    try:
+        last = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return True
+    return (now or datetime.now()) - last >= timedelta(hours=hours)
+
+
+def mark_site_verified(key):
+    """记下「这个位置的最优刚验过」，给 site_verify_due 限频用。"""
+    if not key:
+        return
+    data = load_sites()
+    rec = data.get(find_site(data, key))
+    if not rec:
+        return
+    rec["verified_at"] = datetime.now().isoformat(timespec="seconds")
+    save_sites(data)
+
+
+def note_band_loss(key, band, loss, avg=None, rsrp=None):
+    """守护采样里出现高丢包 → 记进这个位置该频段的滚动样本。
+
+    为什么必须留痕：band_flap 只认样本，而样本原来只有体检才写。于是
+    BAND 40 昨晚体检 80% 丢包、今天 12:21 又 40% 丢包，记忆里却一直是
+    「40.7 Mbps、干净」，守护每次来都优先锁它 —— 用户的原话是
+    「BAND 40 丢包很严重，放我宿舍的次优项」。丢包不留痕，就永远选不出次优。
+    """
+    if not key or band is None:
+        return
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key))
+        if not rec:
+            return
+        v = (rec.get("bands") or {}).get(str(int(band)))
+        if not isinstance(v, dict):
+            return
+        samples = v.setdefault("samples", [])
+        now = datetime.now()
+        r = _num(rsrp)
+        samples.append([now.hour, 0.0, int(round(float(loss or 0))),
+                        int(_num(avg) or 0), int(r) if r is not None else None])
+        del samples[:-SITE_SAMPLES]
+        save_sites(data)
+    except (TypeError, ValueError):
+        return
+
+
 def guard_memory_band(st):
     """久坐时：能不能凭「这个位置的历史」直接锁定？返回 (频段 or None, 说明)。
 
@@ -2663,6 +2733,50 @@ def _guard_plan_band(prefer=None):
     return band or prefer
 
 
+def _guard_verify_memo(dev, memo, serving, key, speed_url, host):
+    """切到记忆里那条最优，实地验一次；不够用就切回原频段。
+
+    用户 2026-10-31：「在一个熟悉的地方要优先锁历史记录里面最优的，最近这几次
+    锁定看起来没有验证记忆」。以前只有两条路 —— 记忆没记信号就「不敢锁它」，
+    然后锁当前这条。结果是记忆里的最优永远上不了台面，也永远攒不到信号，
+    一直 blind 下去（实机一整早都是这样，最后锁在 BAND 40，而用户说
+    BAND 40 丢包严重、只是次优项）。
+
+    返回 (最终停在哪个频段, 记忆那条到底顶不顶用)。顶用 → 调用方直接认定已锁；
+    不顶用 → 调用方按原逻辑往下走（当前这条够用就锁它，不够用才跑体检）。
+    """
+    print(f"      → 记忆里的最优是 BAND {memo}，但从来没记过信号 —— 与其猜，"
+          f"切过去实测一次（两次切换，约 2~3 分钟断网）", flush=True)
+    if not _guard_lock_band(dev, memo):
+        print(f"      [!] BAND {memo} 切不过去，这次还是按原逻辑处理", flush=True)
+        return None, False
+    try:
+        st = dev.get_state()
+    except Exception:  # noqa: BLE001
+        st = {}
+    rsrp = _num((st.get("signal") or {}).get("rsrp"))
+    if speed_url is None:
+        speed_url = probe.resolve_speed_url(None, verbose=False)
+    quick = guard_quick_probe(speed_url, host)
+    quick["band"] = memo
+    mbps = float(quick.get("mbps") or 0)
+    ok = bool(quick.get("ok"))
+    sig = f"{rsrp:.0f}dBm" if rsrp is not None else "—"
+    print(f"      → BAND {memo}：{mbps:.0f} Mbps ｜ 延迟 {quick.get('avg')}ms ｜ "
+          f"丢包 {quick.get('loss')}% ｜ RSRP {sig} → "
+          f"{'够用，就留在这一条' if ok else '不够用，切回去'}", flush=True)
+    record_site(key, [{"band": memo, "ok": ok, "mbps": mbps,
+                       "avg": quick.get("avg"), "loss": quick.get("loss"),
+                       "rsrp": rsrp}])
+    mark_site_verified(key)
+    if ok:
+        return memo, True
+    if serving and str(serving) != str(memo):
+        _guard_lock_band(dev, serving)
+        return serving, False
+    return None, False
+
+
 def _guard_measure(args, prefer=None):
     """跑一次完整体检，返回它选出的最优频段（读不到就是 None）。
 
@@ -2746,6 +2860,7 @@ def run_guard(args, cfg):
     speed_url = None
     pending_lock = None                  # 体检跑完后要落地的频段（见下面 after-exam 分支）
     pending_tries = 0                    # 落地失败的重试次数（3 次就认，别无限折腾设备）
+    last_loss_note = 0.0                 # 上次把「高丢包」写进记忆的时刻
 
     try:
         while True:
@@ -2832,6 +2947,14 @@ def run_guard(args, cfg):
             bad_now = (avg_ms is None or (ping["loss"] or 0) >= GUARD_BAD_LOSS
                        or avg_ms >= GUARD_LAG_MS)
             bad_streak = bad_streak + 1 if bad_now else 0
+
+            # 高丢包必须留痕。以前只有体检才写样本，于是「这条会周期性掉包」
+            # 这个判断永远拿不到证据：BAND 40 昨晚 80%、今天 12:21 又 40%，
+            # 记忆却一直干净，守护每次都优先锁它（用户原话：「BAND 40 丢包很严重」）。
+            if (not dry and serving and (ping["loss"] or 0) >= SITE_LOSS_BAD
+                    and now - last_loss_note >= GUARD_LOSS_NOTE_SEC):
+                note_band_loss(_site_key(st), serving, ping["loss"], avg_ms, rsrp)
+                last_loss_note = now
 
             pci_changed = (pci is not None and last_pci is not None
                            and pci != last_pci)
@@ -2986,7 +3109,27 @@ def run_guard(args, cfg):
                         band, kind = guard_pick_lock(
                             memo, memo_best, serving, quick,
                             memo_rsrp=memo_rsrp, cur_rsrp=rsrp)
-                        if kind == "weak_keep":
+                        # 记忆里的最优「没记过信号」时，不能永远绕过去。
+                        # 用户 2026-10-31：「在一个熟悉的地方要优先锁历史记录里
+                        # 最优的，最近这几次锁定看起来没有验证记忆」。
+                        # 日志里确实如此 —— 10:11 那次记忆写着 BAND 3 是 23 Mbps，
+                        # 因为没记信号就绕开，锁了 BAND 40，还把记忆的最优改成了 40，
+                        # 从此 BAND 3 再没被提起。所以这里先去看一眼。
+                        verified = False
+                        if (kind in ("blind_keep", "blind") and memo is not None
+                                and site_verify_due(key_now)):
+                            landed, memo_ok = _guard_verify_memo(
+                                dev, int(memo), serving, key_now, speed_url, host)
+                            if memo_ok:
+                                band = landed
+                                serving = locked_band = landed
+                                locked, bad_streak = True, 0
+                                verified = True
+                            # 记忆那条不顶用就落回原来的分支：当前够用 → 锁当前；
+                            # 不够用 → 跑体检。别在这里硬锁一条刚被证伪的。
+                        if verified:
+                            pass
+                        elif kind == "weak_keep":
                             print(f"      → 记忆里 BAND {memo} 当时只有 {memo_rsrp:.0f}dBm，"
                                   f"当前的 BAND {serving} 是 {rsrp:.0f}dBm"
                                   f"（差 {abs(rsrp - memo_rsrp):.0f}dB，超过 "
@@ -3001,7 +3144,12 @@ def run_guard(args, cfg):
                                   f"当前这条够用，先不赌，锁当前 BAND {serving}", flush=True)
                             _guard_lock_band(dev, band)
                             note_band_rsrp(key_now, band, rsrp)
-                            mark_site_provisional(key_now, band, force_best=True)
+                            # 这里原来带 force_best=True，等于用「刚才 20 秒快测
+                            # 当前这条不错」把「这个位置的最优」改写成当前频段。
+                            # 实机 2026-10-31：10:11 一次就把最优从 BAND 3 改成
+                            # BAND 40，12:31 再报「最优 BAND 40，直接锁定」——
+                            # 用户要的「熟悉的地方锁记忆最优」就是这么丢的。
+                            mark_site_provisional(key_now, band)
                         elif kind == "keep":
                             # 记忆里的最优可能是几天前、甚至换了 PCI 测的；
                             # 当前这条是几分钟前刚量的。差得不多就别切。
@@ -3139,6 +3287,74 @@ def _run_interactive(dev, caps, st0, args, cfg, speed_url, ping_host):
     return run_apply_plan(dev, caps, cur, args, cfg, ping_host)
 
 
+def pin_site_best(key, band):
+    """把「这个位置的最优」钉成用户指定的那条。
+
+    只有 --lock-band 会调它：那是用户明确说「就要这条」，不是程序在猜。
+    同时盖上 verified_at —— 已经照人说的锁了，就别再拿「没记信号」去实测一遍。
+    """
+    if not key or not band:
+        return
+    try:
+        data = load_sites()
+        real = find_site(data, key)
+        rec = data.get(real)
+        if not rec:
+            return
+        rec["best"] = int(band)
+        rec["verified_at"] = datetime.now().isoformat(timespec="seconds")
+        rec["pinned"] = int(band)
+        save_sites(data)
+    except (TypeError, ValueError):
+        return
+
+
+def run_lock_band(dev, args):
+    """直接锁到指定频段：不测速、不裁决，只切一次。
+
+    为什么需要这条：用户的场景是「BAND 40 丢包严重，我知道 BAND 3 才是首选」。
+    他要的是把设备锁过去，而不是再花 6 分钟体检、然后被「当前这条更快」说服
+    又锁回 BAND 40。体检仍是最好的默认，但「我已经知道答案」时要有一条不啰嗦的路。
+    """
+    band = int(args.lock_band)
+    print(f"\n[锁定] 直接切到 BAND {band}（不测量、不裁决，只切一次）")
+    try:
+        print(f"  当前：{dev.get_state().get('band') or '自动'}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        dev.set_band(band)
+    except DeviceUnreachable:
+        pass                        # 射频重启把连接掐了，指令通常已经送达
+    except Unsupported as e:
+        print(f"[跳过] {e}")
+        return 2
+    except Exception as e:  # noqa: BLE001
+        print(f"[×] 锁定失败：{type(e).__name__}: {e}")
+        return 1
+    if not wait_device_back(dev, timeout=60, poll=3):
+        print("[!] 设备 60 秒没回来；指令多半已生效，稍后用 --status 确认")
+        return 1
+    st, sig = {}, {}
+    try:
+        st = dev.get_state()
+        sig = st.get("signal") or {}
+    except Exception:  # noqa: BLE001
+        pass
+    cur = st.get("band") or 0
+    print(f"[√] 已锁定 BAND {cur or band}"
+          f"（RSRP {sig.get('rsrp') or '—'}，PCI {sig.get('pci') or '—'}）")
+    try:
+        pin_site_best(_site_key(st), band)
+    except Exception:  # noqa: BLE001
+        pass
+    if cur and str(cur) != str(band):
+        print(f"[!] 读回来是 BAND {cur}，不是 {band} —— 这台设备可能不支持这条")
+        return 1
+    print("  出门前记得：mifi --restore")
+    return 0
+
+
 def main():
     cfg = load_config()
 
@@ -3149,6 +3365,8 @@ def main():
     ap.add_argument("--bands", default="default",
                     help="default=设备声明的全部频段 / preferred=配置里的子集 / 逗号分隔如 3,40")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
+    ap.add_argument("--lock-band", type=int, metavar="N",
+                    help="直接锁到指定频段（只切一次，不测量）；出门前记得 --restore")
     ap.add_argument("--observe", type=int, default=OBSERVE_SEC, metavar="秒",
                     help=f"应用后盯多少秒确认稳定（0 = 不盯，默认 {OBSERVE_SEC}）")
     ap.add_argument("--fresh", action="store_true",
@@ -3311,7 +3529,8 @@ def main():
     # 动手测之前先确认「测速源真的下得动」。
     # 实测踩过：整条链路 HTTPS 到 CDN 全失败（HTTP 正常），于是每个频段都测出
     # 0 Mbps，工具据此推荐了错误的频段。先选源能把这类假结论挡在源头。
-    if not (args.watch or args.restore or args.apply_plan or args.list_drivers):
+    if not (args.watch or args.restore or args.apply_plan or args.list_drivers
+            or args.lock_band):
         speed_url = probe.resolve_speed_url(speed_url)
 
     if args.guard:
@@ -3384,6 +3603,9 @@ def main():
 
     if args.apply_plan:
         return run_apply_plan(dev, caps, st0, args, cfg, ping_host)
+
+    if args.lock_band:
+        return run_lock_band(dev, args)
 
     if args.restore:
         # 还原是「断网时救命」的命令，绝不能崩。切频段会让射频重启，紧接着

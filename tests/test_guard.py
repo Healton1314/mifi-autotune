@@ -607,5 +607,72 @@ class GuardPlanBand(unittest.TestCase):
         self.assertEqual(A._guard_plan_band(prefer=3), 3)
 
 
+class VerifyMemory(unittest.TestCase):
+    """熟悉的地方要「验证记忆」，而不是永远绕过去。
+
+    实机 2026-10-31：记忆里 BAND 3 是 23 Mbps 但没记 RSRP，守护 10:11 那次
+    直接判定「不敢赌」锁了 BAND 40，还把记忆的最优改写成 40。用户原话：
+    「在一个熟悉的地方要优先锁历史记录里面最优的，最近这几次锁定看起来没有验证记忆」。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+        from datetime import datetime, timedelta
+        from pathlib import Path
+        from unittest import mock
+        self.json, self.dt = json, datetime
+        self.timedelta = timedelta
+        self.SITES = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.SITES)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _rec(self, **kw):
+        rec = {"seen": 2, "last": self.dt.now().isoformat(timespec="seconds"),
+               "best": 3, "bands": {"3": {"ok": 2, "best": 23.0},
+                                    "40": {"ok": 3, "best": 40.7}}}
+        rec.update(kw)
+        self.SITES.write_text(self.json.dumps({"350-CMCC": rec}), encoding="utf-8")
+
+    def test_never_verified_is_due(self):
+        self._rec()
+        self.assertTrue(A.site_verify_due("350-CMCC"))
+
+    def test_verified_recently_is_not_due(self):
+        self._rec(verified_at=self.dt.now().isoformat(timespec="seconds"))
+        self.assertFalse(A.site_verify_due("350-CMCC"))
+
+    def test_verified_long_ago_is_due_again(self):
+        ago = (self.dt.now() - self.timedelta(hours=A.GUARD_VERIFY_HOURS + 1))
+        self._rec(verified_at=ago.isoformat(timespec="seconds"))
+        self.assertTrue(A.site_verify_due("350-CMCC"))
+
+    def test_mark_verified_closes_the_window(self):
+        self._rec()
+        A.mark_site_verified("350-CMCC")
+        self.assertFalse(A.site_verify_due("350-CMCC"))
+
+    def test_high_loss_samples_turn_into_flap(self):
+        # BAND 40 昨晚 80%、今天 12:21 又 40% —— 这些采样必须留痕，
+        # 否则 band_flap 永远拿不到证据，记忆里 40 一直是「干净又快」。
+        self._rec()
+        for loss in (40, 25, 80):
+            A.note_band_loss("350-CMCC", 40, loss, avg=80, rsrp=-80)
+        data = self.json.loads(self.SITES.read_text(encoding="utf-8"))
+        flip = A.band_flap(data["350-CMCC"]["bands"]["40"])
+        self.assertTrue(flip[0], f"三条高丢包样本应该判成掉包，实际 {flip}")
+
+    def test_pin_best_is_what_the_user_asked_for(self):
+        self._rec()
+        A.pin_site_best("350-CMCC", 3)
+        data = self.json.loads(self.SITES.read_text(encoding="utf-8"))
+        self.assertEqual(data["350-CMCC"]["best"], 3)
+        self.assertEqual(data["350-CMCC"]["pinned"], 3)
+        self.assertFalse(A.site_verify_due("350-CMCC"))
+
+
 if __name__ == "__main__":
     unittest.main()
