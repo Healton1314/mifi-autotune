@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -3076,6 +3076,21 @@ def note_band_rsrp(key, band, rsrp):
         return
 
 
+def note_band_rsrp_at(key, band, serving, rsrp):
+    """只有「要锁的这条」正是刚才读信号的那条，才把 RSRP 写进记忆。
+
+    守护循环里那个 rsrp 是**当前驻留频段**的信号。切到别的频段去锁的时候，
+    这个数字属于别人 —— 记到目标频段名下就是造假，而且会反过来污染下一次
+    的信号闸门：BAND 3 实际是 -100dBm，被写成 BAND 40 的 -77dBm，下次就
+    会判「记忆里那条信号很好」而锁上去，锁上去才发现根本不通。
+
+    缺的那次采样 5 分钟后的定时采样（GUARD_RSRP_NOTE_SEC）会补，不会丢。
+    """
+    if serving is None or band is None or str(band) != str(serving):
+        return
+    note_band_rsrp(key, band, rsrp)
+
+
 def site_verify_due(key, now=None, hours=GUARD_VERIFY_HOURS):
     """这个位置该不该「去验一次记忆里的最优」。
 
@@ -3235,6 +3250,14 @@ def guard_memory_band(st):
     if (v.get("dead") or 0) >= DEAD_SKIP_MIN and not (v.get("ok") or 0):
         return None, f"记忆里的最优 BAND {band} 现在没覆盖"
     if band_flap(v)[0]:
+        # 最优会周期性掉包 → 退而求其次，用记忆里另一条稳的。
+        # 直接跑体检要断好几次网、耗 5 分钟；而「哪条稳」记忆里早写着。
+        # 2026-10-31 21:36 实机就是这么白跑了一次体检：明知道 BAND 40 会掉包，
+        # 也知道 BAND 3 不会，却还是从头把 6 条频段各测一遍。
+        alt = guard_alt_band(st, skip=band)
+        if alt:
+            return alt, (f"记忆里的最优 BAND {band} 会周期性掉包，"
+                         f"改用稳的 BAND {alt}")
         return None, f"记忆里的最优 BAND {band} 会周期性掉包"
     nm = str(rec.get("name") or "").strip()
     where = f"「{nm}」" if nm else "这个位置"
@@ -3775,14 +3798,14 @@ def run_guard(args, cfg):
                                   f"{GUARD_LOCK_RSRP_DROP}dB 就不锁它了），锁当前这条",
                                   flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                             mark_site_provisional(key_now, band, force_best=True)
                         elif kind == "blind_keep":
                             print(f"      → 记忆里 BAND {memo} 是 {memo_best:.0f} Mbps，"
                                   f"但当时没记信号，说不准它现在还能不能用；"
                                   f"当前这条够用，先不赌，锁当前 BAND {serving}", flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                             # 这里原来带 force_best=True，等于用「刚才 20 秒快测
                             # 当前这条不错」把「这个位置的最优」改写成当前频段。
                             # 实机 2026-10-31：10:11 一次就把最优从 BAND 3 改成
@@ -3798,7 +3821,7 @@ def run_guard(args, cfg):
                                   f"{float(quick.get('mbps') or 0):.0f} Mbps"
                                   f"（差不到 {gap}%），锁当前这条，不切换", flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "pinned":
                             # 人已经替它做过决定了。这里不再比速度、不再看
                             # RSRP 差几 dB、不再问「当前够不够用」。
@@ -3808,7 +3831,7 @@ def run_guard(args, cfg):
                                   flush=True)
                             _guard_lock_band(dev, band)
                             set_device_pin(band)      # 位置级命中时也补上设备级
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "memo_bad_alt":
                             # 记忆说这条最优，可它刚刚被量到 3 Mbps。别锁它，
                             # 换记忆里另一条 —— 这一步几乎不断网，比跑体检快得多。
@@ -3824,21 +3847,21 @@ def run_guard(args, cfg):
                         elif kind == "memo":
                             print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "flap_avoid":
                             # 当前这条信号更强，但记忆里它会周期性掉包。
                             # 强信号 + 周期性掉包 = 用起来一直在卡，不如稳的那条。
                             print(f"      → 当前 BAND {serving} 信号更强，可它在记忆里"
                                   f"会周期性掉包 —— 锁稳的 BAND {band}", flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "quick":
                             print(f"      → 当前 BAND {serving} 快测够用"
                                   f"（{float(quick.get('mbps') or 0):.0f} Mbps / "
                                   f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
                                   flush=True)
                             _guard_lock_band(dev, band)
-                            note_band_rsrp(key_now, band, rsrp)
+                            note_band_rsrp_at(key_now, band, serving, rsrp)
                             mark_site_provisional(key_now, band)
                         else:
                             why = ("记忆里的最优现在信号差太多、当前这条也不够用"

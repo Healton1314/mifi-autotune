@@ -151,6 +151,34 @@ class GuardMemoryFirst(unittest.TestCase):
         self.assertIsNone(band)
         self.assertIn("掉包", why)
 
+    def test_flappy_best_falls_back_to_stable_one(self):
+        """最优会掉包、但记忆里还有一条稳的 → 用那条，别跑 5 分钟体检。
+
+        实机 2026-10-31 21:36（宿舍）：记忆早知道 BAND 40 会周期性掉包、
+        BAND 3 不会，守护还是选择「跑一次完整体检」—— 断网几次、耗 5 分钟，
+        只为重新发现一个已经写在记忆里的结论。
+        """
+        self._write({"seen": 6, "last": self.ago(hours=1), "best": 40,
+                     "bands": {"40": {"dead": 0, "ok": 4, "best": 43.0,
+                                      "samples": [[12, 40, 60, 90], [12, 40, 5, 70],
+                                                  [12, 40, 45, 88]]},
+                               "3": {"dead": 0, "ok": 3, "best": 23.0}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertEqual(band, 3)
+        self.assertIn("BAND 40 会周期性掉包", why)
+        self.assertIn("BAND 3", why)
+
+    def test_flappy_best_and_no_stable_alt_still_means_measure(self):
+        """记忆里只有那一条会掉包的 → 没得选，老老实实重测。"""
+        self._write({"seen": 4, "last": self.ago(hours=1), "best": 40,
+                     "bands": {"40": {"dead": 0, "ok": 4, "best": 43.0,
+                                      "samples": [[12, 40, 60, 90], [12, 40, 5, 70],
+                                                  [12, 40, 45, 88]]},
+                               "3": {"dead": 5, "ok": 0}}})
+        band, why = A.guard_memory_band(self._st())
+        self.assertIsNone(band)
+        self.assertIn("掉包", why)
+
     def test_dead_best_means_measure(self):
         self._write({"seen": 4, "last": self.ago(hours=1), "best": 38,
                      "bands": {"38": {"dead": 6, "ok": 0}}})

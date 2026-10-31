@@ -780,6 +780,23 @@ class NoteBandRsrp(unittest.TestCase):
         bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
         self.assertNotIn("rsrp", bands["40"])
 
+    def test_only_write_signal_of_the_band_we_are_locking(self):
+        """要锁的不是刚读信号的那条时，别把别人的 RSRP 写进来。
+
+        实机 2026-10-31 21:36（宿舍）：当前驻留 BAND 40 是 -77dBm，因为记忆里
+        BAND 3 不会掉包、BAND 40 会，守护切去锁 BAND 3。那一拍的 rsrp 变量里
+        装的是 **BAND 40** 的 -77dBm；原样写进去，记忆就变成「BAND 3 有 -77dBm」，
+        下次信号闸门会认为它信号很好而主动锁上去 —— 而它实际只有 -100dBm。
+        """
+        A.note_band_rsrp_at("350-CMCC", 3, 40, -77)
+        bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
+        self.assertNotIn("rsrp", bands["3"])
+
+    def test_write_signal_when_band_matches(self):
+        A.note_band_rsrp_at("350-CMCC", 40, 40, -79)
+        bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
+        self.assertEqual(bands["40"]["rsrp"], -79)
+
     def test_unknown_pci_gets_its_own_record(self):
         """还没建过档的 PCI 也要能写进去 —— 这就是「两个模式共用一套记忆」。
 
