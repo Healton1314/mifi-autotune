@@ -780,5 +780,26 @@ class DevicePin(unittest.TestCase):
         self.assertEqual(A.device_pin(), 3)
 
 
+class PinOverridesLock(unittest.TestCase):
+    """设备锁着的不是人要的那条，就该纠正 —— 而不是当成「已锁好」纯监控。
+
+    实机 2026-10-31 17:11：pin=3，设备被外部锁在 BAND 40，守护显示
+    「锁定 BAND 40」一路纯监控，pinned 连读都没读到。
+    """
+
+    def test_locked_elsewhere_is_not_ok(self):
+        self.assertTrue(A.pin_overrides_lock(40, 3))
+
+    def test_locked_as_wanted_is_ok(self):
+        self.assertFalse(A.pin_overrides_lock(3, 3))
+
+    def test_auto_is_left_to_normal_flow(self):
+        self.assertFalse(A.pin_overrides_lock(0, 3))
+
+    def test_no_pin_means_hands_off(self):
+        # 人没指定时，设备锁在哪就是哪 —— 别把用户手动锁的频段改掉
+        self.assertFalse(A.pin_overrides_lock(40, None))
+
+
 if __name__ == "__main__":
     unittest.main()
