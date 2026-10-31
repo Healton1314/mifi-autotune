@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.8"
+__version__ = "0.7.9"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2668,9 +2668,10 @@ def pin_overrides_lock(locked_band, pin_goal):
 
 def guard_pick_lock(memo, memo_mbps, serving, quick,
                     memo_rsrp=None, cur_rsrp=None, pinned_band=None,
-                    cur_loss=None):
+                    cur_loss=None, alt_band=None):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
-    依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind}。
+    依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind,
+            memo_bad, memo_bad_alt}。
 
       memo      记忆里的最优频段（None = 没有可信记忆）
       memo_mbps 记忆里那条的历史最好速度
@@ -2680,6 +2681,7 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       cur_rsrp  当前驻留频段此刻的 RSRP
       cur_loss  当前驻留频段此刻的丢包%；≥GUARD_BAD_LOSS 时「留在当前」
                 这个选项直接作废 —— 正在大量丢包的链路不能算「够用」
+      alt_band  记忆里的次优频段（当前这条被证伪时用它；没有就是 None）
 
     依据的含义：
       weak_keep 记忆那条现在信号差一截，但当前这条够用 → 留在当前
@@ -2690,6 +2692,8 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       memo      记忆里的最优明显更快且信号不差 → 切过去（值得断那几秒）
       quick     没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
       pinned    用户用 --lock-band 亲手指定过 → 照办，不过信号闸门
+      memo_bad     记忆里的最优就是当前这条，可它刚被实测判为不够用 → 跑体检
+      memo_bad_alt 同上，但记忆里还有一条能换 → 换过去，别锁这条
     返回 (None, None) 表示信息不够，该老老实实跑一次完整体检。
     """
     # ⓪ 用户亲手钉的优先。放在所有启发式之前：那些规则是「程序猜」，而
@@ -2706,6 +2710,19 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     cur_ok = bool(quick and quick.get("ok") and serving
                   and quick.get("band") == serving and not dropped)
     cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
+    # ⓪b 记忆里的「最优」正好就是当前驻留的这条，而刚才的实测判它不够用。
+    #     这是被「基站拥塞」咬得最准的一种情况：信号指标漂亮，速度塌了。
+    #     2026-10-31 20:13 实机就长这样 —— BAND 40 是 -78dBm / SINR 21dB（比
+    #     BAND 3 强 20dB），快测只有 3 Mbps、延迟 84ms，当场判「不够用」；
+    #     一分钟后的决策却是「原地待了 3 分钟，锁住当前频段防止它自己乱跳」，
+    #     把这条 3 Mbps 的锁死了。原因就是「记忆说它最优」压过了「一分钟前刚
+    #     量出来的数字」。眼前这个数字必须赢，否则一整晚都卡在这条上。
+    if (memo is not None and str(serving) == str(memo)
+            and quick and quick.get("band") == serving
+            and _quick_grade(quick) == "poor"):
+        if alt_band:
+            return int(alt_band), "memo_bad_alt"
+        return None, "memo_bad"
     # ① 先看信号，再看速度。记忆里的速度是过去某个时刻量的，而 RSRP 差
     #    10dB 是结构性的（穿墙、距离），锁上去今天的下场就是一路掉到掉线。
     #    用户实机 2026-10-30：记忆说 BAND 3 有 46.8 Mbps，那天在这屋 BAND 3
@@ -2733,6 +2750,27 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     if cur_ok:
         return int(serving), "quick"
     return None, None
+
+
+def guard_plan_lock(st, memo, serving, quick, cur_rsrp, cur_loss, pinned,
+                    memo_rsrp=None):
+    """把「锁哪一条」这一步的输入整理和裁决收在一处，真跑和演练共用。
+
+    单独抽出来的原因很实际：`--guard-dry-run` 原来只印一句「未改动设备」，
+    锁哪一条、凭什么，全看不到 —— 而这恰恰是演练唯一想确认的事。2026-10-31
+    晚上就是这么白跑了一次演练：只看到「锁住当前频段防止它自己乱跳」，
+    根本不知道它指的是 BAND 40。
+
+    返回 (key, band, kind, memo_best)；band 为 None 表示「该跑体检再定」。
+    """
+    key = _site_key(st)
+    memo_best = guard_memo_speed(key, memo) if memo else 0.0
+    alt = guard_alt_band(st, skip=serving) if memo is not None else None
+    band, kind = guard_pick_lock(
+        memo, memo_best, serving, quick,
+        memo_rsrp=memo_rsrp, cur_rsrp=cur_rsrp,
+        pinned_band=pinned, cur_loss=cur_loss, alt_band=alt)
+    return key, band, kind, memo_best
 
 
 def mark_site_provisional(key, band, force_best=False):
@@ -3159,6 +3197,8 @@ def run_guard(args, cfg):
           f"（设备自己换频段不算，那只是它重启射频）")
     print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
     print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
+    print("  记忆里的「最优」要是刚测出不够用 → 换记忆里的次优"
+          "（信号好看不代表快：基站拥塞时 -78dBm 也可能只有 3 Mbps）")
     print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
           f" → 先换备选，没有才解锁")
     print(f"  Ctrl+C 停止（按不出来就在另一个窗口跑 mifi --stop）"
@@ -3439,10 +3479,23 @@ def run_guard(args, cfg):
                 bad_streak=bad_streak, cooldown_left=max(0.0, next_allowed - now),
                 outage_after_unlock=outage_after_unlock)
 
+            # 演练模式原来只印一句「未改动设备」，锁哪一条、凭什么全都看不到 ——
+            # 而这恰恰是演练唯一想看的。所以「锁哪条」的裁决在打印之前就算出来，
+            # 真跑和演练共用同一份结果。
+            plan = None
+            if action == "lock" and not getattr(args, "guard_fast", False):
+                plan = guard_plan_lock(st, memo, serving, quick, rsrp,
+                                       ping["loss"], pinned, memo_rsrp)
+
             if action:
                 print(f"      → {why}", flush=True)
                 if dry:
-                    print("      （演练模式，未改动设备）", flush=True)
+                    if plan:
+                        aim = f"BAND {plan[1]}" if plan[1] else "（先体检再定）"
+                        print(f"      （演练模式，未改动设备；本来会锁 {aim}，"
+                              f"依据 {plan[2]}）", flush=True)
+                    else:
+                        print("      （演练模式，未改动设备）", flush=True)
                 elif action == "unlock" and bad_streak >= GUARD_BAD_HITS and not moving:
                     # 锁着但真的不行了：先换记忆里的备选，别直接交还给设备 ——
                     # 设备只会按信号最强又选回刚才那条（用户的真实体验）。
@@ -3476,12 +3529,7 @@ def run_guard(args, cfg):
                     if getattr(args, "guard_fast", False):
                         _guard_lock_current(dev, serving)
                     else:
-                        key_now = _site_key(st)
-                        memo_best = guard_memo_speed(key_now, memo) if memo else 0.0
-                        band, kind = guard_pick_lock(
-                            memo, memo_best, serving, quick,
-                            memo_rsrp=memo_rsrp, cur_rsrp=rsrp,
-                            pinned_band=pinned, cur_loss=ping["loss"])
+                        key_now, band, kind, memo_best = plan
                         # 记忆里的最优「没记过信号」时，不能永远绕过去。
                         # 用户 2026-10-31：「在一个熟悉的地方要优先锁历史记录里
                         # 最优的，最近这几次锁定看起来没有验证记忆」。
@@ -3543,6 +3591,18 @@ def run_guard(args, cfg):
                             _guard_lock_band(dev, band)
                             set_device_pin(band)      # 位置级命中时也补上设备级
                             note_band_rsrp(key_now, band, rsrp)
+                        elif kind == "memo_bad_alt":
+                            # 记忆说这条最优，可它刚刚被量到 3 Mbps。别锁它，
+                            # 换记忆里另一条 —— 这一步几乎不断网，比跑体检快得多。
+                            print(f"      → 记忆里 BAND {memo} 是最优，但刚才实测只有 "
+                                  f"{float(quick.get('mbps') or 0):.0f} Mbps / "
+                                  f"{quick['avg']}ms，不够用 —— "
+                                  f"换到记忆里的 BAND {band}", flush=True)
+                            _guard_lock_band(dev, band)
+                            # 这里既不写 RSRP 也不写「测过」：RSRP 是当前那条
+                            # （BAND 40）的，记到 BAND 3 名下就是造假；而这次
+                            # 换过去本来就没测过 BAND 3，别把 last 刷新成「刚测过」。
+                            # 换错了自有「连续 3 次不通 → 换备选/解锁」兜底。
                         elif kind == "memo":
                             print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
                             _guard_lock_band(dev, band)
@@ -3560,6 +3620,9 @@ def run_guard(args, cfg):
                                    if kind == "weak" else
                                    "记忆里没有信号记录、当前这条也不够用"
                                    if kind == "blind" else
+                                   "记忆里这条标着最优，但刚才实测不够用，"
+                                   "而记忆里也没有能换的备选"
+                                   if kind == "memo_bad" else
                                    (memo_why or "没有可信依据"))
                             print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None

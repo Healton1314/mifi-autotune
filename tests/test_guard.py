@@ -9,6 +9,7 @@
 """
 
 import unittest
+from unittest import mock
 
 import autotune as A
 
@@ -373,6 +374,89 @@ class PickLockBand(unittest.TestCase):
                                        memo_rsrp=-78, cur_rsrp=-78,
                                        pinned_band=3, cur_loss=100)
         self.assertEqual((band, kind), (3, "pinned"))
+
+
+class MemoIsTheServingBand(unittest.TestCase):
+    """记忆里的「最优」正好就是当前驻留的这条 —— 最容易被拥塞咬到的情况。
+
+    2026-10-31 20:13 实机（宿舍，解锁后设备自己驻留在 BAND 40）：
+      · 信号 -78dBm / SINR 21dB，比 BAND 3 强 20dB，指标漂亮；
+      · 快测只有 3 Mbps、延迟 84ms，当场判「不够用」；
+      · 记忆里 best 也正好是 40（两小时前测的），
+      · 20:14:38 的决策是「原地待了 3 分钟，锁住当前频段防止它自己乱跳」——
+        把刚量出 3 Mbps 的那条锁死了，而且整晚都没有再回头看。
+    原来所有「够不够用」的判据都挂在 `serving != memo` 上，一旦两者相等就
+    只剩一句「记忆说它最优」，眼前刚量到的数字完全不算数。
+    """
+
+    def _q(self, band=40, mbps=3.0, grade="poor"):
+        return {"band": band, "ok": grade != "poor", "mbps": mbps,
+                "avg": 84, "loss": 0, "grade": grade}
+
+    def test_measured_bad_switches_to_alt(self):
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=3)
+        self.assertEqual((band, kind), (3, "memo_bad_alt"))
+
+    def test_measured_bad_without_alt_means_exam(self):
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78)
+        self.assertEqual((band, kind), (None, "memo_bad"))
+
+    def test_measured_ok_keeps_the_memo_band(self):
+        # 当前就是记忆最优、而且刚量出来确实够用 → 照旧锁它，别乱动
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40,
+            quick=self._q(40, 30.0, grade="good"),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=3)
+        self.assertEqual((band, kind), (40, "memo"))
+
+    def test_no_quick_yet_keeps_the_memo_band(self):
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=None,
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=3)
+        self.assertEqual((band, kind), (40, "memo"))
+
+    def test_pin_still_wins(self):
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=3, pinned_band=40)
+        self.assertEqual((band, kind), (40, "pinned"))
+
+
+class PlanLockReadsAltFromMemory(unittest.TestCase):
+    """`guard_plan_lock` 要自己去记忆里挑备选，而不是让调用方猜。"""
+
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from datetime import datetime
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self.tmp.write_text(json.dumps({"236-CMCC": {
+            "seen": 3, "last": datetime.now().isoformat(timespec="seconds"),
+            "best": 40, "name": "宿舍",
+            "bands": {"40": {"ok": 2, "best": 40.7, "dead": 0, "rsrp": -78},
+                      "3": {"ok": 3, "best": 23.0, "dead": 0, "rsrp": -100}},
+        }}, ensure_ascii=False), encoding="utf-8")
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_picks_the_second_band_when_the_best_one_is_bad_now(self):
+        st = {"band": 40, "signal": {"pci": "236", "operator": "CMCC", "rsrp": "-78"}}
+        key, band, kind, memo_best = A.guard_plan_lock(
+            st, memo=40, serving=40,
+            quick={"band": 40, "ok": False, "mbps": 3.0, "avg": 84,
+                   "loss": 0, "grade": "poor"},
+            cur_rsrp=-78, cur_loss=0, pinned=None, memo_rsrp=-78)
+        self.assertEqual(key, "236-CMCC")
+        self.assertEqual((band, kind), (3, "memo_bad_alt"))
+        self.assertEqual(memo_best, 40.7)
 
 
 class MemoSpeed(unittest.TestCase):
