@@ -3033,8 +3033,13 @@ def run_guard(args, cfg):
                             print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None
                             pending_lock = _guard_measure(args, prefer=serving) or serving
-                            print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
-                                  f"（体检结论「保持现状」不等于「别锁」）", flush=True)
+                            if pending_lock:
+                                print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
+                                      f"（体检结论「保持现状」不等于「别锁」）", flush=True)
+                            else:
+                                # 连当前驻留都读不到。不吭声地跳过正是这次要修的病。
+                                print("      [!] 体检没留下结论、也读不到当前驻留频段，"
+                                      "这次没锁上；下一轮重新判断", flush=True)
                     stable_since = time.time()
                     quick, quick_done = None, False
                 else:  # measure：解锁后仍然不通，说明不是「锁错了」
@@ -3042,6 +3047,9 @@ def run_guard(args, cfg):
                     # 这条路径不是「选最优」，是「救火」：体检完照样得锁回去，
                     # 否则下一轮又会因为「没有记忆」再跑一次体检，无限断网。
                     pending_lock = _guard_measure(args, prefer=serving) or None
+                    if not pending_lock:
+                        print("      [!] 救护体检也没能给出可锁的频段，先保持解锁状态",
+                              flush=True)
                     stable_since = time.time()
                     quick, quick_done = None, False
 
