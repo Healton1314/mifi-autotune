@@ -570,6 +570,42 @@ class SiteCells(unittest.TestCase):
                             "bands": {"40": {"dead": 0, "ok": 20, "best": 31.0}}}
         self.assertEqual(A.find_site(data, "236-CMCC"), "236-CMCC")
 
+    def _no_bridge(self, last_hours_ago=30):
+        """只有 350 一条本体，cells 里还不知道 236 —— 换频段那一刻的真实状态。"""
+        return {"350-CMCC": {
+            "seen": 9, "last": ago(hours=last_hours_ago), "best": 3,
+            "bands": {"3": {"dead": 0, "ok": 9, "best": 46.8}},
+            "cells": [{"pci": "350", "band": 3, "n": 9}],
+        }}
+
+    def test_cell_change_absorbs_observation_record(self):
+        """设备换小区那一下，先把「只有观测」的新记录并进来，别留 5 分钟空窗。
+
+        顺序躲不开：守护先写信号、后判「设备换小区了」，所以切到新频段那一拍
+        必然先在陌生 PCI 下建条观测记录。桥接时不并掉，它就要等下一次写记忆
+        （最长 5 分钟）才被吸收 —— 这段时间里守护读到的记忆还是没信号。
+        """
+        self.tmp.write_text(json.dumps(self._no_bridge(30)), encoding="utf-8")
+        # 守护在陌生 PCI 236 下采到信号（这时还没人告诉它 236 是同一处）
+        A.note_band_rsrp("236-CMCC", 3, -96)
+        self.assertEqual(len(json.loads(self.tmp.read_text(encoding="utf-8"))), 2)
+        A.note_cell_change("350-CMCC", "236-CMCC")
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["350-CMCC"])          # 观测记录被并掉
+        self.assertEqual(data["350-CMCC"]["bands"]["3"]["rsrp"], -96)
+        self.assertEqual(data["350-CMCC"]["bands"]["3"]["best"], 46.8)  # 速度没动
+
+    def test_cell_change_keeps_measured_record_apart(self):
+        """两条都真测过：桥接只连小区，不许把其中一条吃掉。"""
+        self.tmp.write_text(json.dumps(self._no_bridge(30)), encoding="utf-8")
+        A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 12.0}])
+        before = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertIn("236-CMCC", before)
+        A.note_cell_change("350-CMCC", "236-CMCC")
+        after = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(after), sorted(before))
+        self.assertEqual(after["236-CMCC"]["bands"]["40"]["best"], 12.0)
+
     def test_absorb_keeps_cells_and_count_but_not_speeds(self):
         self.tmp.write_text(json.dumps(self._rich(30)), encoding="utf-8")
         A.record_site("236-CMCC", [{"band": 40, "ok": True, "mbps": 12.0}])
@@ -710,12 +746,77 @@ class NoteBandRsrp(unittest.TestCase):
         self.assertEqual(bands["40"]["rsrp_med"], -77)
         self.assertNotIn("rsrp", bands["3"])      # 没测过的频段不能瞎写
 
-    def test_unknown_band_or_empty_value_is_ignored(self):
-        A.note_band_rsrp("350-CMCC", 8, -90)      # 这条记忆里没有 BAND 8
+    def test_new_band_gets_rsrp_but_not_marked_measured(self):
+        """记忆里还没有的频段：信号可以记，但不能算「测过」。
+
+        守护锁到哪条就采到哪条，这条观测本来就该留在记忆里（否则下次还得
+        重新瞎猜）。但只有一条 RSRP 不等于测过 —— 不能写 ok / best，不然
+        「这个位置有几条频段可用」就被一次采样骗了。
+        """
+        A.note_band_rsrp("350-CMCC", 8, -90)      # 这条记忆里原来没有 BAND 8
+        bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
+        self.assertEqual(bands["8"]["rsrp"], -90)
+        self.assertNotIn("ok", bands["8"])        # 没测过
+        self.assertNotIn("best", bands["8"])
+
+    def test_empty_value_is_ignored(self):
         A.note_band_rsrp("350-CMCC", 40, None)    # 读不到信号
         bands = json.loads(self.tmp.read_text(encoding="utf-8"))["350-CMCC"]["bands"]
-        self.assertNotIn("8", bands)
         self.assertNotIn("rsrp", bands["40"])
+
+    def test_unknown_pci_gets_its_own_record(self):
+        """还没建过档的 PCI 也要能写进去 —— 这就是「两个模式共用一套记忆」。
+
+        2026-10-31 实机：记忆里只有昨天在 PCI 236 下测的，今天设备锁在 BAND 3
+        上、PCI 是 350；守护在这个新 PCI 下采到的信号全被丢掉，因为原来
+        `rec = data.get(find_site(...))` 找不到就直接 return。
+        """
+        A.note_band_rsrp("350-CMCC", 3, -96)
+        A.note_band_rsrp("236-CMCC", 42, -80)     # 同运营商、另一个小区
+        data = json.loads(self.tmp.read_text(encoding="utf-8"))
+        self.assertEqual(data["350-CMCC"]["bands"]["3"]["rsrp"], -96)
+        self.assertEqual(data["236-CMCC"]["bands"]["42"]["rsrp"], -80)
+        # 新建的记录只是「来过」，不能算测过（没有 last → site_memory_state 判 stale）
+        self.assertNotIn("last", data["236-CMCC"])
+        self.assertEqual(data["236-CMCC"].get("seen"), 0)
+        # 但「来过」得留下时间戳，否则排错时这条记录和「坏了的老记录」没区别
+        self.assertIn("observed", data["236-CMCC"])
+
+    def test_absorbing_observation_keeps_its_signal(self):
+        """纯观测记录被并进实测记录时，信号/丢包要跟着走，别整条扔了。
+
+        实机 2026-10-31：守护锁 BAND 3 时 PCI 是 350、auto 驻留 BAND 40 时是
+        236，记忆本体在 236 名下。守护先在 350 这条空记录里采到 -96dBm，等
+        `note_cell_change` 把两个 PCI 认成同一处之后，350 会被并进 236 ——
+        原来 `_absorb_site` 只搬小区和次数，采来的信号就这么没了。
+        """
+        data = {
+            "236-CMCC": {"seen": 2, "last": ago(hours=3), "best": 40,
+                         "bands": {"40": {"dead": 0, "ok": 2, "best": 40.7}}},
+            "350-CMCC": {"seen": 0, "bands": {
+                "3": {"rsrp": -96, "rsrp_med": -96,
+                      "samples": [[10, None, 80, 210, -96]]}}},
+        }
+        A._absorb_site(data, "236-CMCC", "350-CMCC")
+        self.assertNotIn("350-CMCC", data)
+        b3 = data["236-CMCC"]["bands"]["3"]
+        self.assertEqual(b3["rsrp"], -96)
+        self.assertEqual(b3["samples"][0][2], 80)
+        self.assertNotIn("ok", b3)                 # 观测不等于测过
+        # 实测过的那条不能被观测盖掉
+        self.assertEqual(data["236-CMCC"]["bands"]["40"]["best"], 40.7)
+
+    def test_absorbing_measured_record_does_not_merge_totals(self):
+        """两条都实测过的记录合并时，速度成绩不许互相串（原有行为，守一下）。"""
+        data = {
+            "236-CMCC": {"seen": 2, "last": ago(hours=3), "best": 40,
+                         "bands": {"40": {"dead": 0, "ok": 2, "best": 40.7}}},
+            "350-CMCC": {"seen": 1, "last": ago(hours=1), "best": 3,
+                         "bands": {"3": {"dead": 0, "ok": 1, "best": 23.0}}},
+        }
+        A._absorb_site(data, "236-CMCC", "350-CMCC")
+        self.assertNotIn("3", data["236-CMCC"]["bands"])
+        self.assertEqual(data["236-CMCC"]["bands"]["40"]["best"], 40.7)
 
     def test_gate_can_use_it_next_time(self):
         A.note_band_rsrp("350-CMCC", 40, -77)

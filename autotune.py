@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.5"
+__version__ = "0.7.6"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -201,6 +201,11 @@ GUARD_VERIFY_HOURS = 20
 # 丢包留档的最小间隔：样本槽只有 8 个，30 秒一条会四分钟就填满，
 # 全被同一次掉包占满，反而看不出「周期性」。
 GUARD_LOSS_NOTE_SEC = 120
+# 「守护采样到的信号」写进记忆的最小间隔。守护和半自动（体检 / --apply-plan）
+# 共用同一份 sites.json，但守护原来只在「锁定的那一刻」写一次 RSRP ——
+# 于是记忆里长期没有信号，下次来判「这条还能不能用」时只能瞎猜（blind）。
+# 采样每分钟都有，5 分钟写一次就够，不折腾文件。
+GUARD_RSRP_NOTE_SEC = 300
 
 # 决赛：第二名和第一名的差距小于这个比例时，两个都要复测。
 # 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
@@ -1170,6 +1175,24 @@ def _absorb_site(data, real, key):
         if c.get("pci"):
             _remember_cell(rec, f"{c['pci']}-{op}", c.get("band"))
     rec["seen"] = int(rec.get("seen") or 0) + int(old.get("seen") or 0)
+    # 被并掉的这条如果只是「守护路过时看到的」（没有 last、也没实测过），
+    # 它手里的信号和丢包是花时间采来的，别跟着记录一起消失 —— 守护在陌生
+    # PCI 下攒的那点观测，正是「两个模式共用一套记忆」里守卫那一半。
+    # 只补空缺：速度 / ok / best 一律不动，那是测量的账，混进来会造假最优。
+    if not old.get("last") and not _site_measured(old):
+        for b, ov in (old.get("bands") or {}).items():
+            if not isinstance(ov, dict):
+                continue
+            tv = rec.setdefault("bands", {}).setdefault(b, {})
+            if not isinstance(tv, dict):
+                continue
+            if not tv:
+                tv.update(ov)
+                continue
+            if tv.get("rsrp") is None and ov.get("rsrp") is not None:
+                tv["rsrp"], tv["rsrp_med"] = ov.get("rsrp"), ov.get("rsrp_med")
+            if ov.get("samples") and not tv.get("samples"):
+                tv["samples"] = ov["samples"]
 
 
 def note_cell_change(old_key, new_key):
@@ -1190,6 +1213,14 @@ def note_cell_change(old_key, new_key):
         return                                  # 这处还没建过记录，等体检/快测去建
     _remember_cell(rec, old_key, None)
     _remember_cell(rec, new_key, None)
+    # 新 PCI 名下如果已经有「只有观测、没测过」的记录，桥接这一刻就并进来。
+    # 顺序上躲不开：守护是先写信号、后判「设备换小区了」，所以切到新频段那
+    # 一拍必然先在一个陌生 PCI 下建了条空记录；不在这里并掉，它就要等到
+    # 下一次写记忆（最长 5 分钟）才被吸收 —— 这 5 分钟里守护读到的记忆还是
+    # 「没有信号」，该 blind 还是 blind。
+    nv = data.get(new_key) or {}
+    if nv and not nv.get("last") and not _site_measured(nv):
+        _absorb_site(data, real, new_key)
     save_sites(data)
 
 
@@ -2684,6 +2715,35 @@ def mark_site_provisional(key, band, force_best=False):
     save_sites(data)
 
 
+def _band_slot(data, key, band):
+    """取（必要时新建）「某处某条频段」的记忆槽，顺手把小区记进去。
+
+    守护和半自动（体检 / --apply-plan）共用 sites.json，但守护原来只在
+    「这条记录已经存在」时才写。同一张桌子换个频段就是另一个 PCI（锁 BAND 3
+    是 350、auto 驻留 BAND 40 是 236），于是守护在一张没建过档的 PCI 下采到的
+    信号和丢包全被丢掉 —— 用户 2026-10-31：「守护模式和半自动的那个模式要
+    共享一套记忆」，这就是没共享的那一半。
+
+    新建的记录故意不写 last / seen / ok：它只是「我来过、看到了这些」，
+    不等于「测过」。site_memory_state 会判 stale，选带时照旧走 blind 分支，
+    不会拿它假装这里有可信记忆。
+    """
+    if not key or band is None:
+        return None
+    real = find_site(data, key)
+    _absorb_site(data, real, key)
+    rec = data.setdefault(real, {"seen": 0, "bands": {}})
+    if not rec.get("last"):
+        # 「来过」和「测过」是两件事，必须分开记：last 只给真测过的写
+        # （site_memory_state 拿它判断这份记忆能不能信），observed 只说明
+        # 守护在这儿看到过信号。没有它，一条纯观测记录在别处看起来和
+        # 「坏了的老记录」一模一样，排错时根本分不清。
+        rec.setdefault("observed", datetime.now().isoformat(timespec="seconds"))
+    _remember_cell(rec, key, band)
+    bands = rec.setdefault("bands", {})
+    return bands.setdefault(str(int(band)), {})
+
+
 def note_band_rsrp(key, band, rsrp):
     """把「此刻这条频段的信号」补进记忆，让下次的信号闸门有据可依。
 
@@ -2696,11 +2756,7 @@ def note_band_rsrp(key, band, rsrp):
         return
     try:
         data = load_sites()
-        real = find_site(data, key)
-        rec = data.get(real)
-        if not rec:
-            return
-        v = (rec.get("bands") or {}).get(str(int(band)))
+        v = _band_slot(data, key, band)
         if not isinstance(v, dict):
             return
         v["rsrp"] = int(round(float(rsrp)))
@@ -2755,16 +2811,15 @@ def note_band_loss(key, band, loss, avg=None, rsrp=None):
         return
     try:
         data = load_sites()
-        rec = data.get(find_site(data, key))
-        if not rec:
-            return
-        v = (rec.get("bands") or {}).get(str(int(band)))
+        v = _band_slot(data, key, band)
         if not isinstance(v, dict):
             return
         samples = v.setdefault("samples", [])
         now = datetime.now()
         r = _num(rsrp)
-        samples.append([now.hour, 0.0, int(round(float(loss or 0))),
+        # 速度那一格写 None（不是 0.0）：守护只 ping 不测速，这里没有速度可言。
+        # 写 0.0 等于在记忆里造一条「0 Mbps」的假数据，日后谁按速度统计它就被带偏。
+        samples.append([now.hour, None, int(round(float(loss or 0))),
                         int(_num(avg) or 0), int(r) if r is not None else None])
         del samples[:-SITE_SAMPLES]
         save_sites(data)
@@ -3009,6 +3064,7 @@ def run_guard(args, cfg):
     pending_lock = None                  # 体检跑完后要落地的频段（见下面 after-exam 分支）
     pending_tries = 0                    # 落地失败的重试次数（3 次就认，别无限折腾设备）
     last_loss_note = 0.0                 # 上次把「高丢包」写进记忆的时刻
+    last_rsrp_note = 0.0                 # 上次把「采样到的信号」写进记忆的时刻
 
     try:
         while True:
@@ -3116,6 +3172,16 @@ def run_guard(args, cfg):
                     and now - last_loss_note >= GUARD_LOSS_NOTE_SEC):
                 note_band_loss(_site_key(st), serving, ping["loss"], avg_ms, rsrp)
                 last_loss_note = now
+
+            # 信号也要留档。守护和半自动（体检 / --apply-plan）共用 sites.json，
+            # 但守护原来只在「锁定那一刻」写一次 RSRP，其它时间采样到的信号全丢 ——
+            # 于是记忆里长期是「有速度、没信号」，下次判「这条还能不能用」只能
+            # blind：要么白跑 6 分钟体检，要么不敢切。用户 2026-10-31：
+            # 「守护模式和半自动的那个模式要共享一套记忆」—— 这就是没共享的那一半。
+            if (not dry and serving and rsrp is not None
+                    and now - last_rsrp_note >= GUARD_RSRP_NOTE_SEC):
+                note_band_rsrp(_site_key(st), serving, rsrp)
+                last_rsrp_note = now
 
             pci_changed = (pci is not None and last_pci is not None
                            and pci != last_pci)
