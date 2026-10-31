@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
-"""把「久坐 → 记忆缺信号 → 体检 → 真的锁上」这条链路完整跑一遍。
+"""把守护的两条关键链路完整跑一遍（假驱动 + 真实数字，不碰任何设备）。
 
-不是 unittest（要跑 80 秒），手动执行：
+    python tests/manual/sim_guard_lock.py blind     # 场景一：体检完必须真的锁上
+    python tests/manual/sim_guard_lock.py verify    # 场景二：熟悉的地方要验证记忆
 
-    python tests/manual/sim_guard_lock.py
+不是 unittest —— 每个场景要跑 80 秒左右（守护的 settle 有下限），手动执行。
 
-不碰真设备：用一个假驱动模拟一台「频段自动、实际驻留 BAND 3」的机器，
-其余全部走 autotune.py 里真实的守护循环（run_guard）。
+场景一（0.7.0 修的病）：记忆里的最优没记信号 → 判 blind → 跑体检 →
+  0.6.9 之前体检完什么都不锁；0.7.0 必须看到 set_band(3)。
 
-复刻的是 2026-10-30 22:53 的实机现场：
-  记忆里 best=40 但没记 RSRP → 判 blind → 跑体检 →
-  体检结论「BAND 3 最优 22 Mbps，BAND 40 丢包 80% 不选」→ 按 auto 保持现状
-0.7.0 之前：到这里就结束了，什么都没锁，用户只能手动锁。
-0.7.0：必须看到 dev.set_band(3) 被真的调用。
-
-为什么只能模拟：真机上这条路径要「当前链路不够用」才会触发，网络好用的时候
-永远走 quick/memo 分支；硬造现场就是反复切频段断网。逻辑走假驱动，选带依据
-用的是当晚的真实数字。
+场景二（0.7.1 修的病，2026-10-31 一整早的实机）：记忆里最优是 BAND 3（23 Mbps，
+  没记 RSRP），当前驻留 BAND 40 且快测够用 → 0.7.0 会判 blind_keep「先不赌」，
+  锁当前 BAND 40，还把记忆的最优改写成 40。现在的行为：切到 BAND 3 实测一次，
+  够用就留在它上面，并且**不动**记忆里的最优。
 """
 
 import json
@@ -30,26 +26,31 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import autotune as A            # noqa: E402
 
+MODE = (sys.argv[1] if len(sys.argv) > 1 else "blind").lower()
 TMP = Path(tempfile.mkdtemp())
 SITES = TMP / "sites.json"
 PLAN = TMP / "plan.json"
 
 
 class FakeDev:
-    """一台「频段自动、实际驻留 BAND 3」的随身 WiFi。"""
+    """一台随身 WiFi。band=0 表示没锁，此时实际驻留 serving_auto。"""
 
-    def __init__(self):
-        self.band = 0                 # 0 = 自动（未锁）
+    def __init__(self, serving):
+        self.band = 0
+        self.serving_auto = serving
         self.sets = []
 
+    def serving(self):
+        return self.band or self.serving_auto
+
     def get_state(self):
-        band_txt = f"BAND {self.band}" if self.band else "BAND 3"
+        b = self.serving()
         return {
             "band": self.band,
             "channel": 0,
             "mtu": 1500,
-            "signal": {"pci": "350", "rsrp": -98, "sinr": 4,
-                       "operator": "CMCC", "band": band_txt},
+            "signal": {"pci": "350" if b == 3 else "236", "rsrp": -98, "sinr": 4,
+                       "operator": "CMCC", "band": f"BAND {b}"},
         }
 
     def set_band(self, b):
@@ -61,18 +62,27 @@ class FakeDev:
         return True
 
 
-DEV = FakeDev()
+DEV = FakeDev(serving=40 if MODE == "verify" else 3)
 
-# ---- 1. 位置记忆：best=40，但没记过 RSRP（老格式）→ 必然判 blind ----
-SITES.write_text(json.dumps({
-    "350-CMCC": {
-        "seen": 3,
-        "last": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "best": 40,
-        "bands": {"40": {"ok": 3, "best": 40.0, "dead": 0}},
-        "cells": [{"pci": "350"}],
-    }
-}), encoding="utf-8")
+CREATED = time.strftime("%Y-%m-%dT%H:%M:%S")
+if MODE == "verify":
+    # 今早实机：最优写的是 BAND 3，但只有速度、没有信号
+    SITES.write_text(json.dumps({
+        "350-CMCC": {
+            "seen": 2, "last": CREATED, "best": 3,
+            "bands": {"3": {"ok": 2, "best": 23.0, "dead": 0},
+                      "40": {"ok": 3, "best": 40.7, "dead": 0}},
+            "cells": [{"pci": "350"}, {"pci": "236"}],
+        }
+    }), encoding="utf-8")
+else:
+    SITES.write_text(json.dumps({
+        "350-CMCC": {
+            "seen": 3, "last": CREATED, "best": 40,
+            "bands": {"40": {"ok": 3, "best": 40.0, "dead": 0}},
+            "cells": [{"pci": "350"}],
+        }
+    }), encoding="utf-8")
 
 PLAN_EXAM = {
     "lte": [
@@ -89,23 +99,28 @@ exam_runs = []
 
 
 def fake_run_cycle(args):
-    """体检：不碰设备，只按 22:53 的真实结果落一份 plan.json。"""
     exam_runs.append(time.strftime("%H:%M:%S"))
     PLAN.write_text(json.dumps(PLAN_EXAM, ensure_ascii=False), encoding="utf-8")
-    print("      [模拟体检] 已写出结论：BAND 3 最优 22.0 Mbps；"
+    print("      [模拟体检] 结论：BAND 3 最优 22.0 Mbps；"
           "BAND 40 17.5 Mbps 但丢包 80%（应被剔除）", flush=True)
     return 0
 
 
 def fake_quick(speed_url, host, **kw):
-    # 当前这条「不够用」→ 才会从 blind_keep 变成 blind（该跑体检）
+    b = DEV.serving()
+    if MODE == "verify":
+        # 两条都够用：重点不是谁快，而是「有没有真的去验记忆里的那条」
+        return {"mbps": 22.0 if b == 3 else 25.0, "avg": 70, "loss": 0,
+                "ok": True, "samples": [22.0, 22.0], "grade": "good", "band": b}
     return {"mbps": 3.0, "avg": 210, "loss": 6, "ok": False,
-            "samples": [3.0, 3.0], "grade": "poor", "band": 3}
+            "samples": [3.0, 3.0], "grade": "poor", "band": b}
 
 
 def spy_lock(dev, band):
     ok = A.__dict__["_real_lock"](dev, band)
-    raise KeyboardInterrupt      # 锁上了就收工（走 run_guard 自己的收尾路径）
+    if MODE == "verify" and int(band) == int(DEV.serving()):
+        raise KeyboardInterrupt      # 场景二：切到目标频段、测完就收工
+    return ok
 
 
 A.SITES = SITES
@@ -127,11 +142,20 @@ t0 = time.time()
 rc = A.run_guard(args, cfg)
 dt = time.time() - t0
 
+sites = json.loads(SITES.read_text(encoding="utf-8"))
+best = (sites.get("350-CMCC") or {}).get("best")
 print("\n" + "=" * 60)
-print(f"用时 {dt:.0f}s ｜ 体检跑了几次：{len(exam_runs)} ｜ "
-      f"set_band 调用序列：{DEV.sets} ｜ 最终锁在：{DEV.band or '未锁'}")
-ok = (len(exam_runs) == 1 and DEV.sets and DEV.sets[-1] == 3
-      and DEV.band == 3 and rc == 0)
-print("[通过] 体检跑完了，设备真的被锁到 BAND 3" if ok
-      else "[失败] 体检后没有落地锁定，或锁错了频段")
+print(f"用时 {dt:.0f}s ｜ 体检次数 {len(exam_runs)} ｜ set_band {DEV.sets} ｜ "
+      f"最终 BAND {DEV.band or '未锁'} ｜ 记忆 best={best}")
+
+if MODE == "verify":
+    ok = (bool(DEV.sets) and DEV.sets[0] == 3 and DEV.band == 3
+          and best == 3 and rc == 0)
+    print("[通过] 切到记忆里的 BAND 3 实测过，留在它上面，记忆的最优没被改写"
+          if ok else "[失败] 没有去验证记忆里的最优，或把 best 改掉了")
+else:
+    ok = (len(exam_runs) == 1 and bool(DEV.sets) and DEV.sets[-1] == 3
+          and DEV.band == 3 and rc == 0)
+    print("[通过] 体检跑完了，设备真的被锁到 BAND 3" if ok
+          else "[失败] 体检后没有落地锁定，或锁错了频段")
 sys.exit(0 if ok else 1)
