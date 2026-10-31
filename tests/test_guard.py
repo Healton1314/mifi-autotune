@@ -710,5 +710,75 @@ class VerifyMemory(unittest.TestCase):
         self.assertFalse(A.site_verify_due("350-CMCC"))
 
 
+class DevicePin(unittest.TestCase):
+    """「就要 BAND 3」得跟着设备走，不能跟着 PCI 走。
+
+    实机 2026-10-31 16:47 的翻车：锁着 BAND 3 时 PCI=350，`--lock-band 3`
+    把 pinned 写进 `350-?` 那条；`--restore` 后设备回 auto、驻留 BAND 40 时
+    PCI=236，守护去读 `236-?` 那条 —— 那是今早体检写的 best=40、没有 pinned，
+    于是乖乖锁回 40。用户的原话是「WiFi 要锁在 band3」，不是「350 这个小区要 3」。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        d = Path(tempfile.mkdtemp())
+        self.SITES, self.CONFIG = d / "sites.json", d / "config.json"
+        self._ps = [mock.patch.object(A, "SITES", self.SITES),
+                    mock.patch.object(A, "CONFIG", self.CONFIG)]
+        for p in self._ps:
+            p.start()
+        self.json = json
+
+    def tearDown(self):
+        for p in self._ps:
+            p.stop()
+
+    def _sites(self, **rec):
+        self.SITES.write_text(self.json.dumps(rec), encoding="utf-8")
+
+    def test_pin_is_device_level_not_site_level(self):
+        self._sites(**{"350-CMCC": {"seen": 1, "last": "2026-10-31T16:00:00",
+                                    "best": 3, "pinned": 3}})
+        A.set_device_pin(3)
+        # 换频段后是另一个 PCI、另一条（没有 pinned 的）记录
+        self._sites(**{"236-CMCC": {"seen": 1, "last": "2026-10-31T09:00:00",
+                                    "best": 40}})
+        self.assertIsNone(A.site_pinned({"signal": {"pci": 236,
+                                                    "operator": "CMCC"}}))
+        self.assertEqual(A.device_pin(), 3)
+
+    def test_clear_on_restore(self):
+        A.set_device_pin(3)
+        A.clear_device_pin()          # --restore 就是「我要自动」
+        self.assertIsNone(A.device_pin())
+
+    def test_cleared_after_two_failures(self):
+        """指定的那条锁上就不通：第一次记一笔，连续两次才放弃。
+
+        不设这条闸门，当地没覆盖时会「锁 → 不通 → 解锁 → 体检 → 照 pin 锁回去」
+        无限循环，每次断网 87 秒。
+        """
+        A.set_device_pin(3)
+        A.note_pin_failure(3)
+        self.assertEqual(A.device_pin(), 3)      # 一次不算数
+        A.note_pin_failure(3)
+        self.assertIsNone(A.device_pin())        # 两次就取消
+
+    def test_failure_of_other_band_does_not_touch_pin(self):
+        A.set_device_pin(3)
+        A.note_pin_failure(40)                   # 自动挑的备选不通，跟指定无关
+        self.assertEqual(A.device_pin(), 3)
+
+    def test_reset_counter_when_pinned_again(self):
+        A.set_device_pin(3)
+        A.note_pin_failure(3)
+        A.set_device_pin(3)                      # 人又说了一次 → 重新给机会
+        A.note_pin_failure(3)
+        self.assertEqual(A.device_pin(), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

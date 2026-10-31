@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -2496,6 +2496,74 @@ def site_pinned(st):
         return None
 
 
+def device_pin():
+    """设备级「上次你亲手指定的频段」。None = 没指定过。
+
+    为什么不能只靠 site_pinned：那个挂在 `PCI-运营商` 键上，而 PCI 是**当前驻留
+    小区**，同一条频段才有意义。锁 BAND 3 读到 350，设备回 auto 后驻留 BAND 40
+    读到 236 —— 同一张桌子两个键。实机 2026-10-31 16:47 就是这么翻车的：
+    `--lock-band 3` 把 pinned 写进 350 那条，`--restore` 后设备停回 40，守护读到
+    236 那条（今早体检写的 best=40、没有 pinned）→ 直接锁回 40，pinned 白加。
+
+    人说的是「这台设备要 3」，不是「这个小区的这条记录要 3」。所以另存一份设备级，
+    放在 config.json 里，跟位置无关；`--restore` 会清掉它（那是「我要 auto」的意思）。
+    """
+    try:
+        b = load_config().get("pin_band")
+        return int(b) if b else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_device_pin(band):
+    """记下「就要这条」，并把失败计数归零（重新给了一次机会）。"""
+    if not band:
+        return
+    try:
+        cfg = load_config()
+        cfg["pin_band"] = int(band)
+        cfg["pin_fails"] = 0
+        save_config(cfg)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def clear_device_pin(reason=""):
+    if reason:
+        print(f"      → {reason}", flush=True)
+    try:
+        cfg = load_config()
+        had = cfg.get("pin_band") or cfg.get("pin_fails")
+        cfg.pop("pin_band", None)
+        cfg["pin_fails"] = 0
+        if had:
+            save_config(cfg)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def note_pin_failure(band):
+    """pin 的这条锁上后仍然不通：记一次，连续两次就取消，别让人一直断网。
+
+    没这个闸门的话，某个频段在当地根本没覆盖时，守护会「锁 → 不通 → 解锁 →
+    体检 → 又照 pin 锁回去」无限循环，每次断网 87 秒。人指定的优先级最高，
+    但不该高到把人网彻底弄没。
+    """
+    pin = device_pin()
+    if pin is None or str(pin) != str(band):
+        return
+    try:
+        cfg = load_config()
+        n = int(cfg.get("pin_fails") or 0) + 1
+        cfg["pin_fails"] = n
+        save_config(cfg)
+    except (OSError, TypeError, ValueError):
+        return
+    if n >= 2:
+        clear_device_pin(f"你指定的 BAND {band} 锁上后连续 {n} 次不通，"
+                         "已取消这个指定（不再强锁，按记忆重新挑）")
+
+
 def guard_pick_lock(memo, memo_mbps, serving, quick,
                     memo_rsrp=None, cur_rsrp=None, pinned_band=None):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
@@ -3054,7 +3122,10 @@ def run_guard(args, cfg):
             # 实机 2026-10-31 16:13：BAND 3 是 -103dBm、BAND 40 是 -82dBm，
             # 差 21dB，但 BAND 40 实测丢包 80%、BAND 3 延迟 55ms 丢包 0%。
             # 只看 RSRP 会把用户反复踢回那条烂链路。
-            pinned = None if locked else site_pinned(st)
+            # 两种来源都算「人说的」：位置级（这个 PCI 记录上钉的）和设备级
+            # （config 里的 pin_band，--restore 后设备换频段也还在）。
+            pinned_site = None if locked else site_pinned(st)
+            pinned = pinned_site or (None if locked else device_pin())
             # 记忆里的最优现在信号是不是已经不行了（比当前驻留差一截）。
             # 这一刻就要算出来：既决定「要不要先快测当前」，也决定「准不准锁它」。
             memo_rsrp = (guard_memo_rsrp(_site_key(st), memo)
@@ -3136,6 +3207,7 @@ def run_guard(args, cfg):
                 elif action == "unlock" and bad_streak >= GUARD_BAD_HITS and not moving:
                     # 锁着但真的不行了：先换记忆里的备选，别直接交还给设备 ——
                     # 设备只会按信号最强又选回刚才那条（用户的真实体验）。
+                    note_pin_failure(locked_band)   # 若是你指定的那条救不回来，记一笔
                     alt = guard_alt_band(st, skip=locked_band)
                     if alt:
                         print(f"      换到记忆里的备选 BAND {alt}（不交还给设备）…", flush=True)
@@ -3219,10 +3291,12 @@ def run_guard(args, cfg):
                         elif kind == "pinned":
                             # 人已经替它做过决定了。这里不再比速度、不再看
                             # RSRP 差几 dB、不再问「当前够不够用」。
-                            print(f"      → 你亲手指定的 BAND {band}"
-                                  f"（--lock-band 记着的），按它锁，不再比",
+                            src = ("这个位置你指定过" if pinned_site
+                                   else "你上次用 --lock-band 定的")
+                            print(f"      → {src} BAND {band}，照它锁，不再比",
                                   flush=True)
                             _guard_lock_band(dev, band)
+                            set_device_pin(band)      # 位置级命中时也补上设备级
                             note_band_rsrp(key_now, band, rsrp)
                         elif kind == "memo":
                             print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
@@ -3412,6 +3486,9 @@ def run_lock_band(dev, args):
         pin_site_best(_site_key(st), band)
     except Exception:  # noqa: BLE001
         pass
+    # 位置级的 pinned 只在「当前 PCI」那条记录上有效，设备换频段就失联；
+    # 再存一份设备级的，断电/还原后守护才认得出「他说过要这条」。
+    set_device_pin(band)
     if cur and str(cur) != str(band):
         print(f"[!] 读回来是 BAND {cur}，不是 {band} —— 这台设备可能不支持这条")
         return 1
@@ -3702,6 +3779,10 @@ def main():
             print("[√] 已还原。建议等待 30 秒重新注册。")
         else:
             print("[!] 只做了一半：频段已解开，信道没动（设备当时不可达）")
+        # 人主动 --restore 就是「我要 auto」：顺手清掉设备级 pin，
+        # 否则下次守护一起会照旧锁回去，和这条命令的意图正好相反。
+        if device_pin():
+            clear_device_pin("已取消之前指定的频段（--restore 就是回到自动的意思）")
         # 保留改动前的原始记录，只补一条「什么时候还原的」。
         # 直接覆盖会把「我原来是哪个频段」抹掉，之后想查都查不到。
         saved = {}
