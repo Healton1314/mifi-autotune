@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.7.9"
+__version__ = "0.8.0"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -1254,6 +1254,148 @@ def note_cell_change(old_key, new_key):
     save_sites(data)
 
 
+MEMORY_KIND = "mifi-memory"
+
+
+def export_memory(origin=None):
+    """把本机的位置记忆导出成一份可以搬走的 JSON。
+
+    只搬「真测过」和「起过名」的：provisional 和守护路过时写的纯观测记录是
+    半成品（连 `last` 都没有），搬到别的机器上只会变成一条来历不明的假记忆。
+
+    这份文件里有真实的 PCI、实测速度和到访时间 —— 它属于**本机数据**，
+    和 sites.json 一个级别，永远不该进仓库、不该上传。
+    """
+    data = load_sites()
+    sites = {}
+    for k, v in (data or {}).items():
+        if not isinstance(v, dict):
+            continue
+        if not _site_measured(v) and not str(v.get("name") or "").strip():
+            continue
+        sites[k] = v
+    return {
+        "kind": MEMORY_KIND,
+        "version": __version__,
+        "exported": datetime.now().isoformat(timespec="seconds"),
+        "origin": (origin or "").strip() or "另一台机器",
+        "sites": sites,
+    }
+
+
+def _merge_band(dst, src):
+    """把一个频段的实测结果并进另一个。返回合并后的那个 dict。
+
+    原则和 _absorb_site 一样但放宽一档：导入的数据是**真的测出来的**（不是观测），
+    所以速度可以取更快、ok 可以累加；但 `last`/`seen`/`best` 这些「本机的账」
+    不在这里动，由调用方决定。
+    """
+    if not dst:
+        return dict(src or {})
+    if not src:
+        return dst
+    try:
+        dst["ok"] = int(dst.get("ok") or 0) + int(src.get("ok") or 0)
+    except (TypeError, ValueError):
+        pass
+    if not dst.get("best"):
+        # 本机这条根本没测出速度（上次是死的），导入的更快就用它。
+        dst["best"] = src.get("best")
+    # dead 取小：另一台测过是活的，就说明这条频段在这个位置能用，
+    # 「死」很可能只是那一次方位不好，不该被另一台机器的结论锁死。
+    try:
+        dst["dead"] = min(int(dst.get("dead") or 0), int(src.get("dead") or 0))
+    except (TypeError, ValueError):
+        pass
+    for k in ("rsrp", "rsrp_med", "rsrq", "sinr"):
+        if dst.get(k) is None and src.get(k) is not None:
+            dst[k] = src[k]
+    if src.get("samples"):
+        merged = list(dst.get("samples") or []) + list(src["samples"])
+        dst["samples"] = merged[-SITE_SAMPLES:]
+    return dst
+
+
+def import_memory(payload, data=None):
+    """把别处导出的记忆并进本机。返回一份说明用的统计。
+
+    合并的方向是「只补空缺、不夺权」：
+      * 本机没有这个位置 → 整条搬进来，但不改 `last`（保留原始时间，
+        所以它会按真实年龄被判 aging/stale，不会假装刚测过）；
+      * 本机已有 → 只补本机缺的频段数据、本机没有的速度、本机没见过的 PCI，
+        绝不覆盖本机的 `last`/`seen`/`best`/**名字**。
+    这样「拿电脑的历史喂手机」不会把手机上真机测出来的结论挤掉。
+    """
+    if not isinstance(payload, dict) or payload.get("kind") != MEMORY_KIND:
+        raise ValueError("这不是 mifi 导出的记忆文件（缺少 kind 标记）")
+    src_sites = payload.get("sites")
+    if src_sites is None:
+        src_sites = {}
+    if not isinstance(src_sites, dict):
+        raise ValueError("记忆文件里的 sites 不是对象")
+    data = load_sites() if data is None else data
+    origin = str(payload.get("origin") or "另一台机器")
+    stamp = datetime.now().isoformat(timespec="seconds")
+    stat = {"added": 0, "merged": 0, "skipped": 0, "bands": 0}
+
+    for key, rec in src_sites.items():
+        if not isinstance(rec, dict):
+            stat["skipped"] += 1
+            continue
+        _, op = _split_key(key)
+        if not op:
+            stat["skipped"] += 1
+            continue
+        target = key
+        if key not in data:
+            # 这处本机没记过，但可能已经有另一条记录见过同一个 PCI ——
+            # 那就并到那条上，别在同一个地方留两条。
+            pci = _split_key(key)[0]
+            for kk, vv in data.items():
+                if _split_key(kk)[1] != op:
+                    continue
+                if not isinstance(vv, dict):
+                    continue
+                if pci in {str(c.get("pci")) for c in (vv.get("cells") or [])}:
+                    target = kk
+                    break
+
+        dst = data.get(target)
+        if dst is None:
+            new = json.loads(json.dumps(rec))       # 深拷贝，别和 payload 共享引用
+            new.setdefault("cells", [])
+            _remember_cell(new, key, new.get("best"))
+            new["imported_at"] = stamp
+            new["imported_from"] = origin
+            data[target] = new
+            stat["added"] += 1
+            stat["bands"] += len(new.get("bands") or {})
+            continue
+
+        # —— 已有记录：只补空缺 ——
+        bands = dst.setdefault("bands", {})
+        for b, bv in (rec.get("bands") or {}).items():
+            if not isinstance(bv, dict):
+                continue
+            before = json.dumps(bands.get(b), sort_keys=True)
+            bands[b] = _merge_band(bands.get(b), bv)
+            if json.dumps(bands.get(b), sort_keys=True) != before:
+                stat["bands"] += 1
+        for c in rec.get("cells") or []:
+            if c.get("pci"):
+                _remember_cell(dst, f"{c['pci']}-{op}", c.get("band"))
+        if not str(dst.get("name") or "").strip() and str(rec.get("name") or "").strip():
+            dst["name"] = rec["name"]
+        if not dst.get("best") and rec.get("best"):
+            dst["best"] = rec["best"]
+        dst["imported_at"] = stamp
+        dst["imported_from"] = origin
+        stat["merged"] += 1
+
+    save_sites(data)
+    return stat
+
+
 def record_site(key, results, best_band=None, reset_best=False):
     """把这次的结果记到位置上。只记「有没有信号」和「最好跑到多少」。
 
@@ -2404,7 +2546,7 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
     if cooldown_left > 0:
         return None, f"冷却中（{int(cooldown_left)}s）"
     if not moving and not locked and still_sec >= settle_sec:
-        return "lock", f"原地待了 {int(still_sec / 60)} 分钟，锁住当前频段防止它自己乱跳"
+        return "lock", f"原地待了 {int(still_sec / 60)} 分钟，该把频段定下来了"
     return None, ""
 
 
@@ -2589,6 +2731,30 @@ def site_pinned(st):
         return None
 
 
+def clear_site_pins(reason=""):
+    """把所有位置上的「你亲手指定过」清掉。`--restore` 用这个。
+
+    位置级 pinned 挂在 `PCI-运营商` 这个键上，而 `--restore` 之后设备会重新选
+    小区 —— 只清设备级的话，位置级那份还留在原地等着，下次守护一来又把它锁
+    回去，和「回到自动」正好相反。
+
+    实测（2026-10-31 20:56，一台手机）：`--restore` 明明打印了「已取消之前指定
+    的频段」，紧接着的守护演练却报「本来会锁 BAND 3，依据 pinned」—— 设备级清
+    了、位置级没清，而守护优先读位置级。
+    """
+    data = load_sites()
+    hits = []
+    for k, v in (data or {}).items():
+        if isinstance(v, dict) and v.get("pinned"):
+            v.pop("pinned", None)
+            hits.append(k)
+    if hits:
+        save_sites(data)
+        if reason:
+            print(f"      → {reason}", flush=True)
+    return hits
+
+
 def device_pin():
     """设备级「上次你亲手指定的频段」。None = 没指定过。
 
@@ -2664,6 +2830,25 @@ def pin_overrides_lock(locked_band, pin_goal):
     人没指定（pin_goal=None）时不动它 —— 别把用户自己手动锁的频段随便改掉。
     """
     return bool(locked_band and pin_goal and str(locked_band) != str(pin_goal))
+
+
+_KIND_TEXT = {
+    "pinned": "这个频段是你亲手指定的",
+    "memo": "记忆里这处的最优",
+    "keep": "当前这条不比记忆里差",
+    "quick": "当前这条快测够用",
+    "weak_keep": "记忆那条现在信号差一截、当前够用",
+    "blind_keep": "记忆里没记信号、当前够用",
+    "memo_bad_alt": "记忆里的最优刚测出不够用，换次优",
+    "memo_bad": "记忆里的最优刚测出不够用",
+    "weak": "记忆里那条信号差太多、当前也不够用",
+    "blind": "记忆里没记信号、当前也不够用",
+}
+
+
+def _kind_text(kind):
+    """把判定依据翻成人话 —— 屏幕上别出现 `pinned` 这种只有代码里才用的词。"""
+    return _KIND_TEXT.get(kind, "没有可信依据")
 
 
 def guard_pick_lock(memo, memo_mbps, serving, quick,
@@ -3492,8 +3677,8 @@ def run_guard(args, cfg):
                 if dry:
                     if plan:
                         aim = f"BAND {plan[1]}" if plan[1] else "（先体检再定）"
-                        print(f"      （演练模式，未改动设备；本来会锁 {aim}，"
-                              f"依据 {plan[2]}）", flush=True)
+                        print(f"      （演练模式，未改动设备；本来会锁 {aim} —— "
+                              f"{_kind_text(plan[2])}）", flush=True)
                     else:
                         print("      （演练模式，未改动设备）", flush=True)
                 elif action == "unlock" and bad_streak >= GUARD_BAD_HITS and not moving:
@@ -3865,6 +4050,13 @@ def main():
     ap.add_argument("--bands", default="default",
                     help="default=设备声明的全部频段 / preferred=配置里的子集 / 逗号分隔如 3,40")
     ap.add_argument("--restore", action="store_true", help="还原为不锁频段 + 自动信道")
+    ap.add_argument("--export-memory", nargs="?", const="", metavar="文件",
+                    help="把位置记忆导出成一个 JSON（默认 mifi-memory.json）；"
+                         "含真实 PCI/速度，只能在本机之间搬，别上传")
+    ap.add_argument("--import-memory", metavar="文件或网址",
+                    help="把别处导出的记忆并进来（只补空缺，不覆盖本机实测）")
+    ap.add_argument("--memory-origin", metavar="名字",
+                    help="给导出的记忆标个来源（如 宿舍电脑），导入时会显示出来")
     ap.add_argument("--lock-band", type=int, metavar="N",
                     help="直接锁到指定频段（只切一次，不测量）；出门前记得 --restore")
     ap.add_argument("--here", metavar="名字",
@@ -4019,6 +4211,49 @@ def main():
               f"（改 config.json 的 log_keep 可调整，0 = 不保存）")
         return 0
 
+    if args.export_memory is not None:
+        out = Path(args.export_memory or "mifi-memory.json")
+        payload = export_memory(getattr(args, "memory_origin", None))
+        try:
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+        except OSError as e:
+            print(f"[×] 写不进去：{e}")
+            return 1
+        n = len(payload["sites"])
+        print(f"[导出] {n} 处位置 → {out}")
+        if not n:
+            print("  记忆是空的，导出的文件没什么用（先去跑一次体检）。")
+        else:
+            print("  这份文件含真实 PCI / 实测速度 / 到访时间，和 sites.json 同级，"
+                  "别提交、别上传。")
+            print(f"  搬到另一台机器上用：mifi --import-memory <文件或网址>")
+        return 0
+
+    if args.import_memory:
+        src = args.import_memory
+        try:
+            if src.startswith(("http://", "https://")):
+                import urllib.request
+                print(f"[导入] 正在从 {src} 取…")
+                with urllib.request.urlopen(src, timeout=20) as r:
+                    raw = r.read().decode("utf-8")
+            else:
+                raw = Path(src).read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            stat = import_memory(payload)
+        except (OSError, ValueError) as e:
+            print(f"[×] 读不了这份记忆：{type(e).__name__}: {e}")
+            print("    要的是 `mifi --export-memory` 导出的那个 JSON。")
+            return 1
+        print(f"[导入] 新增 {stat['added']} 处 ｜ 补齐 {stat['merged']} 处 ｜ "
+              f"动了 {stat['bands']} 条频段数据 ｜ 跳过 {stat['skipped']} 条")
+        if stat["added"]:
+            print("  新增的位置用的是导出方的时间戳，不是「刚刚测过」——"
+                  "该过期还是会过期。")
+        print("  本机已有的实测记录不会被子文件覆盖（名字、次数、最好速度都保留）。")
+        return 0
+
     speed_url = args.speed_url or cfg["speed_url"]
     ping_host = args.ping_host or cfg["ping_host"]
     if args.speed_url:
@@ -4145,9 +4380,11 @@ def main():
             print("[√] 已还原。建议等待 30 秒重新注册。")
         else:
             print("[!] 只做了一半：频段已解开，信道没动（设备当时不可达）")
-        # 人主动 --restore 就是「我要 auto」：顺手清掉设备级 pin，
-        # 否则下次守护一起会照旧锁回去，和这条命令的意图正好相反。
-        if device_pin():
+        # 人主动 --restore 就是「我要 auto」：顺手清掉 pin，否则下次守护一起
+        # 会照旧锁回去，和这条命令的意图正好相反。两级都要清 —— 位置级挂在
+        # PCI 键上，restore 后设备换小区，不清就会在另一条记录里继续生效。
+        site_hits = clear_site_pins()
+        if device_pin() or site_hits:
             clear_device_pin("已取消之前指定的频段（--restore 就是回到自动的意思）")
         # 保留改动前的原始记录，只补一条「什么时候还原的」。
         # 直接覆盖会把「我原来是哪个频段」抹掉，之后想查都查不到。

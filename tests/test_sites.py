@@ -1062,5 +1062,114 @@ class StatusSiteLine(unittest.TestCase):
         return dev
 
 
+class MemoryPortability(unittest.TestCase):
+    """把一份位置记忆从一台机器搬到另一台（`--export-memory` / `--import-memory`）。
+
+    用户的场景：电脑上跑过几次体检，那份速度数据有参考价值；手机刚装、记忆是
+    空的，什么都得从零测。但反过来，手机在真机位置测出来的结论比电脑更可信，
+    搬进来时**绝不能把它挤掉** —— 所以合并方向是「只补空缺，不夺权」。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _write(self, data):
+        self.tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _read(self):
+        return json.loads(self.tmp.read_text(encoding="utf-8"))
+
+    def _measured(self):
+        return {"seen": 4, "last": ago(hours=20), "best": 40,
+                "bands": {"3": {"ok": 4, "best": 44.6, "dead": 0},
+                          "40": {"ok": 4, "best": 40.7, "dead": 0},
+                          "38": {"ok": 0, "best": None, "dead": 3}}}
+
+    def _exported(self):
+        """模拟「另一台机器」：把一份记忆导出来，本机随即清空。"""
+        self._write({"236-CMCC": self._measured()})
+        payload = A.export_memory("电脑")
+        self._write({})
+        return payload
+
+    def test_export_skips_records_that_only_passed_by(self):
+        """守护路过时写的空记录不导出：那是半成品，搬到别的机器上是假记忆。"""
+        self._write({
+            "236-CMCC": self._measured(),
+            "350-CMCC": {"observed": ago(minutes=5), "seen": 0,
+                         "bands": {"3": {"rsrp": -98}}},
+        })
+        payload = A.export_memory("电脑")
+        self.assertEqual(list(payload["sites"]), ["236-CMCC"])
+        self.assertEqual(payload["kind"], A.MEMORY_KIND)
+        self.assertEqual(payload["origin"], "电脑")
+
+    def test_export_keeps_a_named_place(self):
+        """起过名的地方哪怕没测过也留着 —— 名字是唯一的锚，不是数据。"""
+        self._write({"236-CMCC": {"name": "宿舍", "observed": ago(hours=2), "seen": 0}})
+        self.assertEqual(list(A.export_memory()["sites"]), ["236-CMCC"])
+
+    def test_import_into_empty_machine_keeps_real_age(self):
+        """搬进来不等于「刚测过」：时间戳要保留，该过期还是过期。"""
+        payload = self._exported()
+        stat = A.import_memory(payload)
+        self.assertEqual((stat["added"], stat["merged"]), (1, 0))
+        rec = self._read()["236-CMCC"]
+        self.assertEqual(rec["imported_from"], "电脑")
+        self.assertEqual(rec["best"], 40)
+        self.assertEqual(rec["bands"]["3"]["best"], 44.6)
+
+    def test_import_never_overwrites_local_measurements(self):
+        """本机真机测过的结论优先级最高：best / 名字 / 次数 / 时间都不许被改。"""
+        payload = self._exported()
+        self._write({"236-CMCC": {
+            "seen": 5, "last": "2026-10-31T20:20:00", "best": 3, "name": "宿舍",
+            "bands": {"3": {"ok": 5, "best": 44.6, "dead": 0, "rsrp": -100}},
+        }})
+        A.import_memory(payload)
+        rec = self._read()["236-CMCC"]
+        self.assertEqual(rec["best"], 3)
+        self.assertEqual(rec["name"], "宿舍")
+        self.assertEqual(rec["seen"], 5)
+        self.assertEqual(rec["last"], "2026-10-31T20:20:00")
+        self.assertEqual(rec["bands"]["3"]["rsrp"], -100)   # 本机信号不被抹掉
+
+    def test_import_fills_the_bands_this_machine_never_measured(self):
+        """这正是「帮手机快速成长」：省掉它从零把六条频段各测一遍。"""
+        payload = self._exported()
+        self._write({"236-CMCC": {"seen": 1, "last": ago(hours=1), "best": 3,
+                                  "bands": {"3": {"ok": 1, "best": 44.6, "dead": 0}}}})
+        stat = A.import_memory(payload)
+        rec = self._read()["236-CMCC"]
+        self.assertEqual(stat["merged"], 1)
+        self.assertEqual(sorted(rec["bands"]), ["3", "38", "40"])
+        self.assertEqual(rec["bands"]["40"]["best"], 40.7)   # 补进来
+        self.assertEqual(rec["bands"]["3"]["ok"], 5)         # 累加：1 + 4
+        self.assertEqual(rec["bands"]["38"]["dead"], 3)      # 那条「没信号」也记住了
+
+    def test_import_joins_by_a_known_cell_instead_of_duplicating(self):
+        """同一处换个 PCI 就是另一条记录了 —— 只要那个小区在这处的 cells 里就并进去。"""
+        self._write({"236-CMCC": {"seen": 2, "last": ago(hours=1), "best": 3,
+                                  "cells": [{"pci": "350", "band": 3}],
+                                  "bands": {"3": {"ok": 2, "best": 44.6, "dead": 0}}}})
+        A.import_memory({"kind": A.MEMORY_KIND, "origin": "电脑", "sites": {
+            "350-CMCC": {"seen": 3, "last": ago(hours=30), "best": 3,
+                         "bands": {"3": {"ok": 3, "best": 46.8, "dead": 0}}}}})
+        data = self._read()
+        self.assertEqual(list(data), ["236-CMCC"])
+        self.assertEqual(data["236-CMCC"]["bands"]["3"]["ok"], 5)
+
+    def test_import_rejects_a_file_that_is_not_ours(self):
+        with self.assertRaises(ValueError):
+            A.import_memory({"sites": {}})
+        with self.assertRaises(ValueError):
+            A.import_memory({"kind": A.MEMORY_KIND, "sites": []})
+
+
 if __name__ == "__main__":
     unittest.main()
