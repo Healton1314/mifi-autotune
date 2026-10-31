@@ -1211,16 +1211,24 @@ def note_cell_change(old_key, new_key):
     rec = data.get(real)
     if not rec:
         return                                  # 这处还没建过记录，等体检/快测去建
+    # 锚点必须选「真测过」的那一条。守护的顺序躲不开：先写信号、后判「设备
+    # 换小区了」，所以切频段那一拍 old_key 常常正好是一条刚建的空壳观测记录；
+    # 拿它当本体，等于把位置记忆挂到空壳上，有数据的那条永远读不到。
+    if not rec.get("last") and not _site_measured(rec):
+        nv = data.get(new_key) or {}
+        if nv.get("last") or _site_measured(nv):
+            real, rec = new_key, nv
     _remember_cell(rec, old_key, None)
     _remember_cell(rec, new_key, None)
-    # 新 PCI 名下如果已经有「只有观测、没测过」的记录，桥接这一刻就并进来。
-    # 顺序上躲不开：守护是先写信号、后判「设备换小区了」，所以切到新频段那
-    # 一拍必然先在一个陌生 PCI 下建了条空记录；不在这里并掉，它就要等到
-    # 下一次写记忆（最长 5 分钟）才被吸收 —— 这 5 分钟里守护读到的记忆还是
-    # 「没有信号」，该 blind 还是 blind。
-    nv = data.get(new_key) or {}
-    if nv and not nv.get("last") and not _site_measured(nv):
-        _absorb_site(data, real, new_key)
+    # 两边的纯观测记录（有 observed、没 last、没实测）都在这一刻并进来。
+    # 不并的话，它要等到下一次写记忆（最长 5 分钟）才被吸收 —— 这段时间里
+    # 守护读到的记忆还是「没有信号」，该 blind 还是 blind。
+    for k in (old_key, new_key):
+        if k == real:
+            continue
+        ov = data.get(k) or {}
+        if ov and not ov.get("last") and not _site_measured(ov):
+            _absorb_site(data, real, k)
     save_sites(data)
 
 
