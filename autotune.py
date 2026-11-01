@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -141,6 +141,25 @@ GUARD_RESELECT_DB = 8
 # 实机 17:24 延迟 4402ms、只丢 10%，会被当成「正常」）。
 GUARD_LAG_MS = 2000
 GUARD_BAD_HITS = 3                  # 连续这么多次采样不通 = 锁定的频段撑不住
+# 锁着的时候只看「链路垮没垮」不够。人从住处走到餐厅，原来那条 BAND 3 会从
+# -98dBm 掉到 -115dBm，但餐厅未必到「丢包过半 / 延迟 2 秒」那么惨 —— 于是守护
+# 一路「监控中」，明明换了地方也不解锁。
+# 所以另立一条：**这条的信号比锁定那一刻塌了 10dB 以上，锁的前提就没了**。
+GUARD_LOCK_SIGNAL_HITS = 2          # 连续这么多拍信号塌了才动，挡住单拍抖动
+GUARD_LOCK_SIGNAL_WIN = 4           # 参考值取锁定后最近几拍里最好的那个 RSRP
+# 窗口内换这么多次小区，即使链路还没垮也算「在动」。
+# 为什么不是 GUARD_MOVE_HITS(2)：住处坐着不动，设备自己在两个扇区之间重选也能
+# 凑到 2 次（2026-10-31 实机坐了 144 分钟被误判移动）。3 次基本只有真走路才有。
+GUARD_MOVE_CHURN_ONLY = 3
+# 锁定之后每隔这么久复核一次「锁定这条还够不够用」。
+# 为什么必须有：锁上之后就再也不看记忆、不测速了（设计如此，免得反复断网），
+# 于是「人换了个地方、这条变慢但还没到丢包/延迟阈值」这种情况没有任何出口。
+# 若是两地挨得近（比如餐厅离住处两百米），信号几乎不掉 —— 连「信号塌了」都判不
+# 出来，屏幕上只有「换小区」和「监控中」，一整个午饭都卡在那条频段上。
+GUARD_LOCK_AUDIT_SEC = 1200
+# 两拍之间隔了这么久，说明进程被系统挂起了（Termux 一退到后台就会被冻结）。
+# 这个数只是「报出来」的门槛，不影响任何决策 —— 不报的话，用户会以为守护在跑。
+GUARD_HANG_SLACK = 90
 GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（只管主动动作）
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
 # 挂上，窗口就已经关了，后面那条「解锁仍不通 → 跑体检」永远走不到。
@@ -2510,7 +2529,7 @@ def _pci_num(v):
         return None
 
 
-def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False):
+def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False, churn_n=0):
     """人到底动没动。抽成纯函数，因为这条判断直接决定「要不要解锁」。
 
     PCI 变只是**必要条件**。2026-10-30 的实测推翻了这个假设：坐在住处里、
@@ -2525,6 +2544,8 @@ def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False):
         设备自己换频段时信号通常是**变好**的（-98 → -76），人走路不会这样。
       · 剩下那种「PCI 变了、频段没变、链路垮了」才当移动 —— 真走出覆盖时，
         这两件事一定同时发生。
+      · 还有一条不用看链路的：窗口内换够 GUARD_MOVE_CHURN_ONLY 次小区。
+        走路的特征就是一直换小区，未必每一拍都在丢包。
     """
     if band_changed:
         # 先判这一条，再判「换了几次小区」。设备自己换频段时 PCI 必变、
@@ -2536,16 +2557,41 @@ def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False):
         # 于是解锁、静止计时清零、白等 10 分钟。那一刻丢包 0%、延迟 110ms，
         # 链路好好的 —— 人根本没走。真走出覆盖时，换小区和链路垮一定同时发生。
         return True
+    if churn_n >= GUARD_MOVE_CHURN_ONLY:
+        # 但「链路垮」这个附加条件也会漏判：2026-11-01 中午人从住处走到餐厅，
+        # 5 分钟里换了 3 个小区，可每个新小区的信号都不算差、ping 也没丢，
+        # 于是每一拍都落在「PCI 变了但链路没垮」→ 判「人没动」→ 带着住处那条
+        # BAND 3 的锁在餐厅坐了一中午。换到 3 次就够说明问题了，别再要求链路垮。
+        return True
     return bool(pci_changed and bad_now)
 
 
+UNLOCK_SIGNAL_COLLAPSE = "锁着的这条信号塌了（多半是走开了），锁的前提没了"
+
+
+def lock_signal_collapsed(lock_rsrp, cur_rsrp, drop=GUARD_LOCK_RSRP_DROP):
+    """锁着的那条现在还剩多少信号 —— 比锁定那一刻塌了 drop 以上就算塌了。
+
+    为什么单独拎一条：链路指标（丢包/延迟）是**结果**，信号是**原因**。人走开
+    之后信号先掉、链路过一会儿才垮，甚至根本不垮（餐厅的 BAND 3 只是慢）。
+    2026-11-01 中午就是这个样子：守护一路「监控中」，用户看着「换了小区」的
+    提示等它解锁，一中午都没等到。
+    """
+    if lock_rsrp is None or cur_rsrp is None:
+        return False
+    return cur_rsrp <= lock_rsrp - drop
+
+
 def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
-                 cooldown_left, outage_after_unlock):
+                 cooldown_left, outage_after_unlock, signal_collapsed=False):
     """守护状态机：只回答「现在该做什么」，完全不碰设备（为了能单测）。
 
     规则（实测中 定的）：
       · 在移动、且锁着频段 → 解锁。锁死一个频段，走到没覆盖的地方就断网，
         而设备本来能自己换。这是「保证一直有网」的第一道保险。
+      · 锁着、但这条的信号比锁定那一刻塌了 10dB 以上（连续两拍）→ 也解锁。
+        原先只有「人动」和「连续不通」两条路会解锁，而「人走开了、信号掉了、
+        链路还没垮」正好卡在中间，能锁一整天。
       · 原地不动够久、且没锁 → **先选优，再锁定**（跑一次体检测出最优频段）。
         只锁「当前驻留的」不一定最优，可能把一个次优频段长期锁死；
         选优只在久坐时发生一次，不会反复断网（--guard-fast 可跳过选优）。
@@ -2562,6 +2608,9 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
     # 等于「锁在坏频段上」的自救链是断的。
     if moving and locked:
         return "unlock", "检测到移动，锁死频段会限制可用覆盖"
+    if signal_collapsed and locked:
+        # 不等到「丢包过半」才认：信号塌了就是锁的前提（这个位置这条频段好）没了。
+        return "unlock", UNLOCK_SIGNAL_COLLAPSE
     if bad and locked:
         return "unlock", f"锁定后连续 {bad_streak} 次不通，先解锁自救"
     if bad and not locked and outage_after_unlock:
@@ -3408,6 +3457,36 @@ def _install_stop_signals():
             pass                        # 非主线程装不了，忽略
 
 
+def _acquire_wakelock():
+    """尽量别让系统把 Termux 冻住（能拿就拿，拿不到不影响守护运行）。
+
+    症状：切到别的应用几分钟再回来，屏幕上还停在切走前那一行 —— 这期间一拍都没
+    采。这是 Android 的后台管理，不是代码能绕过的 —— 但 Termux 自带
+    `termux-wake-lock`（就是通知栏那个 Acquire wakelock 按钮的等价物），有就替
+    你按一下，省得忘了。
+    """
+    exe = shutil.which("termux-wake-lock")
+    if not exe:
+        return False
+    try:
+        subprocess.run([exe], timeout=10, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _release_wakelock():
+    exe = shutil.which("termux-wake-unlock")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe], timeout=10, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def guard_still_reset(*, pci_changed, moving, band_changed=False):
     """这一拍要不要把「静止计时」清零。
 
@@ -3452,11 +3531,16 @@ def run_guard(args, cfg):
           "（信号好看不代表快：基站拥塞时 -78dBm 也可能只有 3 Mbps）")
     print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
           f" → 先换备选，没有才解锁")
+    print(f"  锁定后每 {int(GUARD_LOCK_AUDIT_SEC / 60)} 分钟复核一次"
+          f"（只测不切：够不够用，不够就换备选/解锁）")
     print(f"  Ctrl+C 停止（按不出来就在另一个窗口跑 mifi --stop）"
           f"{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
     print("=" * 62, flush=True)
 
     _install_stop_signals()
+
+    if not dry and _acquire_wakelock():
+        print("  已替你按下 Termux 的 wakelock（切走应用也不容易被系统冻住）", flush=True)
 
     dev = None
     last_pci, last_rsrp, stable_since, pci_log = None, None, time.time(), deque()
@@ -3471,10 +3555,32 @@ def run_guard(args, cfg):
     last_loss_note = 0.0                 # 上次把「高丢包」写进记忆的时刻
     last_rsrp_note = 0.0                 # 上次把「采样到的信号」写进记忆的时刻
     place, place_key = "", ""            # 这地方叫什么（`--here` 起的名字），按 PCI 缓存
+    lock_rsrp_hist = deque(maxlen=GUARD_LOCK_SIGNAL_WIN)   # 锁住这条原本有多少信号
+    lock_ref_band = 0                    # 参考值是给哪条频段记的（换条就重来）
+    lock_weak_hits = 0                   # 连续几拍发现「锁的这条信号塌了」
+    last_beat = 0.0                      # 上一拍的开始时刻（用来发现被系统挂起）
+    hangs = 0                            # 被系统挂起过几次
+    next_audit = 0.0                     # 下次「锁定复核」的时刻
 
     try:
         while True:
             now = time.time()
+            # 手机把 Termux 退到后台就会冻结它（Android 12+ 的 phantom process
+            # killer 更狠，直接杀）。冻结期间一拍都不采，可屏幕上最后一行还写着
+            # 「监控中」，看的人以为它在盯着 —— 界面切走一次再回来，才发现整段
+            # 时间什么都没发生。
+            # 这里只负责把它**说出来**：真正防冻结要去通知栏点 Acquire wakelock、
+            # 或把 Termux 的电池策略设成「不受限制」。
+            if last_beat and now - last_beat > interval * GUARD_HANG_FACTOR + GUARD_HANG_SLACK:
+                hangs += 1
+                print(f"{_now_hm()}  [!] 上一拍到这一拍隔了 {int(now - last_beat)} 秒"
+                      f"（正常约 {interval} 秒）—— 这段时间被系统挂起了，没在采样",
+                      flush=True)
+                if hangs == 1:
+                    print("      手机把 Termux 放后台就会冻结它。两个开关任选："
+                          "下拉通知栏点 Termux 的 Acquire wakelock；"
+                          "或 设置 → 应用 → Termux → 电池 → 不受限制", flush=True)
+            last_beat = now
             if dev is None:
                 try:
                     dev = detect(args.host, args.user, args.password, name=args.driver)
@@ -3516,6 +3622,27 @@ def run_guard(args, cfg):
                       f"但你指定过 BAND {pin_goal} —— 按「没锁对」处理",
                       flush=True)
                 locked = False
+
+            # 「锁的这条还剩多少信号」的参考值。取锁定后最近几拍里**最好**的那个
+            # RSRP：信号一点点往下滑不算塌，只有真的掉了一大截（人走开了）才算。
+            # 参考值按频段记：设备中途自己换了频段，就得重新积累，不能拿上一条的
+            # -78 去比这一条的 -103。
+            if locked:
+                if lock_ref_band != locked_band:
+                    lock_rsrp_hist.clear()
+                    lock_weak_hits = 0
+                    next_audit = now + GUARD_LOCK_AUDIT_SEC
+                lock_ref_band = locked_band
+                if rsrp is not None:
+                    lock_rsrp_hist.append(rsrp)
+            else:
+                lock_ref_band = 0
+                lock_rsrp_hist.clear()
+                lock_weak_hits = 0
+            lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
+            lock_weak_hits = (lock_weak_hits + 1
+                              if lock_signal_collapsed(lock_ref, rsrp) else 0)
+            signal_collapsed = lock_weak_hits >= GUARD_LOCK_SIGNAL_HITS
 
             # 体检刚跑完：把它的结论真的落到设备上。
             # 这段必须在「重连成功 + 读到状态」之后做 —— 体检子进程要抢登录，
@@ -3612,7 +3739,8 @@ def run_guard(args, cfg):
 
             churn = len(pci_log) >= GUARD_MOVE_HITS
             moving = guard_is_moving(churn=churn, pci_changed=pci_changed,
-                                     bad_now=bad_now, band_changed=band_changed)
+                                     bad_now=bad_now, band_changed=band_changed,
+                                     churn_n=len(pci_log))
             if pci_changed and not moving:
                 # 人没动、设备自己换的小区 → 记进同一处，这地方以后认得它
                 note_cell_change(last_key, _site_key(st))
@@ -3725,10 +3853,37 @@ def run_guard(args, cfg):
                   f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
                   flush=True)
 
+            # 锁定复核：锁上之后按设计就不再看记忆、不测速了，免得反复断网 ——
+            # 但「人换了个地方、这条变慢、还没慢到丢包/延迟阈值」就没了出口。
+            # 2026-11-01 中午在餐厅就是这样：一顿饭卡在住处锁的 BAND 3 上，屏幕
+            # 只有「换小区」和「监控中」。所以每隔 GUARD_LOCK_AUDIT_SEC 量一次，
+            # 只测不切；判「不够用」就走自救那条路（先换备选，没有才解锁）。
+            if locked and not dry and not moving and now >= next_audit:
+                if speed_url is None:
+                    speed_url = probe.resolve_speed_url(cfg.get("speed_url"),
+                                                        verbose=False)
+                print(f"{_now_hm()}  锁定复核：量一下 BAND {locked_band} 还够不够用"
+                      f"（只测，不切）…", flush=True)
+                audit = guard_quick_probe(speed_url, host)
+                audit["band"] = locked_band
+                next_audit = time.time() + GUARD_LOCK_AUDIT_SEC
+                g = _quick_grade(audit)
+                mbps = audit.get("mbps") or 0
+                if g == "poor":
+                    print(f"      [!] 复核结论：{mbps:.0f} Mbps、延迟 "
+                          f"{audit.get('avg') or '—'}ms —— 这条已经不够用了，"
+                          f"不再死守", flush=True)
+                    # 把它当成「连续不通」那一档：guard_decide 会走自救
+                    # （先换记忆里的备选，没有才解锁），不用另开一套逻辑。
+                    bad_streak = max(bad_streak, GUARD_BAD_HITS)
+                elif g == "good":
+                    print(f"      复核结论：{mbps:.0f} Mbps，够用，继续守着", flush=True)
+
             action, why = guard_decide(
                 moving=moving, still_sec=still, settle_sec=settle, locked=locked,
                 bad_streak=bad_streak, cooldown_left=max(0.0, next_allowed - now),
-                outage_after_unlock=outage_after_unlock)
+                outage_after_unlock=outage_after_unlock,
+                signal_collapsed=signal_collapsed)
 
             # 演练模式原来只印一句「未改动设备」，锁哪一条、凭什么全都看不到 ——
             # 而这恰恰是演练唯一想看的。所以「锁哪条」的裁决在打印之前就算出来，
@@ -3768,6 +3923,11 @@ def run_guard(args, cfg):
                     # 冷却只挡「主动锁」，不挡自救（unlock/measure 都在它前面判）。
                     next_allowed = time.time() + GUARD_COOLDOWN
                 elif action == "unlock":
+                    if why == UNLOCK_SIGNAL_COLLAPSE:
+                        # 这条是你指定过的、现在当地已经不行了 → 记一笔。
+                        # 连续两次就会自动取消 pin，否则「解锁 → 下一拍又照 pin
+                        # 锁回来」，解锁等于没解（2026-11-01 中午在餐厅就是这样）。
+                        note_pin_failure(locked_band)
                     _guard_unlock(dev, locked_band)
                     unlocked_at = time.time()
                     pci_log.clear()
@@ -3908,6 +4068,7 @@ def run_guard(args, cfg):
                 next_allowed = time.time() + GUARD_COOLDOWN
             time.sleep(interval)
     except KeyboardInterrupt:
+        _release_wakelock()
         print("\n[守护] 已停止（设备保持当前配置）")
         return 0
 

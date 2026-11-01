@@ -39,6 +39,26 @@ class GuardDecide(unittest.TestCase):
     def test_not_settled_yet_does_nothing(self):
         self.assertIsNone(decide(still_sec=300, settle_sec=600)[0])
 
+    def test_collapsed_signal_with_lock_unlocks(self):
+        """锁着的这条信号塌了 → 解锁。
+
+        原先只有「人动」和「连续不通」会解锁，「人走开了、信号掉了、链路还没
+        垮」正好卡在中间，能锁一整天（2026-11-01 中午）。
+        """
+        action, why = decide(locked=True, signal_collapsed=True)
+        self.assertEqual(action, "unlock")
+        self.assertEqual(why, A.UNLOCK_SIGNAL_COLLAPSE)
+
+    def test_collapsed_signal_without_lock_does_nothing(self):
+        # 没锁着就不关它的事，设备自己会换
+        self.assertIsNone(decide(signal_collapsed=True)[0])
+
+    def test_moving_still_wins_over_collapse(self):
+        # 两条都成立时先说「移动」—— 那是更根本的原因
+        action, why = decide(locked=True, moving=True, signal_collapsed=True)
+        self.assertEqual(action, "unlock")
+        self.assertIn("移动", why)
+
     def test_settled_but_already_locked_does_nothing(self):
         self.assertIsNone(decide(still_sec=999, settle_sec=600, locked=True)[0])
 
@@ -565,6 +585,19 @@ class MovingDetection(unittest.TestCase):
         self.assertFalse(self._move(churn=True, pci_changed=True, bad_now=True,
                                     band_changed=True))
 
+    def test_three_cells_in_window_is_moving(self):
+        """换够 3 个小区就算在动，不再要求链路同时垮。
+
+        两地挨得近时（餐厅离住处两百米）对方就是这么漏的：5 分钟里换了 3 个小区，
+        可每个新小区信号都不算差、ping 也没丢，于是每一拍都判「人没动」，
+        带着原来那条 BAND 3 的锁在新地方坐了一中午。
+        """
+        self.assertTrue(self._move(churn=True, pci_changed=True, churn_n=3))
+
+    def test_two_cells_is_still_not_moving(self):
+        # 2 次还是放行：住处坐着不动，设备自己在两个扇区之间重选也能凑到 2 次
+        self.assertFalse(self._move(churn=True, pci_changed=True, churn_n=2))
+
 
 class StillReset(unittest.TestCase):
     """「坐满 10 分钟才锁」不能被移动判定的尾巴拖长。
@@ -1033,6 +1066,28 @@ class FlapAvoid(unittest.TestCase):
         self.assertTrue(A.site_band_flap(st, 40))
         self.assertFalse(A.site_band_flap(st, 3))     # 没样本 → 不定罪
         self.assertFalse(A.site_band_flap(st, None))
+
+
+class LockSignalCollapse(unittest.TestCase):
+    """锁着的那条信号还剩多少 —— 链路指标是结果，信号是原因。
+
+    人走开之后信号先掉，链路过一会儿才垮，甚至根本不垮（餐厅离住处近，
+    那条 BAND 3 只是变慢）。所以「信号塌了」要单独判一次。
+    """
+
+    def test_drop_ten_db_is_collapse(self):
+        self.assertTrue(A.lock_signal_collapsed(-98, -108))
+
+    def test_small_drop_is_not(self):
+        # 掉 8dB 还在正常波动范围里，别一惊一乍
+        self.assertFalse(A.lock_signal_collapsed(-98, -106))
+
+    def test_signal_getting_better_is_not(self):
+        self.assertFalse(A.lock_signal_collapsed(-108, -95))
+
+    def test_unknown_is_never_collapse(self):
+        self.assertFalse(A.lock_signal_collapsed(None, -110))
+        self.assertFalse(A.lock_signal_collapsed(-98, None))
 
 
 if __name__ == "__main__":
