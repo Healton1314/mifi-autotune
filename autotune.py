@@ -3181,6 +3181,24 @@ def set_device_pin(band):
         pass
 
 
+def _clear_device_pin():
+    """把「就要这条」撤掉 —— 用户手动选了「自动」。
+
+    不清的话会出一个很难解释的现象：他从界面上选了「自动」，设备也确实
+    变回自动了，可守护下次一启动又把 cfg 里那条 pin 捡回来、重新锁上去。
+    口头说的是自动，实际又被锁住，这比不给选项更糟。
+    """
+    try:
+        cfg = load_config()
+        if not cfg.get("pin_band") and not cfg.get("pin_fails"):
+            return
+        cfg["pin_band"] = 0
+        cfg["pin_fails"] = 0
+        save_config(cfg)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def clear_device_pin(reason=""):
     if reason:
         print(f"      → {reason}", flush=True)
@@ -4755,7 +4773,12 @@ def run_lock_band(dev, args):
     又锁回 BAND 40。体检仍是最好的默认，但「我已经知道答案」时要有一条不啰嗦的路。
     """
     band = int(args.lock_band)
-    print(f"\n[锁定] 直接切到 BAND {band}（不测量、不裁决，只切一次）")
+    # band=0 是「解除锁定」，不是「锁定到 0 号频段」—— 界面上那个「自动」选项
+    # 走的就是这条。措辞必须分开，否则用户看到「切到 BAND 0」只会以为出错了。
+    if band == 0:
+        print("\n[解锁] 解除频段锁定，交回设备自己选（只切一次，不测量）")
+    else:
+        print(f"\n[锁定] 直接切到 BAND {band}（不测量、不裁决，只切一次）")
     try:
         print(f"  当前：{dev.get_state().get('band') or '自动'}")
     except Exception:  # noqa: BLE001
@@ -4780,6 +4803,18 @@ def run_lock_band(dev, args):
     except Exception:  # noqa: BLE001
         pass
     cur = st.get("band") or 0
+
+    if band == 0:
+        # 「解锁」要核对的是**锁定值**变成 0；而 st 里的服务频段一直都在，
+        # 拿它去比对会永远「对不上」，所以这条分支不套下面那套校验。
+        if cur:
+            print(f"[!] 读回来的锁定值还是 BAND {cur}，可能没解除；稍后用 --status 再看一次")
+            return 1
+        _clear_device_pin()
+        print(f"[√] 已解除锁定（设备此刻驻留在 BAND {serving_band(st) or '—'}）")
+        print("  之后它会自己按信号强弱选频段，不再听这边的。")
+        return 0
+
     print(f"[√] 已锁定 BAND {cur or band}"
           f"（RSRP {sig.get('rsrp') or '—'}，PCI {sig.get('pci') or '—'}）")
     try:
@@ -4793,6 +4828,52 @@ def run_lock_band(dev, args):
         print(f"[!] 读回来是 BAND {cur}，不是 {band} —— 这台设备可能不支持这条")
         return 1
     print("  出门前记得：mifi --restore")
+    return 0
+
+
+def run_set_channel(dev, args):
+    """直接把 WiFi 信道设成指定值：不扫描、不评分、只写一次。
+
+    和 run_lock_band 是同一类命令 —— 用户已经知道答案（邻居全挤在 6，
+    他就要 13），不该逼他再走一遍「扫描 → 给建议 → 点应用」。
+    channel=0 表示交回设备自动。
+
+    注意这台设备的 WiFi 就是操作者唯一的通道：改信道 = 自己的网先断。
+    所以「发完指令读不回状态」是必然现象，不能当成失败（那正是 10-30
+    那次把成功的操作报成失败的原因）。
+    """
+    ch = int(args.set_channel)
+    label = "自动" if ch == 0 else f"信道 {ch}"
+    print(f"\n[设置] 直接改到{label}（不扫描、不评分，只写一次）")
+    try:
+        before = dev.get_state().get("channel") or 0
+        print(f"  当前：{'自动' if not before else f'信道 {before}'}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        dev.set_channel(ch)
+    except DeviceUnreachable:
+        pass                        # 改信道必断 AP，指令通常已经送达
+    except Unsupported as e:
+        print(f"[跳过] {e}")
+        return 2
+    except Exception as e:  # noqa: BLE001
+        print(f"[×] 设置失败：{type(e).__name__}: {e}")
+        return 1
+    # 改信道比换频段回来得快，但手机自己也要重连一次，60 秒是宽裕值。
+    if not wait_device_back(dev, timeout=60, poll=3):
+        print("[!] 设备 60 秒没回来；指令多半已生效，稍后用 --status 确认")
+        return 1
+    try:
+        cur = dev.get_state().get("channel") or 0
+    except Exception:  # noqa: BLE001
+        print("[!] 改完读不回设备状态，稍后用 --status 确认")
+        return 0
+    if cur != ch:
+        have = "自动" if not cur else f"信道 {cur}"
+        print(f"[!] 读回来是{have}，不是{label} —— 这台设备可能不支持这条")
+        return 1
+    print(f"[√] 已切到{label}")
     return 0
 
 
@@ -4814,7 +4895,9 @@ def main():
     ap.add_argument("--memory-origin", metavar="名字",
                     help="给导出的记忆标个来源（如 住处电脑），导入时会显示出来")
     ap.add_argument("--lock-band", type=int, metavar="N",
-                    help="直接锁到指定频段（只切一次，不测量）；出门前记得 --restore")
+                    help="直接锁到指定频段（只切一次，不测量）；0 = 解除锁定交回自动")
+    ap.add_argument("--set-channel", type=int, metavar="N",
+                    help="直接设 WiFi 信道（只切一次，不扫描）；0 = 自动")
     ap.add_argument("--here", metavar="名字",
                     help="给当前位置起个名字（如 mifi --here 住处），日志里会带上它")
     ap.add_argument("--observe", type=int, default=OBSERVE_SEC, metavar="秒",
@@ -5024,8 +5107,11 @@ def main():
     # 动手测之前先确认「测速源真的下得动」。
     # 实测踩过：整条链路 HTTPS 到 CDN 全失败（HTTP 正常），于是每个频段都测出
     # 0 Mbps，工具据此推荐了错误的频段。先选源能把这类假结论挡在源头。
+    # 这几条都不测速（只写一次就完事），没有测速源可用与否的问题。
+    # lock-band / set-channel 用 `is not None` 判：0 是「自动」，是合法值。
     if not (args.watch or args.restore or args.apply_plan or args.list_drivers
-            or args.lock_band or args.here):
+            or args.lock_band is not None or args.set_channel is not None
+            or args.here):
         speed_url = probe.resolve_speed_url(speed_url)
 
     if args.guard:
@@ -5104,8 +5190,13 @@ def main():
     if args.apply_channel:
         return run_apply_channel(dev, caps, st0, args, ping_host)
 
-    if args.lock_band:
+    # 0 是合法输入（解除锁定 / 交回自动），所以只判 None —— 写成 `if args.lock_band:`
+    # 会把「自动」这条最常用的选项直接吞掉，界面上点了没反应。
+    if args.lock_band is not None:
         return run_lock_band(dev, args)
+
+    if args.set_channel is not None:
+        return run_set_channel(dev, args)
 
     if args.here:
         return run_here(dev, args)

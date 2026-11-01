@@ -22,6 +22,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.concurrent.thread
 
@@ -74,6 +75,15 @@ class MainActivity : Activity() {
     // 这条建议来自哪：体检出来的频段（band）还是扫描出来的信道（channel）。
     // 两者落地路径不同 —— 信道只动信道，绝不能顺手把频段也切了。
     private var applyKind = "band"
+    // 手动选频段/信道要用的一组事实：设备认哪些值、现在锁的是什么、支不支持改。
+    // 一律用设备声明的集合，不让手填 —— 填个不支持的值，设备会先静默忽略、
+    // 再花 26 秒重新注册，最后失败，用户只会以为工具坏了。
+    private var devBands: List<Int> = emptyList()
+    private var devChannels: List<Int> = emptyList()
+    private var capLockBand = false
+    private var capSetChannel = false
+    private var curBandLock = 0
+    private var curChannel = 0
     // 详情默认展开：那几个数就是用户打开 app 最想先看到的，藏起来反而多一步。
     // 「收起」还留着 —— 想只看按钮和开关的人可以收掉。
     private var detailOpen = true
@@ -193,6 +203,21 @@ class MainActivity : Activity() {
         tools.addView(restore, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         box.addView(spacer(12))
         box.addView(tools)
+
+        // 手动选择：和上面「扫描信道」不是一回事 —— 那条是「我不知道哪个好，你
+        // 扫给我看」，这条是「我已经知道答案」。体检要 3~6 分钟、中途断网，还可能
+        // 因为波动大给不出结论；用户说「BAND 40 晚上丢包，我就要 BAND 3」的时候，
+        // 他要的是把设备锁过去，不是再被说服一遍。
+        val manual = row()
+        val pickBand = actionButton("手动设频段", false)
+        pickBand.setOnClickListener { showBandDialog() }
+        val pickChan = actionButton("手动设信道", false)
+        pickChan.setOnClickListener { showChannelDialog() }
+        manual.addView(pickBand, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        manual.addView(spacerW(10))
+        manual.addView(pickChan, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        box.addView(spacer(10))
+        box.addView(manual)
 
         // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿弹出来
         val logBtn = actionButton("查看运行日志", false)
@@ -413,6 +438,15 @@ class MainActivity : Activity() {
             val serving = if (o.isNull("serving_band")) 0 else o.optInt("serving_band", 0)
             val bandWarn = o.optBoolean("band_warn", false)
 
+            // 手动选择要用的那份事实，跟着每次状态刷新一起更新 —— 设备换了、
+            // 固件不同，支持的值就不一样，缓存一次是不行的。
+            curBandLock = band
+            curChannel = o.optInt("channel", 0)
+            capLockBand = o.optBoolean("can_lock_band", false)
+            capSetChannel = o.optBoolean("can_set_channel", false)
+            devBands = intList(o.optJSONArray("bands"))
+            devChannels = intList(o.optJSONArray("channels"))
+
             // 状态行只说一句人话：好不好。数字都放详情里。
             val slow = (loss >= 8) || (lat >= 200)
             // 锁 39 实际驻留 3 这种事必须说，不然用户以为自己锁住了，白等。
@@ -577,6 +611,215 @@ class MainActivity : Activity() {
                 runTask("restore") { "正在恢复，完成后会自动重连" }
             }
             .show()
+    }
+
+    // ---------------- 手动选频段 / 信道 ----------------
+
+    private fun showBandDialog() {
+        if (guardOn) {
+            showLog("守护在跑，先关掉它再手动设")
+            return
+        }
+        if (!capLockBand) {
+            showLog("这台设备不支持锁定频段")
+            return
+        }
+        if (devBands.isEmpty()) {
+            showLog("还没读到设备支持哪些频段，等状态刷新一下再点")
+            return
+        }
+        // current 传的是**锁定值**（0 = 自动）。界面上显示的实际驻留频段是另一个
+        // 概念，不能拿来当选中项 —— 否则「自动但此刻在 BAND 40」会被画成「锁了 40」。
+        pickDialog(
+            title = "手动选频段",
+            sub = "只切一次，不测速、不裁决。换频段会断网 20~40 秒。",
+            values = devBands,
+            current = curBandLock,
+            label = { "BAND $it" },
+            autoLabel = "自动",
+            allowAuto = true
+        ) { band ->
+            val what = if (band == 0) "解除频段锁定" else "锁定到 BAND $band"
+            AlertDialog.Builder(this)
+                .setTitle("$what？")
+                .setMessage("会断一次网，20~40 秒后自动重连。")
+                .setNegativeButton("算了", null)
+                .setPositiveButton("确定") { _, _ -> startManual("lock_band", band, "$what…") }
+                .show()
+        }
+    }
+
+    private fun showChannelDialog() {
+        if (guardOn) {
+            showLog("守护在跑，先关掉它再手动设")
+            return
+        }
+        if (!capSetChannel) {
+            showLog("这台设备不支持改信道")
+            return
+        }
+        if (devChannels.isEmpty()) {
+            showLog("还没读到设备支持哪些信道，等状态刷新一下再点")
+            return
+        }
+        pickDialog(
+            title = "手动设信道",
+            sub = "只写一次，不扫描、不评分。改信道会断网十几秒。",
+            values = devChannels,
+            current = curChannel,
+            label = { "信道 $it" },
+            autoLabel = "自动",
+            allowAuto = true
+        ) { ch ->
+            val what = if (ch == 0) "交回自动选信道" else "切到信道 $ch"
+            AlertDialog.Builder(this)
+                .setTitle("$what？")
+                // 这台设备的 WiFi 就是手机唯一的通道，改信道等于先把自己掐断。
+                // 不说清楚，用户会以为「怎么一点就断网了，是不是坏了」。
+                .setMessage("手机现在就是通过这台设备的 WiFi 上网的，改信道会先断一下再自动重连。")
+                .setNegativeButton("算了", null)
+                .setPositiveButton("确定") { _, _ -> startManual("set_channel", ch, "$what…") }
+                .show()
+        }
+    }
+
+    /** 手动设置的落地：只跑一条命令，不碰体检结论、不碰守护。 */
+    private fun startManual(fn: String, value: Int, busyText: String) {
+        if (busy) return
+        busy = true
+        // 手动改过之后，屏幕上那条体检结论就过期了。留着它等于骗人 ——
+        // 用户会以为「建议里写的是 BAND 3」，而设备已经被他自己改成别的了。
+        hideVerdict()
+        btnMain.text = busyText
+        btnMain.isEnabled = false
+        btnMain.alpha = 0.6f
+        showLog(busyText)
+        Py.callLong(this, fn, value) { txt ->
+            val o = json(txt)
+            if (o == null || !o.optBoolean("ok", false)) {
+                showLog("没启动起来：" + (o?.optString("msg") ?: txt.take(200)))
+                busy = false
+                resetMain()
+                btnMain.isEnabled = true
+                btnMain.alpha = 1f
+            }
+            // 起来之后 busy 交给 pollJob 在任务结束时复位，和体检/恢复走同一条路
+        }
+    }
+
+    /**
+     * 一组可选值 +「自动」。选中项自己画高亮 —— 整个界面是手写的 LinearLayout，
+     * 没有 Material 的 Chip 可用，选中态只能自己涂。
+     */
+    private fun pickDialog(
+        title: String,
+        sub: String,
+        values: List<Int>,
+        current: Int,
+        label: (Int) -> String,
+        autoLabel: String,
+        allowAuto: Boolean,
+        onPick: (Int) -> Unit
+    ) {
+        val all = ArrayList<Int>()
+        if (allowAuto) all.add(0)
+        all.addAll(values)
+
+        // 设备当前值不在候选里（比如固件报了个 14）就落到「自动」，别显示成没选
+        var picked = if (all.contains(current)) current else 0
+        val chips = LinkedHashMap<Int, TextView>()
+
+        fun paint() {
+            for ((v, tv) in chips) {
+                val on = v == picked
+                tv.setTextColor(if (on) Color.WHITE else INK)
+                (tv.background as? GradientDrawable)?.setColor(
+                    if (on) ACCENT else Color.parseColor("#EFEFF3")
+                )
+            }
+        }
+
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // 一行 4 个：13 个信道排 4 行，弹窗不会顶出屏幕
+        for (group in all.chunked(4)) {
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(8), 0, 0)
+            }
+            for (i in 0 until 4) {
+                if (i > 0) r.addView(spacerW(8))
+                val v = group.getOrNull(i)
+                if (v == null) {
+                    // 末行补空位，否则剩下的一个会拉满整行，看着像主按钮
+                    r.addView(View(this), LinearLayout.LayoutParams(0, dp(1), 1f))
+                    continue
+                }
+                val tv = TextView(this).apply {
+                    text = if (v == 0) autoLabel else label(v)
+                    gravity = Gravity.CENTER
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                    setTypeface(typeface, Typeface.BOLD)
+                    background = GradientDrawable().apply { cornerRadius = dp(12).toFloat() }
+                    setPadding(dp(2), dp(11), dp(2), dp(11))
+                    isClickable = true
+                    isFocusable = true
+                }
+                tv.setOnClickListener {
+                    picked = v
+                    paint()
+                }
+                chips[v] = tv
+                r.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            grid.addView(r)
+        }
+        paint()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+        }
+        root.addView(TextView(this).apply {
+            text = title
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(INK)
+        })
+        root.addView(TextView(this).apply {
+            text = sub
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextColor(MUTED)
+            setPadding(0, dp(6), 0, 0)
+        })
+        root.addView(grid)
+
+        val dlg = Dialog(this)
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val cancel = actionButton("取消", false)
+        val okBtn = actionButton("应用", true)
+        cancel.setOnClickListener { dlg.dismiss() }
+        okBtn.setOnClickListener {
+            dlg.dismiss()
+            onPick(picked)
+        }
+        bar.addView(cancel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(spacerW(10))
+        bar.addView(okBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(bar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(14) })
+
+        dlg.setContentView(root)
+        dlg.window?.setLayout(
+            (resources.displayMetrics.widthPixels * 0.92f).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.show()
     }
 
     private fun runTask(fn: String, okMsg: () -> String) {
@@ -776,6 +1019,14 @@ class MainActivity : Activity() {
         if (s.isNullOrBlank() || s == "null") return null
         val m = Regex("-?\\d+(?:\\.\\d+)?").find(s) ?: return null
         return m.value.toDoubleOrNull()?.toInt()
+    }
+
+    /** JSON 数组 → Int 列表。设备能力里这些值一定是整数，取不出来就跳过。 */
+    private fun intList(a: JSONArray?): List<Int> {
+        if (a == null) return emptyList()
+        val out = ArrayList<Int>(a.length())
+        for (i in 0 until a.length()) out.add(a.optInt(i, 0))
+        return out.filter { it > 0 }
     }
 
     private fun card() = LinearLayout(this).apply {

@@ -525,6 +525,12 @@ def device_status():
         "mtu": st.get("mtu"),
         "max_clients": (st.get("raw", {}).get("wlan") or {}).get("max_clients"),
         "can_lock_band": caps.get("can_lock_band", False),
+        # 手动设频段/信道要给用户一份「这台设备认的合法值」，不能让他手填。
+        # 填了个不支持的值，设备要么静默忽略、要么花 26 秒重新注册再失败，
+        # 用户只会以为工具坏了。
+        "can_set_channel": caps.get("can_set_channel", False),
+        "bands": caps.get("bands") or [],
+        "channels": caps.get("channels") or [],
         "lte": st.get("signal") or {},
         "ping": ping,
         "ts": int(time.time()),

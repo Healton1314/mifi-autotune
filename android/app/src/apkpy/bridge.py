@@ -103,12 +103,17 @@ def restore():
     return _start(["--restore"], "restore")
 
 
-def optimize(mode="all"):
-    args = {"check": [],
-            "wifi": ["--apply", "--wifi-only"],
-            "lte": ["--apply", "--lte-only"],
-            "all": ["--apply"]}.get(mode, ["--apply"])
-    return _start(args, "optimize-" + mode)
+def lock_band(band):
+    """直接锁到指定频段（只切一次，不测量）。band=0 表示解除锁定交回自动。
+
+    和体检那条路的区别：体检要先测完再裁决，这条路是「用户已经知道答案」。
+    """
+    return _start(["--lock-band", str(int(band))], "lock-band")
+
+
+def set_channel(channel):
+    """直接设 WiFi 信道（只写一次，不扫描）。channel=0 表示自动。"""
+    return _start(["--set-channel", str(int(channel))], "set-channel")
 
 
 def job():
