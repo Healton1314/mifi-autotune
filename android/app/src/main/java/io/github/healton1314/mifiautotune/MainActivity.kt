@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     // 主操作
     private lateinit var btnMain: TextView
     private lateinit var jobBox: LinearLayout
+    private lateinit var jobScroll: ScrollView
     private lateinit var tvJob: TextView
 
     // 守护
@@ -54,6 +55,7 @@ class MainActivity : Activity() {
 
     private var busy = false
     private var statusBusy = false
+    private var guardOn = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -188,8 +190,11 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#14161A"))
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
-        jobBox.addView(tvJob, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(190)
+        // 必须是可滚动的：体检和守护都能刷出上百行，直接塞进固定高度的
+        // TextView 只会把超出的部分裁掉，用户以为卡住了。
+        jobScroll = ScrollView(this).apply { addView(tvJob) }
+        jobBox.addView(jobScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(200)
         ))
         box.addView(jobBox)
         return box
@@ -262,7 +267,10 @@ class MainActivity : Activity() {
                 // 直接拿它判空会让日志区一直挂着。这里显式问 isNull。
                 val kind = if (o.isNull("kind")) "" else o.optString("kind")
                 val exit = if (o.isNull("exit")) 0 else o.optInt("exit", 0)
-                if (running || kind.isNotEmpty() || exit != 0) showJob(o)
+                val hasLines = (o.optJSONArray("lines")?.length() ?: 0) > 0
+                // hasLines 这一条是给守护用的：守护不走 JOB 的 running/kind，
+                // 只往日志缓冲里写，不加这行它一整套输出都会被判成「没事可显示」。
+                if (running || kind.isNotEmpty() || exit != 0 || hasLines) showJob(o)
                 if (!running && busy) {
                     busy = false
                     btnMain.text = "开始体检并优化"
@@ -317,6 +325,13 @@ class MainActivity : Activity() {
 
     private fun startPreview() {
         if (busy) return
+        // 守护开着的时候它自己也在连设备、也在切频段。这时候再跑体检，两边会
+        // 抢同一台路由器的登录和射频状态，结果是谁都不准。先说清楚，别硬跑。
+        if (guardOn) {
+            jobBox.visibility = View.VISIBLE
+            tvJob.text = "守护模式正在运行，体检会和它抢设备。\n先在上面把守护关掉，再体检。"
+            return
+        }
         busy = true
         btnMain.text = "体检中…（约 3~6 分钟）"
         btnMain.isEnabled = false
@@ -374,14 +389,17 @@ class MainActivity : Activity() {
                     swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean -> toggleGuard(x) }
                     tvGuardHint.text = "没起来：" + (o?.optString("msg") ?: txt.take(120))
                 } else {
+                    guardOn = true
                     tvGuardHint.text = "正在运行。它每 30 秒看一眼：在动就松开频段锁，坐满 10 分钟才锁住。"
-                    jobBox.visibility = View.VISIBLE
+                    // 这里不主动把日志区拉出来：守护第一行输出要等它连上设备，
+                    // 先摆一个空黑框只会让人以为又卡住了。日志一到 showJob 会显示。
                 }
             }
         } else {
-            tvGuardHint.text = "正在停止（最多等 30 秒）…"
+            guardOn = false
+            tvGuardHint.text = "正在停止（最多等 30 秒，它会先把手头这一轮跑完）…"
             Py.call(this, "guard_stop") { _ ->
-                tvGuardHint.text = "已停止，设备保持当前设置。"
+                tvGuardHint.text = "已请求停止，设备保持当前设置。"
             }
         }
     }
@@ -390,10 +408,13 @@ class MainActivity : Activity() {
 
     private fun showJob(o: JSONObject) {
         val lines = o.optJSONArray("lines") ?: return
+        if (lines.length() == 0) return
         val sb = StringBuilder()
         for (i in 0 until lines.length()) sb.append(lines.optString(i)).append('\n')
         tvJob.text = sb.toString().trimEnd()
         jobBox.visibility = View.VISIBLE
+        // 跟着最新一行走：用户不需要手动拖到最底下才看见当前在干什么
+        jobScroll.post { jobScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun json(s: String): JSONObject? = try {
