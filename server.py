@@ -509,10 +509,17 @@ def device_status():
     st = dev.get_state()
     caps = dev.capabilities()
     ping = probe.ping_stats(6, cfg["ping_host"])
+    # 「频段」有两个含义，别混：band 是锁定值（0 = 自动），serving_band 是
+    # 设备此刻实际驻留的。恢复默认之后锁定被解除，band 就是 0 —— 界面上如果
+    # 只认 band，就会显示成一个「—」，看着像设备坏了，其实它只是变回自动了。
+    serving = autotune.serving_band(st)
+    _text, band_warn = autotune.describe_band_state(st["band"], serving)
     return {
         "driver": dev.name,
         "vendor": caps.get("vendor"),
         "band": st["band"],
+        "serving_band": serving,
+        "band_warn": band_warn,
         "channel": st["channel"],
         "bandwidth": st.get("bandwidth"),
         "mtu": st.get("mtu"),

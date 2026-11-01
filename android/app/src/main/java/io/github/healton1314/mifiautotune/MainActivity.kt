@@ -3,12 +3,15 @@ package io.github.mifiautotune.app
 import android.annotation.SuppressLint
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.Dialog
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.text.TextUtils
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -48,9 +51,7 @@ class MainActivity : Activity() {
 
     // 主操作
     private lateinit var btnMain: TextView
-    private lateinit var jobBox: LinearLayout
-    private lateinit var jobScroll: ScrollView
-    private lateinit var tvJob: TextView
+    private lateinit var tvMainHint: TextView
 
     // 守护
     private lateinit var swGuard: Switch
@@ -59,6 +60,8 @@ class MainActivity : Activity() {
     private var busy = false
     private var statusBusy = false
     private var guardOn = false
+    // 体检跑完、plan.json 里确实有可改的项 → 主按钮切换成「应用结论」
+    private var planReady = false
     // 详情默认展开：那几个数就是用户打开 app 最想先看到的，藏起来反而多一步。
     // 「收起」还留着 —— 想只看按钮和开关的人可以收掉。
     private var detailOpen = true
@@ -109,6 +112,9 @@ class MainActivity : Activity() {
             text = "正在连接…"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTextColor(MUTED)
+            // 一行封顶：状态行一长就会折行，整页跟着长，一屏就装不下了
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         tvChevron = TextView(this).apply {
@@ -167,57 +173,42 @@ class MainActivity : Activity() {
         val scan = actionButton("扫描信道", false)
         scan.setOnClickListener { doScan(scan) }
         val restore = actionButton("恢复默认", false)
-        restore.setOnClickListener { runTask("restore") { "已请求恢复默认设置" } }
+        // 这条路会把频段锁、信道这些改回出厂状态，中间必然断一次网。
+        // 放在详情里已经不容易误触，再问一句 —— 点错了要重新体检一遍才能回来。
+        restore.setOnClickListener { confirmRestore() }
         tools.addView(scan, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         tools.addView(spacerW(10))
         tools.addView(restore, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         box.addView(spacer(12))
         box.addView(tools)
 
-        // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿调
+        // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿弹出来
         val logBtn = actionButton("查看运行日志", false)
-        logBtn.setOnClickListener { showLogFromBuffer() }
+        logBtn.setOnClickListener { showLogDialog() }
         box.addView(spacer(10))
         box.addView(logBtn)
         return box
     }
 
-    /** 主操作：一个按钮，一句时长说明。没有第二句。 */
+    /** 主操作：一个按钮，一行状态。状态平时是时长说明，跑起来就换成最新一行日志。 */
     private fun primaryCard(): View {
         val box = card()
 
         btnMain = actionButton("开始体检并优化", true)
-        btnMain.setOnClickListener { startPreview() }
+        // 同一个按钮两段含义：第一次是「测」，测完出了结论就变成「应用」。
+        // 不想摆第二个按钮 —— 屏幕上只有一个大按钮的时候，没人会点错。
+        btnMain.setOnClickListener { if (planReady) applyNow() else startPreview() }
         box.addView(btnMain)
 
-        box.addView(TextView(this).apply {
+        tvMainHint = TextView(this).apply {
             text = "约 3~6 分钟，中途会断网"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(MUTED)
             setGravity(Gravity.CENTER)
+            setMaxLines(2)
             setPadding(0, dp(10), 0, 0)
-        })
-
-        jobBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(0, dp(14), 0, 0)
         }
-        tvJob = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            setTextColor(LOG_INK)
-            typeface = Typeface.MONOSPACE
-            setTextIsSelectable(true)
-            setBackgroundColor(Color.parseColor("#14161A"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-        // 必须是可滚动的：体检和守护都能刷出上百行，塞进固定高度的 TextView
-        // 只会把超出的部分裁掉，用户以为卡住了。
-        jobScroll = ScrollView(this).apply { addView(tvJob) }
-        jobBox.addView(jobScroll, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(200)
-        ))
-        box.addView(jobBox)
+        box.addView(tvMainHint)
         return box
     }
 
@@ -247,6 +238,10 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setTextColor(MUTED)
             setPadding(0, dp(6), 0, 0)
+            // 守护每次采样都会带一串读数，不封顶的话这一格能长到占半屏，
+            // 想看的按钮就被顶出去了
+            setMaxLines(2)
+            ellipsize = TextUtils.TruncateAt.END
         }
         box.addView(tvGuardHint)
         return box
@@ -276,9 +271,11 @@ class MainActivity : Activity() {
                 if (running || kind.isNotEmpty() || exit != 0) showJob(o)
                 if (!running && busy) {
                     busy = false
-                    btnMain.text = "开始体检并优化"
                     btnMain.isEnabled = true
                     btnMain.alpha = 1f
+                    // 体检成功不代表没事可做，也不代表该「优化」—— plan.json 里
+                    // changes 为空就是「现在这设置已经最好，别折腾」。让按钮去说实话。
+                    if (kind == "preview" && exit == 0) afterPreview() else resetMain()
                 }
             }
             Main.postDelayed(this, 1200)
@@ -323,6 +320,13 @@ class MainActivity : Activity() {
     private fun refreshStatus() {
         // 上一次还没回来就别再发：每次 status 都要真连设备，堆起来只会越来越慢
         if (statusBusy || !Py.isReady) return
+        // 体检中设备会反复重启射频，这时候去查必然「连不上」—— 那不是故障，
+        // 是过程。老老实实说在体检，别让状态行红一下绿一下地吓人。
+        if (busy) {
+            tvConn.text = "体检中，中途会断网"
+            tvConn.setTextColor(MUTED)
+            return
+        }
         statusBusy = true
         Py.call(this, "status") { txt ->
             statusBusy = false
@@ -338,17 +342,32 @@ class MainActivity : Activity() {
             val loss = if (ping == null || ping.isNull("loss")) -1.0 else ping.optDouble("loss", -1.0)
             val lat = if (ping == null || ping.isNull("avg")) -1.0 else ping.optDouble("avg", -1.0)
             val band = o.optInt("band", 0)
+            // 「频段」有两个：band 是锁定值（0 = 自动），serving_band 是此刻实际
+            // 驻留的。恢复默认之后锁定被解除，band 就是 0 —— 只认 band 的话，
+            // 界面上那一格会变成一个「—」，看着像设备坏了，其实它只是变回自动了。
+            val serving = if (o.isNull("serving_band")) 0 else o.optInt("serving_band", 0)
+            val bandWarn = o.optBoolean("band_warn", false)
 
             // 状态行只说一句人话：好不好。数字都放详情里。
             val slow = (loss >= 8) || (lat >= 200)
-            tvConn.text = when {
-                slow -> "网络偏慢" + if (band > 0) " · BAND $band" else ""
-                else -> "网络正常" + if (band > 0) " · BAND $band" else ""
+            // 锁 39 实际驻留 3 这种事必须说，不然用户以为自己锁住了，白等。
+            val bandTag = when {
+                bandWarn && serving > 0 -> " · 锁 $band 实际 $serving"
+                band > 0 -> " · BAND $band"
+                serving > 0 -> " · 自动 BAND $serving"
+                else -> ""
             }
+            tvConn.text = (if (slow) "网络偏慢" else "网络正常") + bandTag
             tvConn.setTextColor(if (slow) WARN else OK)
 
-            // 详情里的数
-            tvBand.text = if (band > 0) "BAND $band" else "—"
+            // 详情里的数：频段这一格永远显示**实际驻留**的那个。锁定值 0（自动）
+            // 时以前会显示成一个「—」，看着像设备坏了 —— 那是最误导人的一种空。
+            tvBand.text = when {
+                serving > 0 -> "BAND $serving"
+                band > 0 -> "BAND $band"
+                else -> "—"
+            }
+            tvBand.setTextColor(if (bandWarn) WARN else INK)
             tvChan.text = o.optInt("channel", 0).takeIf { it > 0 }?.toString() ?: "自动"
             // 设备给的是带单位的字符串（"-99dBm" / "3dB"）。浏览器里 parseInt 会
             // 自动截出数字，Kotlin 的 optInt 直接失败返回 0 —— 这就是前一版这两格
@@ -375,7 +394,7 @@ class MainActivity : Activity() {
         // 守护开着的时候它自己也在连设备、也在切频段。这时候再跑体检，两边会
         // 抢同一台路由器的登录和射频状态，结果是谁都不准。先说清楚，别硬跑。
         if (guardOn) {
-            showLog("守护模式正在运行，体检会和它抢设备。\n先把下面那个开关关掉，再体检。")
+            showLog("守护在跑，先关掉它再体检")
             return
         }
         busy = true
@@ -384,6 +403,66 @@ class MainActivity : Activity() {
         btnMain.alpha = 0.6f
         showLog("正在启动…")
         runTask("preview") { "已开始体检" }
+    }
+
+    /** 体检跑完了：去 plan.json 里看看有没有值得改的，再决定按钮说什么。 */
+    private fun afterPreview() {
+        Py.call(this, "plan") { txt ->
+            val p = json(txt)?.optJSONObject("plan")
+            val n = p?.optJSONArray("changes")?.length() ?: 0
+            if (p == null) {
+                resetMain()
+                tvMainHint.text = "体检没留下结论，看日志找原因"
+            } else if (n == 0) {
+                // 结论是「别动」的时候，硬塞一个「立即优化」按钮就是骗人
+                resetMain()
+                tvMainHint.text = "当前设置已经合适，不用动"
+            } else {
+                planReady = true
+                btnMain.text = "应用结论"
+                tvMainHint.text = "测完了，有 $n 项可以改 · 会断一次网"
+            }
+        }
+    }
+
+    private fun resetMain() {
+        planReady = false
+        btnMain.text = "开始体检并优化"
+        tvMainHint.text = "约 3~6 分钟，中途会断网"
+    }
+
+    /** 按上次体检的结论改设置。只切一次，比重新体检快得多。 */
+    private fun applyNow() {
+        if (busy) return
+        if (guardOn) {
+            showLog("守护在跑，先关掉它再应用")
+            return
+        }
+        planReady = false
+        busy = true
+        btnMain.text = "正在应用…"
+        btnMain.isEnabled = false
+        btnMain.alpha = 0.6f
+        runTask("apply_plan") { "正在应用，中途会断网" }
+    }
+
+    private fun confirmRestore() {
+        if (guardOn) {
+            showLog("守护在跑，先关掉它再恢复")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("恢复默认设置？")
+            .setMessage("会把频段锁定、信道这些改回设备原来的状态，中间会断一次网。")
+            .setNegativeButton("算了", null)
+            .setPositiveButton("恢复") { _, _ ->
+                busy = true
+                btnMain.text = "正在恢复…"
+                btnMain.isEnabled = false
+                btnMain.alpha = 0.6f
+                runTask("restore") { "正在恢复，完成后会自动重连" }
+            }
+            .show()
     }
 
     private fun runTask(fn: String, okMsg: () -> String) {
@@ -402,6 +481,10 @@ class MainActivity : Activity() {
     }
 
     private fun doScan(btn: TextView) {
+        if (guardOn) {
+            showLog("守护在跑，先关掉它再扫信道")
+            return
+        }
         val old = btn.text
         btn.isEnabled = false
         btn.text = "扫描中…"
@@ -409,11 +492,16 @@ class MainActivity : Activity() {
             btn.isEnabled = true
             btn.text = old
             val o = json(txt)
+            // isNull 对「键不存在」和「值是 null」都返回 true，两种都得算没有。
+            // 不能直接 optString 后判空：那次踩过的坑是拿回一个 "null" 字面量。
+            val err = if (o == null || o.isNull("error")) "" else o.optString("error")
+            val best = if (o == null || o.isNull("best")) 0 else o.optInt("best", 0)
+            val cur = if (o == null || o.isNull("current")) 0 else o.optInt("current", 0)
             showLog(when {
                 o == null -> "扫描失败：${txt.take(200)}"
-                o.optString("error").isNotEmpty() -> "扫描失败：${o.optString("error")}"
-                o.optInt("best", 0) > 0 ->
-                    "当前信道 ${o.optInt("current")}，建议换到 ${o.optInt("best")}"
+                err.isNotEmpty() -> "扫描失败：$err"
+                best > 0 && best != cur -> "现在信道 $cur，建议换到 $best"
+                best > 0 -> "信道 $cur 已经是周围最干净的"
                 else -> "扫到了，但没有可推荐的信道"
             })
         }
@@ -447,44 +535,87 @@ class MainActivity : Activity() {
 
     // ---------------- 小工具 ----------------
 
-    /** 日志区统一入口：有内容才露出来，避免空黑框。 */
-    private fun showLog(text: String) {
-        tvJob.text = text
-        jobBox.visibility = View.VISIBLE
-    }
-
     /**
-     * 从「详情」里主动要日志。
+     * 一行状态，不再往界面上堆日志。
      *
-     * 平时不显示是有意的：守护每 30 秒刷一行，摆出来就是一屏噪音。但排障时
-     * 又确实需要看到它，所以留这个入口 —— 点完把它滚到可见位置。
+     * 主界面要保证「详情展开也在一个屏幕里」，就不能有会越长越高的区域。
+     * 所以进度只取最新一行，全文走 [showLogDialog] 弹出来看。
      */
-    private fun showLogFromBuffer() {
-        Py.call(this, "job") { txt ->
-            val o = json(txt)
-            val lines = o?.optJSONArray("lines")
-            if (o == null || lines == null || lines.length() == 0) {
-                showLog("还没有日志。跑一次体检，或把守护打开一会儿再看。")
-            } else {
-                showJob(o)
-            }
-            jobBox.post {
-                jobBox.requestRectangleOnScreen(
-                    android.graphics.Rect(0, 0, jobBox.width, jobBox.height), true
-                )
-            }
-        }
+    private fun showLog(text: String) {
+        tvMainHint.text = text.lineSequence().lastOrNull()?.take(80) ?: ""
     }
 
     private fun showJob(o: JSONObject) {
         val lines = o.optJSONArray("lines") ?: return
         if (lines.length() == 0) return
-        val sb = StringBuilder()
-        for (i in 0 until lines.length()) sb.append(lines.optString(i)).append('\n')
-        tvJob.text = sb.toString().trimEnd()
-        jobBox.visibility = View.VISIBLE
-        // 跟着最新一行走：用户不需要手动拖到最底下才看见当前在干什么
-        jobScroll.post { jobScroll.fullScroll(View.FOCUS_DOWN) }
+        showLog(lines.optString(lines.length() - 1))
+    }
+
+    /**
+     * 完整日志：独立弹窗 + 独立滚动。
+     *
+     * 这里必须是 Dialog 自己搭布局，不能用 AlertDialog.setView —— 它会把内容
+     * 塞进一个自带的 ScrollView，于是滑动落到外层，日志那一块自己滚不动，
+     * 手指在日志上划却在拖动整个页面。给 ScrollView 一个固定的、按屏幕算出来的
+     * 高度，滚动就锁死在框里了。
+     */
+    private fun showLogDialog() {
+        Py.call(this, "job") { txt ->
+            val o = json(txt)
+            val lines = o?.optJSONArray("lines")
+            val sb = StringBuilder()
+            if (lines == null || lines.length() == 0) {
+                sb.append("还没有日志。\n跑一次体检，或把守护打开一会儿再看。")
+            } else {
+                for (i in 0 until lines.length()) sb.append(lines.optString(i)).append('\n')
+            }
+
+            val dlg = Dialog(this)
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.WHITE)
+                setPadding(dp(16), dp(14), dp(16), dp(12))
+            }
+            root.addView(TextView(this).apply {
+                text = "运行日志"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(INK)
+            })
+
+            val tv = TextView(this).apply {
+                text = sb.toString().trimEnd()
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                typeface = Typeface.MONOSPACE
+                setTextIsSelectable(true)
+                setTextColor(LOG_INK)
+                setBackgroundColor(Color.parseColor("#14161A"))
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+            }
+            val sv = ScrollView(this).apply {
+                addView(tv, ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                isVerticalScrollBarEnabled = true
+            }
+            val h = (resources.displayMetrics.heightPixels * 0.52f).toInt()
+            root.addView(sv, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, h).apply { topMargin = dp(10) })
+
+            val close = actionButton("关闭", false)
+            close.setOnClickListener { dlg.dismiss() }
+            root.addView(close, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) })
+
+            dlg.setContentView(root)
+            dlg.window?.setLayout(
+                (resources.displayMetrics.widthPixels * 0.92f).toInt(),
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            dlg.show()
+            // 日志是往下追加的，打开就该停在最新一行，不用每次手划到底
+            sv.post { sv.fullScroll(View.FOCUS_DOWN) }
+        }
     }
 
     private fun json(s: String): JSONObject? = try {

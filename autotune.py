@@ -668,6 +668,11 @@ def _serving_band(st):
     return band or None
 
 
+# 公开别名。面板和 APK 的「频段」格子都要这个值：锁定值 0（自动）时，
+# 光看 band 就是个空的，用户会以为设备出问题了 —— 其实频段好好地在那儿。
+serving_band = _serving_band
+
+
 def quality_issue(res):
     """这个频段算不算「能用的」？返回问题描述（空串 = 干净可用）。
 

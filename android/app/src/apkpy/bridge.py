@@ -122,7 +122,9 @@ def guard_start(dry=False):
     """开守护：在动就解锁、坐满就锁定。整个过程不碰界面线程。"""
     t = _guard["thread"]
     if t is not None and t.is_alive():
-        return _dumps({"ok": False, "msg": "守护已经在跑"})
+        # 关掉之后守护要等当前这一轮采样结束才真的退出（最多 30 秒）。
+        # 这段时间里再开一次会撞上它，如实说明，别让人以为开关坏了。
+        return _dumps({"ok": False, "msg": "上一次还在退，等几秒再开"})
 
     cfg = autotune.load_config()
     # 这些字段跟命令行一一对应。host/user/password/driver 给 None 就走
@@ -172,7 +174,10 @@ def _last_tip():
     够回答「它到底有没有在工作」，又不至于糊一屏。
     跳过启动时那段横幅 —— 那些没有时间前缀。
     """
-    lines = list(server.JOB["lines"])
+    # 守护线程正在往这个列表里追加，先拿锁抄一份再翻 —— 直接边追加边遍历
+    # 会抛 RuntimeError，界面那边就整块刷不动了。
+    with server.JOB_LOCK:
+        lines = list(server.JOB["lines"])
     for line in reversed(lines):
         s = line.strip()
         if _RE_TIME.match(s):
