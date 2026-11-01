@@ -16,6 +16,7 @@ iOS/Android 都可以「添加到主屏幕」，用起来跟 App 一样。
 """
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -148,6 +150,74 @@ def log(line):
             JOB["lines"] = JOB["lines"][-400:]
 
 
+# ---------------- 能不能起子进程 ----------------
+# 面板本来是「再起一个 python 进程跑 autotune」：这样任务崩了不会带倒面板，
+# 输出也能逐行流式读到。但 Chaquopy 打出来的 APK 里**没有独立的 python 二进制**
+# （sys.executable 指向 /system/bin/app_process64），Popen 出去的东西跑不了
+# python 代码。所以先探一次并缓存结果，探不通就退到「同一个解释器里跑」。
+_SPAWN_OK = None
+
+
+def can_spawn():
+    """当前解释器能不能真的起一个 python 子进程（结果只探一次）。"""
+    global _SPAWN_OK
+    if _SPAWN_OK is not None:
+        return _SPAWN_OK
+    try:
+        p = subprocess.run([sys.executable, "-c", "print(1)"],
+                           capture_output=True, timeout=8)
+        _SPAWN_OK = p.returncode == 0 and b"1" in p.stdout
+    except Exception:  # noqa: BLE001
+        _SPAWN_OK = False
+    return _SPAWN_OK
+
+
+class _LineSink:
+    """把 print 出来的东西按行喂给 log()，替代读子进程 stdout 那条路。"""
+
+    encoding = "utf-8"
+
+    def __init__(self, buf=""):
+        self._buf = buf
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                log(line.rstrip())
+        return len(s)
+
+    def flush(self):
+        if self._buf.strip():
+            log(self._buf.strip())
+        self._buf = ""
+
+
+def run_inprocess(args):
+    """在同一个解释器里跑一次 autotune，返回退出码。
+
+    只用于起不了子进程的环境。autotune.main() 是纯命令行入口（读 sys.argv），
+    所以这里临时换掉 argv —— 比把参数解析复制一份出来稳，改参数定义时不会漏。
+    """
+    sink = _LineSink()
+    old_argv = sys.argv
+    sys.argv = [str(HERE / "autotune.py")] + list(args)
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            autotune.main()
+        return 0
+    except SystemExit as e:          # argparse 出错或 --help
+        return int(e.code or 0)
+    except Exception:  # noqa: BLE001
+        for line in traceback.format_exc().splitlines():
+            log(line)
+        return 1
+    finally:
+        sink.flush()
+        sys.argv = old_argv
+
+
 def run_job(args, kind):
     with JOB_LOCK:
         if JOB["running"]:
@@ -155,20 +225,23 @@ def run_job(args, kind):
         JOB.update(running=True, lines=[], kind=kind, started=time.time(), exit=None)
 
     def worker():
-        cmd = [sys.executable, "-u", str(HERE / "autotune.py")] + args
         log(f"$ autotune.py {' '.join(args)}")
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 env=_env(), bufsize=1)
-            for raw in iter(p.stdout.readline, b""):
-                line = raw.decode("utf-8", "ignore").rstrip()
-                if line:
-                    log(line)
-            p.wait()
-            code = p.returncode
-        except Exception as e:  # noqa: BLE001
-            log(f"[!] 启动失败：{e}")
-            code = -1
+        if can_spawn():
+            cmd = [sys.executable, "-u", str(HERE / "autotune.py")] + args
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     env=_env(), bufsize=1)
+                for raw in iter(p.stdout.readline, b""):
+                    line = raw.decode("utf-8", "ignore").rstrip()
+                    if line:
+                        log(line)
+                p.wait()
+                code = p.returncode
+            except Exception as e:  # noqa: BLE001
+                log(f"[!] 启动失败：{e}")
+                code = -1
+        else:
+            code = run_inprocess(args)
         log(f"—— 任务结束（exit={code}）")
         with JOB_LOCK:
             JOB["running"] = False
@@ -209,6 +282,11 @@ def watch_status():
 
 
 def watch_start(dry=False):
+    # APK 里没有独立解释器，也就没有「随时能被 Ctrl+C 或信号停掉」的常驻进程。
+    # 硬塞进线程的话，watch 的循环永远等不到退出信号 —— 面板上点了「停止」也
+    # 停不下来。与其假装能跑，不如直说，让用户改用一次性的体检。
+    if not can_spawn():
+        return False, "APK 里没有独立解释器，持续检测用不了；改用面板的「体检」"
     with WATCH_LOCK:
         proc = WATCH["proc"]
         if proc is not None and proc.poll() is None:
@@ -462,8 +540,19 @@ def lan_ip():
         s.close()
 
 
-def main():
+def serve(host="127.0.0.1", port=8787, token=None):
+    """起一个面板 server 并返回它（不阻塞、不打印）。
+
+    抽出来是给 APK 用的：那边由 Kotlin 起线程调它，再把 WebView 指到
+    127.0.0.1。终端用法完全不变，main() 还是原来那套。
+    返回的 server 需要调用方自己 serve_forever()。
+    """
     global TOKEN
+    TOKEN = load_token(token)
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def main():
     ap = argparse.ArgumentParser(description="mifi-autotune 本地面板")
     ap.add_argument("--lan", action="store_true", help="允许局域网（手机）访问")
     ap.add_argument("--port", type=int, default=8787)
@@ -471,9 +560,8 @@ def main():
                     help="指定访问令牌（默认自动生成并存到 .panel-token）")
     a = ap.parse_args()
 
-    TOKEN = load_token(a.token)
     host = "0.0.0.0" if a.lan else "127.0.0.1"
-    srv = ThreadingHTTPServer((host, a.port), Handler)
+    srv = serve(host=host, port=a.port, token=a.token)
 
     print("面板已启动")
     print(f"  本机访问： http://127.0.0.1:{a.port}/?k={TOKEN}")
