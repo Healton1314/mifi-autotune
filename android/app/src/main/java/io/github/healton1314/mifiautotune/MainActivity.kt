@@ -52,6 +52,14 @@ class MainActivity : Activity() {
     // 主操作
     private lateinit var btnMain: TextView
     private lateinit var tvMainHint: TextView
+    // 体检结论（测完才显示）
+    private lateinit var verdictBox: LinearLayout
+    private lateinit var tvVerdict: TextView
+    private lateinit var tvVerdictSub: TextView
+    private lateinit var tvReject: TextView
+    // 日志最新一屏缓存在这儿：点「查看运行日志」直接用，不用等 Python 那边
+    private var logLines: List<String> = emptyList()
+    private var jobBusy = false
 
     // 守护
     private lateinit var swGuard: Switch
@@ -194,6 +202,47 @@ class MainActivity : Activity() {
     private fun primaryCard(): View {
         val box = card()
 
+        // 体检结论：只给两句，一句「建议什么」，一句「好在哪」。
+        // 平时完全不占地方；测完了才出现，就摆在按钮上面 —— 看到结论的下一
+        // 眼就是能按的那个键，不用去翻日志猜「到底该不该点」。
+        verdictBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, 0, 0, dp(12))
+        }
+        tvVerdict = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(INK)
+        }
+        tvVerdictSub = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextColor(MUTED)
+            setPadding(0, dp(4), 0, 0)
+            setMaxLines(2)
+        }
+        verdictBox.addView(tvVerdict)
+        verdictBox.addView(tvVerdictSub)
+
+        // 建议就是建议，不是命令。拒绝的入口必须看得见，但不能抢主按钮的风头。
+        val rejectRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        tvReject = TextView(this).apply {
+            text = "不用了，保持现状"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(MUTED)
+            setPadding(dp(14), dp(10), 0, 0)
+            isClickable = true
+            isFocusable = true
+        }
+        tvReject.setOnClickListener { declineVerdict() }
+        rejectRow.addView(tvReject)
+        verdictBox.addView(rejectRow)
+
+        box.addView(verdictBox)
+
         btnMain = actionButton("开始体检并优化", true)
         // 同一个按钮两段含义：第一次是「测」，测完出了结论就变成「应用」。
         // 不想摆第二个按钮 —— 屏幕上只有一个大按钮的时候，没人会点错。
@@ -258,17 +307,32 @@ class MainActivity : Activity() {
 
     private val pollJob = object : Runnable {
         override fun run() {
+            // 上一次还没回来就别再投。job() 本身是读内存，很快，但体检这类
+            // 长任务一旦把线程占住，不设这道闸请求就会越积越多 —— 等它跑完，
+            // 队列里还压着几百个旧请求，点「查看运行日志」自然半天没反应。
+            if (jobBusy || !Py.isReady) {
+                Main.postDelayed(this, 1200)
+                return
+            }
+            jobBusy = true
             Py.call(this@MainActivity, "job") { txt ->
+                jobBusy = false
                 val o = json(txt) ?: return@call
                 val running = o.optBoolean("running")
                 // org.json 的 optString 对 JSON null 会返回字符串 "null"，
                 // 直接拿它判空会让日志区一直挂着。这里显式问 isNull。
                 val kind = if (o.isNull("kind")) "" else o.optString("kind")
                 val exit = if (o.isNull("exit")) 0 else o.optInt("exit", 0)
-                // 只有「体检/应用这类一次性任务」才把日志摆出来。
-                // 守护是常驻的，每 30 秒刷一行，摆出来就是一大坨噪音 —— 它的
-                // 状态放在开关下面那一行就够了；真要看日志去详情里点。
-                if (running || kind.isNotEmpty() || exit != 0) showJob(o)
+
+                // 行缓存在这儿顺手存一份：日志弹窗要用，指过去就能立刻弹出来，
+                // 不必再等一次 Python 往返。
+                val arr = o.optJSONArray("lines")
+                if (arr != null) logLines = (0 until arr.length()).map { arr.optString(it) }
+
+                // 只有真在跑的时候才让日志占着提示行。跑完就交还给结论 ——
+                // 否则「任务结束」会一直盖在「有 2 项可以改」上面，让人以为没结论。
+                if (running) showJob(o)
+
                 if (!running && busy) {
                     busy = false
                     btnMain.isEnabled = true
@@ -398,6 +462,7 @@ class MainActivity : Activity() {
             return
         }
         busy = true
+        hideVerdict()   // 重新测就别让上一条结论还挂在那儿
         btnMain.text = "体检中…约 3~6 分钟"
         btnMain.isEnabled = false
         btnMain.alpha = 0.6f
@@ -409,20 +474,60 @@ class MainActivity : Activity() {
     private fun afterPreview() {
         Py.call(this, "plan") { txt ->
             val p = json(txt)?.optJSONObject("plan")
-            val n = p?.optJSONArray("changes")?.length() ?: 0
+            val changes = p?.optJSONArray("changes")
+            val n = changes?.length() ?: 0
             if (p == null) {
+                hideVerdict()
                 resetMain()
                 tvMainHint.text = "体检没留下结论，看日志找原因"
             } else if (n == 0) {
                 // 结论是「别动」的时候，硬塞一个「立即优化」按钮就是骗人
+                hideVerdict()
                 resetMain()
                 tvMainHint.text = "当前设置已经合适，不用动"
             } else {
                 planReady = true
                 btnMain.text = "应用结论"
-                tvMainHint.text = "测完了，有 $n 项可以改 · 会断一次网"
+                val list = (0 until n).map { changes!!.optString(it) }
+                showVerdict(list.joinToString("，"), verdictSub(p))
+                // 提醒拒绝也合法：这是建议，不是它替你做的决定
+                tvMainHint.text = "应用会断一次网 · 不想改点上面「不用了」"
             }
         }
+    }
+
+    /**
+     * 结论正文：只说实测对比，不给没把握的承诺。
+     *
+     * 引擎在「数据不足以断定更快」时会把 mbps_gain 置空（换的是稳定性，不是速度）,
+     * 这里也就不编一个提速百分比出来。
+     */
+    private fun verdictSub(p: JSONObject): String {
+        val e = p.optJSONObject("expected") ?: return ""
+        if (e.isNull("mbps_now") || e.isNull("mbps_best")) return ""
+        val now = e.optDouble("mbps_now", 0.0)
+        val best = e.optDouble("mbps_best", 0.0)
+        if (now <= 0 || best <= 0) return ""
+        // 固定用 US 格式：某些区域的小数点是逗号，"19,7 Mbps" 看着像千分位
+        return String.format(java.util.Locale.US, "实测 %.1f Mbps，现在 %.1f Mbps", best, now)
+    }
+
+    private fun showVerdict(title: String, sub: String) {
+        tvVerdict.text = if (title.startsWith("建议")) title else "建议：$title"
+        tvVerdictSub.text = sub
+        tvVerdictSub.visibility = if (sub.isEmpty()) View.GONE else View.VISIBLE
+        verdictBox.visibility = View.VISIBLE
+    }
+
+    private fun hideVerdict() {
+        verdictBox.visibility = View.GONE
+    }
+
+    /** 拒绝建议：界面回到「还没测」的样子，不再追着问。 */
+    private fun declineVerdict() {
+        hideVerdict()
+        resetMain()
+        tvMainHint.text = "已保持现状 · 想重测再点上面"
     }
 
     private fun resetMain() {
@@ -439,6 +544,7 @@ class MainActivity : Activity() {
             return
         }
         planReady = false
+        hideVerdict()
         busy = true
         btnMain.text = "正在应用…"
         btnMain.isEnabled = false
@@ -466,7 +572,9 @@ class MainActivity : Activity() {
     }
 
     private fun runTask(fn: String, okMsg: () -> String) {
-        Py.call(this, fn) { txt ->
+        // 用长任务通道：它在 APK 里是同步跑完的，挤在查询线程上会让状态、
+        // 日志、结论全部排队，界面上就是「按钮半天不变」。
+        Py.callLong(this, fn) { txt ->
             val o = json(txt)
             if (o != null && o.optBoolean("ok", false)) {
                 showLog(okMsg())
@@ -563,68 +671,78 @@ class MainActivity : Activity() {
      * 高度，滚动就锁死在框里了。
      */
     private fun showLogDialog() {
+        val tv = TextView(this).apply {
+            text = renderLog(logLines)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setTextColor(LOG_INK)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        // 底色给 ScrollView，不给 TextView：日志只有两三行的时候，TextView
+        // 只有那么高，黑底就只剩顶上一条，下面一大片白 —— 看着像框破了。
+        val sv = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#14161A"))
+            addView(tv, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            isVerticalScrollBarEnabled = true
+            minimumHeight = dp(96)
+        }
+
+        val dlg = Dialog(this)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+        }
+        root.addView(TextView(this).apply {
+            text = "运行日志"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(INK)
+        })
+        root.addView(sv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, logHeight(logLines.size)).apply {
+            topMargin = dp(10)
+        })
+
+        val close = actionButton("关闭", false)
+        close.setOnClickListener { dlg.dismiss() }
+        root.addView(close, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
+
+        dlg.setContentView(root)
+        dlg.window?.setLayout(
+            (resources.displayMetrics.widthPixels * 0.92f).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.show()
+        // 日志是往下追加的，打开就该停在最新一行，不用每次手划到底
+        sv.post { sv.fullScroll(View.FOCUS_DOWN) }
+
+        // 上面那屏是缓存 —— 点下去立刻就有东西，不依赖 Python 那边。这里再补
+        // 一次最新的：长任务在另一条线程上跑，这次往返不会被它堵住，几百毫秒就回。
         Py.call(this, "job") { txt ->
-            val o = json(txt)
-            val lines = o?.optJSONArray("lines")
-            val sb = StringBuilder()
-            if (lines == null || lines.length() == 0) {
-                sb.append("还没有日志。\n跑一次体检，或把守护打开一会儿再看。")
-            } else {
-                for (i in 0 until lines.length()) sb.append(lines.optString(i)).append('\n')
-            }
-            val n = if (lines == null) 0 else lines.length()
-
-            val dlg = Dialog(this)
-            val root = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.WHITE)
-                setPadding(dp(16), dp(14), dp(16), dp(12))
-            }
-            root.addView(TextView(this).apply {
-                text = "运行日志"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                setTypeface(typeface, Typeface.BOLD)
-                setTextColor(INK)
-            })
-
-            val tv = TextView(this).apply {
-                text = sb.toString().trimEnd()
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                typeface = Typeface.MONOSPACE
-                setTextIsSelectable(true)
-                setTextColor(LOG_INK)
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-            }
-            // 底色给 ScrollView，不给 TextView：日志只有两三行的时候，TextView
-            // 只有那么高，黑底就只剩顶上一条，下面一大片白 —— 看着像框破了。
-            val sv = ScrollView(this).apply {
-                setBackgroundColor(Color.parseColor("#14161A"))
-                addView(tv, ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-                isVerticalScrollBarEnabled = true
-                minimumHeight = dp(96)
-            }
-            val h = if (n <= 12) ViewGroup.LayoutParams.WRAP_CONTENT
-            else (resources.displayMetrics.heightPixels * 0.52f).toInt()
-            root.addView(sv, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, h).apply { topMargin = dp(10) })
-
-            val close = actionButton("关闭", false)
-            close.setOnClickListener { dlg.dismiss() }
-            root.addView(close, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) })
-
-            dlg.setContentView(root)
-            dlg.window?.setLayout(
-                (resources.displayMetrics.widthPixels * 0.92f).toInt(),
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            dlg.show()
-            // 日志是往下追加的，打开就该停在最新一行，不用每次手划到底
+            val arr = json(txt)?.optJSONArray("lines") ?: return@call
+            logLines = (0 until arr.length()).map { arr.optString(it) }
+            if (!dlg.isShowing) return@call   // 用户已经关掉了，白改
+            tv.text = renderLog(logLines)
+            sv.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, logHeight(logLines.size)
+            ).apply { topMargin = dp(10) }
             sv.post { sv.fullScroll(View.FOCUS_DOWN) }
         }
     }
+
+    private fun renderLog(lines: List<String>): String =
+        if (lines.isEmpty()) "还没有日志。\n跑一次体检，或把守护打开一会儿再看。"
+        else lines.joinToString("\n").trimEnd()
+
+    /** 行数少就贴着内容长，行数多才给固定的半屏高 —— 滚动锁在框里。 */
+    private fun logHeight(n: Int): Int =
+        if (n <= 12) ViewGroup.LayoutParams.WRAP_CONTENT
+        else (resources.displayMetrics.heightPixels * 0.52f).toInt()
 
     private fun json(s: String): JSONObject? = try {
         JSONObject(s)

@@ -21,6 +21,19 @@ object Py {
 
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "mifi-py") }
 
+    /**
+     * 长任务专用线程。
+     *
+     * APK 里没有独立的 python 进程，体检/应用/恢复都是在当前进程里同步跑完的
+     * —— 一次三到六分钟。要是它也排在 [io] 上，这几分钟里所有状态查询、日志
+     * 拉取全得在它后面排队，界面看着像死了一样：点「查看运行日志」要等几分钟
+     * 才弹出来。所以长任务必须和查询分开两条线。
+     *
+     * 两条线同时调 Python 是安全的：CPython 有 GIL，而且长任务大部分时间卡在
+     * sleep 和 socket 上，会主动让出 GIL，查询能正常插进去。
+     */
+    private val longRunner = Executors.newSingleThreadExecutor { r -> Thread(r, "mifi-py-long") }
+
     @Volatile
     private var module: PyObject? = null
 
@@ -49,8 +62,29 @@ object Py {
         fn: String,
         vararg args: Any,
         onResult: (String) -> Unit
+    ) = submit(io, ctx, fn, args, onResult)
+
+    /**
+     * 跑会占住线程几分钟的那种活：体检、应用结论、恢复默认。
+     *
+     * 只在这条线上跑，查询才不会被堵在后面。回调依然是任务**结束后**才来
+     * （in-process 模式没有可分离的进程），界面靠轮询 job() 看进度。
+     */
+    fun callLong(
+        ctx: Context,
+        fn: String,
+        vararg args: Any,
+        onResult: (String) -> Unit
+    ) = submit(longRunner, ctx, fn, args, onResult)
+
+    private fun submit(
+        pool: java.util.concurrent.Executor,
+        ctx: Context,
+        fn: String,
+        args: Array<out Any>,
+        onResult: (String) -> Unit
     ) {
-        io.execute {
+        pool.execute {
             val text = try {
                 start(ctx)
                 val m = module ?: error("Python 模块没起来")
