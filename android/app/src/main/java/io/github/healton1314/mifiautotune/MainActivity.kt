@@ -59,7 +59,9 @@ class MainActivity : Activity() {
     private var busy = false
     private var statusBusy = false
     private var guardOn = false
-    private var detailOpen = false
+    // 详情默认展开：那几个数就是用户打开 app 最想先看到的，藏起来反而多一步。
+    // 「收起」还留着 —— 想只看按钮和开关的人可以收掉。
+    private var detailOpen = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,7 +112,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         tvChevron = TextView(this).apply {
-            text = "详情"
+            text = if (detailOpen) "收起" else "详情"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setTextColor(ACCENT)
             setPadding(dp(8), dp(2), 0, dp(2))
@@ -120,10 +122,10 @@ class MainActivity : Activity() {
         statusRow.setOnClickListener { toggleDetail() }
         root.addView(statusRow)
 
-        // ---- 详情：默认收起 ----
+        // ---- 详情：默认展开，可收起 ----
         detailBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
+            visibility = if (detailOpen) View.VISIBLE else View.GONE
             setPadding(0, dp(14), 0, 0)
         }
         detailBox.addView(detailCard())

@@ -29,7 +29,13 @@ object Py {
     fun start(ctx: Context) {
         if (module != null) return
         if (!Python.isStarted()) Python.start(AndroidPlatform(ctx))
-        Python.getInstance().getModule("bridge").also { module = it }
+        Python.getInstance().getModule("bridge").also {
+            // 必须先把可写目录告诉 Python：原生扫描结果、位置记忆、原始设置
+            // 都落在 filesDir，而 APK 里解压出来的源码目录不是久留之地。
+            // 漏了这一步，扫描会一路 fallback 到 nmcli/iw，报一句用户看不懂的错。
+            it.callAttr("init", ctx.filesDir.absolutePath)
+            module = it
+        }
     }
 
     val isReady: Boolean get() = module != null

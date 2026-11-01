@@ -11,6 +11,7 @@
 
 import contextlib
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -27,6 +28,18 @@ def _dumps(obj):
 
 def _err(e):
     return _dumps({"error": "%s: %s" % (type(e).__name__, e)})
+
+
+def init(files_dir=""):
+    """Kotlin 启动时调一次，把应用私有可写目录告诉 Python。
+
+    scanner.py 就是靠这个环境变量去找原生层写的 wifi_scan.json；不设的话
+    它以为自己在 Termux 里，扫描失败会一路 fallback 到 nmcli/iw，最后报
+    「nmcli / iw 都不可用（需要 root）」—— 而用户就在 app 里，根本没装那些。
+    """
+    if files_dir:
+        os.environ["MIFI_FILES_DIR"] = files_dir
+    return _dumps({"files": os.environ.get("MIFI_FILES_DIR", "")})
 
 
 # ---------------- 状态与结论 ----------------
