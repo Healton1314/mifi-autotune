@@ -61,8 +61,23 @@ object Py {
 /** 主线程投递的薄封装，省得每处都写 Looper。 */
 object Main {
     private val h = android.os.Handler(android.os.Looper.getMainLooper())
-    fun post(block: () -> Unit) {
-        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) block()
-        else h.post { block() }
+
+    /**
+     * 接受 Runnable 而不是 () -> Unit：界面那边传的是 pollStatus / pollJob
+     * 这种 Runnable 实例，函数类型接不住；而 lambda 会由 Kotlin 自动 SAM 成
+     * Runnable，两种写法都能用，也不会出现重载歧义。
+     */
+    fun post(r: Runnable) {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) r.run()
+        else h.post(r)
+    }
+
+    fun postDelayed(r: Runnable, ms: Long) {
+        h.postDelayed(r, ms)
+    }
+
+    /** 退出时把挂着的轮询清干净，否则界面销毁后还在跑，白耗电。 */
+    fun clear() {
+        h.removeCallbacksAndMessages(null)
     }
 }

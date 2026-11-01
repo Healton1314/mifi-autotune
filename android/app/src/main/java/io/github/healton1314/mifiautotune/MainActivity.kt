@@ -258,9 +258,11 @@ class MainActivity : Activity() {
             Py.call(this@MainActivity, "job") { txt ->
                 val o = json(txt) ?: return@call
                 val running = o.optBoolean("running")
-                if (running || o.optInt("exit", 0) != 0 || o.optString("kind").isNotEmpty()) {
-                    showJob(o)
-                }
+                // org.json 的 optString 对 JSON null 会返回字符串 "null"，
+                // 直接拿它判空会让日志区一直挂着。这里显式问 isNull。
+                val kind = if (o.isNull("kind")) "" else o.optString("kind")
+                val exit = if (o.isNull("exit")) 0 else o.optInt("exit", 0)
+                if (running || kind.isNotEmpty() || exit != 0) showJob(o)
                 if (!running && busy) {
                     busy = false
                     btnMain.text = "开始体检并优化"
@@ -466,7 +468,7 @@ class MainActivity : Activity() {
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
 
     override fun onDestroy() {
-        Main.postDelayed({}, 0)   // 清掉挂起的回调
+        Main.clear()   // 轮询是自我重投递的，必须显式清掉，否则界面销毁后还在跑
         super.onDestroy()
     }
 
