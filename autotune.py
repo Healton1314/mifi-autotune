@@ -2351,6 +2351,11 @@ def wait_device_back(dev, timeout=45, poll=5):
             if _tcp_up(host):
                 break
             time.sleep(min(poll, 0.75))
+    # 设备刚重启过射频，手里那个 Digest nonce 必然已经作废。先丢掉，让第一次读
+    # 直接从干净的挑战开始；留着它只会先吃一次「还没就绪」再重发。
+    drop = getattr(dev, "drop_session", None)
+    if drop:
+        drop()
     while time.time() - t0 < timeout:
         try:
             dev.get_state()

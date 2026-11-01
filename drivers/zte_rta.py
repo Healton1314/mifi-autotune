@@ -247,6 +247,10 @@ class ZteRtaDriver(DeviceDriver):
 
     BANDS = [3, 8, 38, 39, 40, 41]
 
+    def drop_session(self):
+        self.c._nonce = None
+        self.c._nc = 0
+
     def __init__(self, *a, client=None, **kw):
         super().__init__(*a, **kw)
         # 复用探测阶段已经认证好的客户端，省掉一次完整会话（实测 3 秒左右）。

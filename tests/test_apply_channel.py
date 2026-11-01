@@ -42,6 +42,10 @@ class FlakyDev:
         self.switch_works = switch_works
         self.down = down_rounds          # get_state 前几次失败；None = 永远不回来
         self.channels_set = []
+        self.session_dropped = False
+
+    def drop_session(self):
+        self.session_dropped = True
 
     def set_band(self, band):
         self.band = band
@@ -146,6 +150,16 @@ class WaitDeviceBack(unittest.TestCase):
         dev = FlakyDev(down_rounds=2)
         with mock.patch.object(autotune.time, "sleep", lambda s: None):
             self.assertTrue(autotune.wait_device_back(dev, timeout=60, poll=5))
+
+    def test_forgets_session_before_first_read(self):
+        """设备刚重启射频，旧 nonce 一定作废 —— 等它回来之前先扔掉。
+
+        不扔的话，第一趟读会先吃一次「还没就绪」再重发，白等一次往返。
+        """
+        dev = FlakyDev(down_rounds=0)
+        with mock.patch.object(autotune.time, "sleep", lambda s: None):
+            autotune.wait_device_back(dev, timeout=60, poll=5)
+        self.assertTrue(dev.session_dropped)
 
     def test_returns_false_when_timeout(self):
         dev = FlakyDev(down_rounds=None)

@@ -99,6 +99,15 @@ class DeviceDriver(ABC):
         """改动后自检：设备是否还能提供数据。默认 True，驱动可覆盖。"""
         return True
 
+    def drop_session(self):
+        """丢掉缓存的认证会话。
+
+        设备重启射频（换频段、改信道）之后，手里的 nonce 一定已经作废。
+        留着一个已知死掉的会话，下一次读要先吃一次「还没就绪」再重发 ——
+        干脆提前扔掉，让第一趟就从干净的挑战开始。默认无事可做。
+        """
+        pass
+
     def close(self):
         pass
 
