@@ -12,6 +12,7 @@
 import contextlib
 import json
 import os
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import autotune
 import server
 
 _guard = {"thread": None, "started": 0.0, "dry": False}
+_RE_TIME = re.compile(r"^\d{1,2}:\d{2}")
 
 
 def _dumps(obj):
@@ -162,11 +164,27 @@ def guard_stop():
     return _dumps({"ok": True, "msg": "已请求停止（最多等一个采样间隔，约 30 秒）"})
 
 
-def guard_state():
-    """守护跑没跑。只给状态，不给日志 —— 界面上不摆那一大坨输出。
+def _last_tip():
+    """守护现在在干什么：取它输出里最后一条带时间戳的行。
 
-    返回的 lines 曾经是 200 行原文，但界面根本不显示（用户明确嫌吵），
-    每次轮询还白传几十 KB。要看日志走 job()。
+    守护每 30 秒打一行「16:40  -97dBm  延迟 65ms 丢包 0%  监控中」，
+    动作（锁定/解锁/换频段）也带时间戳打在同样的位置。界面只要这一行，
+    够回答「它到底有没有在工作」，又不至于糊一屏。
+    跳过启动时那段横幅 —— 那些没有时间前缀。
+    """
+    lines = list(server.JOB["lines"])
+    for line in reversed(lines):
+        s = line.strip()
+        if _RE_TIME.match(s):
+            # 多个空格压成一个，一行放得下
+            return " ".join(s.split())[:80]
+    return ""
+
+
+def guard_state():
+    """守护跑没跑，以及它现在在干什么。
+
+    不给完整日志：界面上不摆那一大坨输出（用户明确嫌吵）。要全文走 job()。
     """
     t = _guard["thread"]
     alive = t is not None and t.is_alive()
@@ -175,4 +193,5 @@ def guard_state():
         "since": int(_guard["started"]) if alive else None,
         "elapsed": round(time.time() - _guard["started"]) if alive else None,
         "dry": _guard["dry"],
+        "tip": _last_tip() if alive else "",
     })

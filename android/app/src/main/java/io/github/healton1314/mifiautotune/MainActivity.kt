@@ -297,15 +297,23 @@ class MainActivity : Activity() {
             if (guardOn) {
                 Py.call(this@MainActivity, "guard_state") { txt ->
                     val o = json(txt) ?: return@call
-                    if (!o.optBoolean("running") && guardOn) {
-                        guardOn = false
-                        swGuard.setOnCheckedChangeListener(null)
-                        swGuard.isChecked = false
-                        swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean ->
-                            toggleGuard(x)
+                    if (!o.optBoolean("running")) {
+                        if (guardOn) {
+                            guardOn = false
+                            swGuard.setOnCheckedChangeListener(null)
+                            swGuard.isChecked = false
+                            swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean ->
+                                toggleGuard(x)
+                            }
+                            tvGuardHint.text = "已经停了。点「查看运行日志」看原因"
                         }
-                        tvGuardHint.text = "已经停了。点「详情 → 查看运行日志」看原因"
+                        return@call
                     }
+                    // 把守护最近一条输出摆出来：不然开关亮着、底下只有一句
+                    // 「运行中」，用户根本不知道它到底在干活没有。
+                    val tip = if (o.isNull("tip")) "" else o.optString("tip")
+                    tvGuardHint.text = if (tip.isNotEmpty()) "运行中 · $tip"
+                    else "运行中 · 正在等第一轮采样…"
                 }
             }
             Main.postDelayed(this, 5000)
