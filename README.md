@@ -75,10 +75,14 @@ score(信道) = Σ  邻居  (信号%/100)² × (重叠宽度 / 20MHz)
 |---|---|---|
 | Windows 10/11 | `netsh wlan show networks mode=bssid` | ✅ 已验证。字段名多语言适配（中/英/日/韩/德/法/西/意/葡/俄/繁） |
 | **Android（Termux）** | `termux-wifi-scaninfo` | ⚠️ 已实现，需 Termux:API + 定位权限。**可在手机上完全独立运行** |
+| **iOS / iPadOS** | 无（系统不开放接口） | ⚠️ **只做频段优化**，信道扫描固定跳过。见下文「在手机上独立运行」 |
 | Linux | `nmcli` → 失败回落 `iw` | ⚠️ 已实现，未实机验证。`iw` 需 root 才能主动扫描 |
 | macOS | `airport -s` | ⚠️ macOS 14+ 已移除 `airport`，届时需自行替换扫描实现 |
 
 系统语言不在支持列表里时，工具会**明确跳过信道优化**而不是拿空数据乱改。
+
+> iOS 那一行不是「还没做」，是**做不了**：苹果不给第三方应用扫描周边 Wi-Fi 的接口，
+> 越狱之外的任何 App 都拿不到邻居列表。频段优化走的是普通 HTTP，不受影响。
 
 ## 安装
 
@@ -538,7 +542,42 @@ iOS/Android 都能「添加到主屏幕」，用起来跟 App 一样。面板上
 
 设备地址是 `192.168.0.1`，只有连在这台随身WiFi 上的设备才够得着。手机本来就一直连着它，所以手机是最合适的运行环境。
 
-### 第 0 步：装 Termux 和 Termux:API
+**先按系统选路：安卓走 Termux，iPhone / iPad 走 a-Shell。两套互不通用。**
+
+### iPhone / iPad：用 a-Shell
+
+先把代价说清楚：**iOS 上只做频段优化，信道那一项会被固定跳过**。
+
+不是没做，是做不了 —— 苹果不给第三方应用扫描周边 Wi-Fi 的接口，任何没越狱的 App 都拿不到邻居列表。频段仍然是提升的大头（开头那个 +112% 就来自频段），但「邻居太多、信道挤」这类问题在 iPhone 上没法自动解决。
+
+1. App Store 装 **a-Shell**（免费）。
+
+2. 打开 a-Shell，**整行复制**下面这条粘进去回车：
+
+```bash
+python3 -c "import urllib.request as u,zipfile as z,io,runpy;z.ZipFile(io.BytesIO(u.urlopen('https://codeload.github.com/Healton1314/mifi-autotune/zip/refs/heads/main').read())).extractall('.');runpy.run_path('mifi-autotune-main/phone/ios_install.py',run_name='__main__')"
+```
+
+走不通时换这条（经第三方代理，慢一点但国内更常见能通）：
+
+```bash
+python3 -c "import urllib.request as u;exec(u.urlopen('https://gh-proxy.com/https://raw.githubusercontent.com/Healton1314/mifi-autotune/main/phone/ios_install.py').read().decode())"
+```
+
+装完会打印用法，之后这样跑：
+
+```bash
+sh ~/mifi --status      # 先确认能读到设备（几秒）
+sh ~/mifi               # 体检：能快多少 → 问你要不要改
+```
+
+三件事不注意就会踩：
+
+- **第一次会弹「是否允许访问本地网络」，必须点允许**。点了拒绝的话，后面一直超时，而且不会再弹第二次（要去设置里手动改）。
+- **体检期间别锁屏、别切走**。iOS 会把后台进程挂起，任务断在半路，设备可能停在临时锁定的频段上（用 `--restore` 能救回来）。整个过程 3~6 分钟，中途断网几次是正常的。
+- **关掉「设置 → 无线局域网 → 无线局域网助理」**。设备一断网，iPhone 会马上切到蜂窝，工具就连不上 `192.168.0.1` 了。
+
+### 安卓：第 0 步：装 Termux 和 Termux:API
 
 应用商店里经常搜不到 Termux。两个安装包的固定下载地址放在本仓库的 Release 里，另有官方长期地址和国内镜像：
 
