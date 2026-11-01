@@ -159,6 +159,10 @@ GUARD_MOVE_CHURN_ONLY = 3
 GUARD_LOCK_AUDIT_SEC = 1200
 # 两拍之间隔了这么久，说明进程被系统挂起了（Termux 一退到后台就会被冻结）。
 # 这个数只是「报出来」的门槛，不影响任何决策 —— 不报的话，用户会以为守护在跑。
+# 阈值 = interval × FACTOR + SLACK。FACTOR 取 3 而不是 2，是因为正常一拍本身
+# 就要十几秒（10 个 ping + 读一次状态），撞上锁定复核那一拍还要多花 20 秒量速度；
+# 用 2 倍容易把「本来就慢的一拍」报成冻结。
+GUARD_HANG_FACTOR = 3
 GUARD_HANG_SLACK = 90
 GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（只管主动动作）
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
@@ -4045,6 +4049,9 @@ def run_guard(args, cfg):
                             print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None
                             pending_lock = _guard_measure(args, prefer=serving) or serving
+                            # 体检要跑 3~6 分钟，这段时间本来就不采样。不把基线推过来，
+                            # 下一拍会算出「隔了 300 多秒」，把自己刚跑的体检报成系统冻结。
+                            last_beat = time.time()
                             if pending_lock:
                                 print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
                                       f"（体检结论「保持现状」不等于「别锁」）", flush=True)
@@ -4059,6 +4066,7 @@ def run_guard(args, cfg):
                     # 这条路径不是「选最优」，是「救火」：体检完照样得锁回去，
                     # 否则下一轮又会因为「没有记忆」再跑一次体检，无限断网。
                     pending_lock = _guard_measure(args, prefer=serving) or None
+                    last_beat = time.time()   # 同上：救护体检跑的几分钟不算被冻结
                     if not pending_lock:
                         print("      [!] 救护体检也没能给出可锁的频段，先保持解锁状态",
                               flush=True)

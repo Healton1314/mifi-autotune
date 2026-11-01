@@ -1090,5 +1090,23 @@ class LockSignalCollapse(unittest.TestCase):
         self.assertFalse(A.lock_signal_collapsed(-98, None))
 
 
+class HangDetection(unittest.TestCase):
+    """「被系统冻结」要不要报出来。
+
+    这条判据写在守护主循环里，没有单测覆盖得到 —— 常量漏定义过一次：
+    382 个测试全绿、import 也正常，可守护跑到第二拍就 NameError 退出。
+    所以这里至少把「这个数得存在、且是个能用的倍数」钉住。
+    """
+
+    def test_factor_exists_and_is_sane(self):
+        self.assertGreater(A.GUARD_HANG_FACTOR, 1)
+
+    def test_threshold_is_longer_than_a_normal_beat(self):
+        # 正常一拍 = 间隔 + 采样耗时。阈值必须明显长于它，否则每拍都报警
+        normal = A.GUARD_INTERVAL + 20
+        threshold = A.GUARD_INTERVAL * A.GUARD_HANG_FACTOR + A.GUARD_HANG_SLACK
+        self.assertGreater(threshold, normal * 2)
+
+
 if __name__ == "__main__":
     unittest.main()
