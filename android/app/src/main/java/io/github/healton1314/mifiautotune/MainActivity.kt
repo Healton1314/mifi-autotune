@@ -500,9 +500,12 @@ class MainActivity : Activity() {
             showLog(when {
                 o == null -> "扫描失败：${txt.take(200)}"
                 err.isNotEmpty() -> "扫描失败：$err"
-                best > 0 && best != cur -> "现在信道 $cur，建议换到 $best"
-                best > 0 -> "信道 $cur 已经是周围最干净的"
-                else -> "扫到了，但没有可推荐的信道"
+                best <= 0 -> "扫到了，但没有可推荐的信道"
+                // 信道设成「自动」时设备报回来的是 0，直接拼进句子就成了
+                // 「现在信道 0」—— 用户会以为自己看错了。
+                cur <= 0 -> "信道现在是自动的，建议固定到 $best"
+                best == cur -> "信道 $cur 已经是周围最干净的"
+                else -> "现在信道 $cur，建议换到 $best"
             })
         }
     }
