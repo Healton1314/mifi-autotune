@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -67,6 +67,7 @@ MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也�
 MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
 OBSERVE_SEC = 90                    # 应用后盯多久，确认「能一直通」
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
+CHANNEL_ADVICE = HERE / "channel_advice.json"   # 「扫描信道」的建议，单独存
 SITES = HERE / "sites.json"         # 位置记忆：每个 PCI 下哪些频段有覆盖、哪个最好
 
 # 守护模式（--watch）的劣化判定阈值。
@@ -210,6 +211,12 @@ GUARD_QUICK_MAX_MS = 150            # 「够用」的延迟上限
 GUARD_QUICK_PROBE_SEC = 4           # 每次快测下 4 秒（测两遍，总时长和原来相当）
 GUARD_QUICK_SAMPLES = 2             # 采样几次。单次 5 秒下载的重复性太差
 GUARD_QUICK_NOISY_RATIO = 3.0       # 两次差这么多倍 → 测不准，别拿它下结论
+# 快测结果最多算它「当时」有效多久。停 3 分钟先测一次，坐满 10 分钟才下锁 ——
+# 中间那 7 分钟里链路完全可能变一个样（晚高峰尤甚），而原来这个数字会一路
+# 带到锁定那一刻。实机 2026-11-01 19:28：18:21:13 测出 9 Mbps（两次 2 / 9，
+# 当场判「测不准」），18:28:01 下锁时又拿同一个 9 Mbps 说「够用」—— 一组数字
+# 得出两个相反的结论，而且早已过期。过期就重测一次：只测不切，20 秒，不断网。
+GUARD_QUICK_MAX_AGE = 240           # 快测结果超过这么久（秒）就不能当锁定依据
 # 久坐锁定前，把「刚才快测到的当前速度」和「记忆里的历史最优」比一下。
 # 实测（2026-10-30 18:00）：记忆说 BAND 3 有 44.6 Mbps，但那是上午、还是在
 # 另一个 PCI（350）下测的；当时实测当前 BAND 40 有 32 Mbps，延迟 65ms 正常。
@@ -778,10 +785,26 @@ def decide_band(cur_res, candidates, cmp_band, caveats=()):
              if r and r.get("ok") and str(r.get("band")) != str(cmp_band)]
     if not cands:
         return None, "没有可比的其他频段"
-    if caveats:
-        return None, f"测量数据本身不可信（{caveats[0].split('（')[0]}），不拿它当切换依据"
     cur_rsrp = _num((cur_res or {}).get("rsrp"))
     cur_med = cur_res.get("mbps") or 0
+    if caveats:
+        # 数据波动大 = 这条建议不可靠，但不等于「用户不配知道」。
+        #
+        # 2026-11-01 实测：屏幕上明明写着「BAND 8 9.6 Mbps → 最优 BAND 3
+        # 20.6 Mbps」，下面紧跟一句「保持现状」和一个点不动的界面 —— 那句话
+        # 等于白写。他的原话：「他可以给我建议，但是我也有权拒绝他的建议」。
+        # 所以照实给建议、把「这次测的波动大」写进理由，切不切由他定。
+        faster = [r for r in cands
+                  if (r.get("mbps") or 0) - cur_med >= MIN_BAND_GAIN_MBPS]
+        if faster:
+            w = max(faster, key=lambda r: r.get("mbps") or 0)
+            gain = (w.get("mbps") or 0) - cur_med
+            why = caveats[0].split("（")[0]
+            return {"band": w["band"], "kind": "speed", "small": True, "risky": True,
+                    "reason": f"它快 {gain:.1f} Mbps，但这次测量{why} —— "
+                              f"数字不一定准，试不试你自己定",
+                    "gain": round(gain, 1)}, ""
+        return None, f"测量数据本身不可信（{caveats[0].split('（')[0]}），不拿它当切换依据"
     if cur_rsrp is not None:
         kept = [r for r in cands
                 if not (r.get("rsrp") is not None
@@ -2484,6 +2507,102 @@ def run_apply_plan(dev, caps, st0, args, cfg, ping_host):
     return 0
 
 
+# ---------------- 只改信道（「扫描信道」那条建议的落地） ----------------
+
+def save_channel_advice(cur, best):
+    """把刚扫出来的信道建议写下来。
+
+    app 里界面和引擎不在同一个进程，只能靠文件传：界面上点「应用建议」时，
+    引擎这边得知道用户同意的是哪个信道。写失败不影响扫描本身 —— 大不了
+    应用的时候说一句「建议过期了，重扫一次」。
+    """
+    try:
+        CHANNEL_ADVICE.write_text(json.dumps(
+            {"current": cur, "best": best,
+             "saved_at": datetime.now().isoformat(timespec="seconds")},
+            ensure_ascii=False), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def load_channel_advice():
+    try:
+        return json.loads(CHANNEL_ADVICE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def run_apply_channel(dev, caps, st0, args, ping_host):
+    """只把信道锁到刚扫出来的那个。
+
+    为什么不并进 run_apply_plan：那份结论是按体检当时的频段算的，可能已经
+    过期；信道建议是刚刚扫的，两件事的时效差很远。硬塞进同一份 plan，就会
+    出现「用户只想改信道，结果频段也被切走」—— 那不叫建议，叫替人做主。
+    """
+    adv = load_channel_advice()
+    if not adv or not adv.get("best"):
+        print("[×] 没有可用的信道建议。先点一次「扫描信道」。")
+        return 1
+    target = adv["best"]
+    cur_ch = st0["channel"]
+
+    if not caps.get("can_set_channel", True):
+        print("[×] 这台设备的固件不让改信道（后台里没有这个选项）。")
+        return 1
+    if target == cur_ch:
+        print(f"[√] 现在就是信道 {target}，不用改。")
+        return 0
+
+    print(f"按扫描结果应用：信道 {cur_ch or '自动'} → {target}")
+    print("      设备会重启 WiFi，这台机器的连接会断 5~20 秒（正常现象）")
+    save_state({"saved_at": datetime.now().isoformat(),
+                "band": st0["band"], "channel": cur_ch})
+
+    try:
+        dev.set_channel(target)
+    except Unsupported as e:
+        print(f"[跳过] {e}")
+        return 1
+    except DeviceUnreachable:
+        # 指令多半已经送到，只是设备重启太快、响应没回来。当失败会误判。
+        print("      指令已发出（设备重启太快，响应没回来 —— 正常）")
+
+    print("      等 WiFi 恢复…")
+    if not wait_device_back(dev, timeout=90, poll=5):
+        print("[!] 90 秒还没连回来。")
+        print(f"    手机看 WiFi 是否已重连，再跑 {_cli()} --status；"
+              f"要回原样用 {_cli()} --restore。")
+        return 1
+
+    try:
+        got = dev.get_state()["channel"]
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] 暂时读不到设备（{type(e).__name__}），等会儿再 {_cli()} --status 确认。")
+        return 1
+
+    if got != target:
+        print(f"[!] 信道未生效（当前 {got}），恢复原值 {cur_ch or '自动'}")
+        try:
+            dev.set_channel(cur_ch or 0)
+            wait_device_back(dev, timeout=90)
+        except Exception:  # noqa: BLE001
+            print(f"    恢复也没发出去，请手动在设备后台把信道改回 {cur_ch or '自动'}")
+        return 1
+
+    print(f"[√] 已生效，信道 {got}")
+    append_log({"ts": datetime.now().isoformat(), "mode": "apply-channel",
+                "before": {"band": st0["band"], "channel": cur_ch},
+                "after": {"band": st0["band"], "channel": got}})
+
+    verdict = observe_after_apply(ping_host, getattr(args, "observe", OBSERVE_SEC))
+    if verdict and verdict["bad"] >= 2:
+        print("\n[!] 切过去之后多次不通，这个信道在你这个位置撑不住。")
+        print(f"    建议回滚：{_cli()} --restore")
+        return 1
+    return 0
+
+
 # ---------------- 守护模式 ----------------
 
 def _threshold(base, floor_ms, cold_ms, cap_ms):
@@ -2648,7 +2767,7 @@ def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False, churn_n=
     return bool(pci_changed and bad_now)
 
 
-UNLOCK_SIGNAL_COLLAPSE = "锁着的这条信号塌了（多半是走开了），锁的前提没了"
+UNLOCK_SIGNAL_COLLAPSE = "锁着的这条信号塌了，锁的前提没了"
 
 
 def lock_signal_collapsed(lock_rsrp, cur_rsrp, drop=GUARD_LOCK_RSRP_DROP):
@@ -2662,6 +2781,62 @@ def lock_signal_collapsed(lock_rsrp, cur_rsrp, drop=GUARD_LOCK_RSRP_DROP):
     if lock_rsrp is None or cur_rsrp is None:
         return False
     return cur_rsrp <= lock_rsrp - drop
+
+
+def lock_collapse_cause(*, lock_ref, cur_rsrp, locked_band, pci_changed,
+                        band_changed):
+    """「锁着的这条信号塌了」到底是哪一种塌 —— 只负责说人话，不影响裁决。
+
+    两种成因的处置完全一样（解锁，交还给设备），但日志里必须分清楚，否则看的人
+    会以为程序在瞎猜。实机 2026-11-01 19:31：锁着 BAND 40，PCI 288 是 -61dBm，
+    两拍内 PCI 变成 222、-97dBm —— 人正坐在餐厅吃饭，根本没走开。原来的文案写
+    死了「多半是走开了」，把「设备在同一频段里挑了个弱小区」硬说成「人走了」。
+    """
+    if band_changed:
+        return "设备已经换到别的频段了"
+    if lock_ref is None or cur_rsrp is None:
+        return "拿不到信号读数，按「不再死守」处理"
+    if pci_changed:
+        return (f"人没动，是设备在 BAND {locked_band} 里换到了弱小区"
+                f"（{int(lock_ref)}→{cur_rsrp}dBm）—— 锁着就换不出去")
+    return f"信号从 {int(lock_ref)} 掉到 {cur_rsrp}dBm，多半是走开了"
+
+
+def quick_line(q):
+    """把一次快测结果排成一行人话。
+
+    「停 3 分钟先测一次」和「下锁前发现过期、再测一次」两处都要打这一行，
+    原来各写一套：一处带「两次差 3.5 倍」，另一处没有 —— 而恰恰是后面那处
+    的差异（2 / 9）决定了能不能信这个数字。所以只留一份实现。
+    """
+    gcn = {"good": "明确够用", "fair": "勉强够用",
+           "unknown": "测不准（两次差太多）", "poor": "不够用"}
+    g = q.get("grade") or ("good" if q.get("ok") else "poor")
+    sam = " / ".join(f"{x:.0f}" for x in (q.get("samples") or []))
+    vals = [x for x in (q.get("samples") or []) if x]
+    spread = ""
+    if len(vals) >= 2 and min(vals) > 0 and max(vals) / min(vals) >= 1.5:
+        spread = f"，两次差 {max(vals) / min(vals):.1f} 倍"
+    lat = f"{q['avg']}ms" if q.get("avg") is not None else "不通"
+    return (f"{float(q.get('mbps') or 0):.0f} Mbps（两次 {sam}{spread}）｜ "
+            f"延迟 {lat} ｜ 丢包 {q.get('loss')}% → {gcn.get(g, g)}"
+            f"（{'先不动它' if q.get('ok') else '坐久了会重新选'}）")
+
+
+def quick_is_stale(q, now, max_age=GUARD_QUICK_MAX_AGE):
+    """这份快测结果还能不能当依据。
+
+    快测发生在「停够 3 分钟」，下锁在「坐满 10 分钟」，中间隔着 7 分钟；
+    晚高峰的链路几分钟就能变一个样。实机 2026-11-01 19:28 就是拿 18:21:13
+    的 9 Mbps（两次 2 / 9，当场判「测不准」）去下锁，说「快测够用」。
+    没有时间戳的旧结果（老版本导出的）一律算过期 —— 宁可多测 20 秒。
+    """
+    if not q:
+        return False
+    at = q.get("at")
+    if at is None:
+        return True
+    return (now - float(at)) > max_age
 
 
 def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
@@ -2794,7 +2969,9 @@ def guard_quick_probe(speed_url, ping_host, secs=GUARD_QUICK_PROBE_SEC,
     q = {"mbps": best["mbps"], "avg": best["avg"],
          # 丢包取最差的那次：一次通不代表链路稳
          "loss": max(r["loss"] or 0 for r in runs),
-         "samples": [round(x, 1) for x in speeds], "noisy": noisy}
+         "samples": [round(x, 1) for x in speeds], "noisy": noisy,
+         # 量出来的时刻。调用方可能过好几分钟才拿它下结论，得能算出「这数字多旧了」
+         "at": time.time()}
     q["grade"] = _quick_grade(q)
     q["ok"] = _quick_ok(q)
     return q
@@ -3883,23 +4060,7 @@ def run_guard(args, cfg):
                 quick = guard_quick_probe(speed_url, host)
                 quick["band"] = serving
                 quick_done = True
-                grade_cn = {"good": "明确够用", "fair": "勉强够用",
-                            "unknown": "测不准（两次差太多）",
-                            "poor": "不够用"}
-                g = quick.get("grade") or ("good" if quick["ok"] else "poor")
-                sam = " / ".join(f"{x:.0f}" for x in (quick.get("samples") or []))
-                # 两次差 1.5 倍以上就把倍数写出来：「12 Mbps（两次 6 / 12）」
-                # 本身不假，但读者不会立刻意识到这条链路的带宽在坐过山车，
-                # 而这个数字接下来要拿来决定锁哪条频段。
-                vals = [x for x in (quick.get("samples") or []) if x]
-                spread = ""
-                if len(vals) >= 2 and min(vals) > 0 and max(vals) / min(vals) >= 1.5:
-                    spread = f"，两次差 {max(vals) / min(vals):.1f} 倍"
-                lat = f"{quick['avg']}ms" if quick["avg"] is not None else "不通"
-                print(f"      {quick['mbps']:.0f} Mbps（两次 {sam}{spread}）｜ 延迟 {lat} ｜ "
-                      f"丢包 {quick['loss']}% → {grade_cn.get(g, g)}"
-                      f"（{'先不动它' if quick['ok'] else '坐久了会重新选'}）",
-                      flush=True)
+                print("      " + quick_line(quick), flush=True)
 
             lat = f"{ping['avg']}ms" if ping["avg"] is not None else "不通"
             # 这地方你命名过的话，状态行带上名字 —— 日志里能一眼看出「现在说的是住处」，
@@ -3974,6 +4135,21 @@ def run_guard(args, cfg):
             # 真跑和演练共用同一份结果。
             plan = None
             if action == "lock" and not getattr(args, "guard_fast", False):
+                # 「当前这条够不够用」是快测给的，而快测发生在停够 3 分钟那会儿，
+                # 下锁是 10 分钟以后 —— 中间这 7 分钟晚高峰能把 9 Mbps 变成 2，
+                # 也能反过来。拿一个过期数字决定「锁哪条」等于蒙。
+                # 实机 2026-11-01 19:28 就是这么锁的 BAND 40，4 分钟后信号塌到
+                # -97dBm 又解锁。重测只测不切，约 20 秒，不断网，比锁错一轮划算。
+                age = (now - float(quick.get("at") or 0)) if quick else 0.0
+                if quick and not dry and quick_is_stale(quick, now):
+                    if speed_url is None:
+                        speed_url = probe.resolve_speed_url(cfg.get("speed_url"),
+                                                            verbose=False)
+                    print(f"{_now_hm()}  刚才那次快测是 {int(age / 60)} 分钟前量的，"
+                          f"下锁前重测一次（只测不切）…", flush=True)
+                    quick = guard_quick_probe(speed_url, host)
+                    quick["band"] = serving
+                    print("      " + quick_line(quick), flush=True)
                 plan = guard_plan_lock(st, memo, serving, quick, rsrp,
                                        ping["loss"], pinned, memo_rsrp)
 
@@ -4008,6 +4184,16 @@ def run_guard(args, cfg):
                     next_allowed = time.time() + GUARD_COOLDOWN
                 elif action == "unlock":
                     if why == UNLOCK_SIGNAL_COLLAPSE:
+                        # 「信号塌了」有两种完全不同的成因，不能都怪到「人走开了」头上：
+                        #   ① 人真的走开了 —— 频段换了，或者一路掉下去；
+                        #   ② 人没动，设备在**同一个频段里**换到了一个弱小区。
+                        # 结论（解锁）一样，但日志必须写清是哪一种，否则看的人
+                        # 会以为程序在瞎猜。判据收在 lock_collapse_cause 里，可单测。
+                        print("      （" + lock_collapse_cause(
+                            lock_ref=lock_ref, cur_rsrp=rsrp,
+                            locked_band=locked_band, pci_changed=pci_changed,
+                            band_changed=band_changed)
+                            + "；交还给设备，它会挑一条能用的）", flush=True)
                         # 这条是你指定过的、现在当地已经不行了 → 记一笔。
                         # 连续两次就会自动取消 pin，否则「解锁 → 下一拍又照 pin
                         # 锁回来」，解锁等于没解（2026-11-01 中午在餐厅就是这样）。
@@ -4110,10 +4296,22 @@ def run_guard(args, cfg):
                             _guard_lock_band(dev, band)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "quick":
-                            print(f"      → 当前 BAND {serving} 快测够用"
-                                  f"（{float(quick.get('mbps') or 0):.0f} Mbps / "
-                                  f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
-                                  flush=True)
+                            # 「测不准」不能写成「够用」。同一组数字（9 Mbps，两次
+                            # 2 / 9）在 18:21 印的是「测不准（先不动它）」，18:28
+                            # 印的是「够用」，看日志的人只会以为程序在自相矛盾。
+                            # 实情是：证据不足时按「先别动设备」处理，那就照实说。
+                            if _quick_grade(quick) == "unknown":
+                                sam = " / ".join(
+                                    f"{x:.0f}" for x in (quick.get("samples") or []))
+                                print(f"      → 当前 BAND {serving} 那次快测偏不准"
+                                      f"（两次 {sam}），没有更硬的依据 —— 按其中较高的 "
+                                      f"{float(quick.get('mbps') or 0):.0f} Mbps 先锁它，"
+                                      f"锁上后每 20 分钟复核一次", flush=True)
+                            else:
+                                print(f"      → 当前 BAND {serving} 快测够用"
+                                      f"（{float(quick.get('mbps') or 0):.0f} Mbps / "
+                                      f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
+                                      flush=True)
                             _guard_lock_band(dev, band)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                             mark_site_provisional(key_now, band)
@@ -4415,6 +4613,8 @@ def main():
                     help="体检并给出「预期提升」，结束时恢复原配置（推荐的第一步）")
     ap.add_argument("--apply-plan", action="store_true",
                     help="按上一次 --preview 的结论应用，不再重测（只切一次，最快）")
+    ap.add_argument("--apply-channel", action="store_true",
+                    help="按上一次 --scan 的信道建议把信道锁上（不动频段）")
     ap.add_argument("-i", "--interactive", action="store_true",
                     help="体检 → 给结论 → 问一句是否应用（手机上的 mifi 用的就是这个）")
     ap.add_argument("--status", action="store_true",
@@ -4669,6 +4869,9 @@ def main():
 
     if args.apply_plan:
         return run_apply_plan(dev, caps, st0, args, cfg, ping_host)
+
+    if args.apply_channel:
+        return run_apply_channel(dev, caps, st0, args, ping_host)
 
     if args.lock_band:
         return run_lock_band(dev, args)

@@ -93,6 +93,11 @@ def apply_plan():
     return _start(["--apply-plan"], "apply")
 
 
+def apply_channel():
+    """按上次「扫描信道」的建议把信道锁上 —— 只动信道，不碰频段。"""
+    return _start(["--apply-channel"], "apply")
+
+
 def restore():
     """恢复原始设置。"""
     return _start(["--restore"], "restore")

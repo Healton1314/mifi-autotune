@@ -155,5 +155,69 @@ class WaitDeviceBack(unittest.TestCase):
             self.assertFalse(autotune.wait_device_back(dev, timeout=10, poll=1))
 
 
+class ChannelAdviceApplied(unittest.TestCase):
+    """「扫描信道」给的建议也要能一键应用 —— 否则那句话只会让人干着急。
+
+    2026-11-01 实测：「信道也是一样的问题，我都点击了，你还给我建议了，
+    但是没有应用建议和不用了的按钮」。所以这条路径单独存在，不并进 plan.json：
+    体检结论是按当时的频段算的，可能已经过期，硬塞进去会把频段一起改掉。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.adv = Path(self.tmp) / "channel_advice.json"
+
+    def _run(self, dev, advice="__none__", caps=None):
+        if advice != "__none__":
+            self.adv.write_text(json.dumps(advice, ensure_ascii=False), encoding="utf-8")
+        st0 = {"band": dev.band, "channel": dev.channel}
+        buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for pt in [
+                mock.patch.object(autotune, "CHANNEL_ADVICE", self.adv),
+                mock.patch.object(autotune, "save_state", lambda *a, **k: None),
+                mock.patch.object(autotune, "append_log", lambda *a, **k: None),
+                mock.patch.object(autotune.time, "sleep", lambda s: None),
+                mock.patch.object(autotune, "observe_after_apply", lambda *a, **k: None),
+                mock.patch.object(autotune, "wait_device_back", lambda *a, **k: True),
+                contextlib.redirect_stdout(buf),
+            ]:
+                stack.enter_context(pt)
+            code = autotune.run_apply_channel(
+                dev, caps or dev.capabilities(), st0, _args(), "223.5.5.5")
+        return code, buf.getvalue()
+
+    def test_no_advice_tells_you_to_scan_first(self):
+        dev = FlakyDev(channel=13, down_rounds=0)
+        code, out = self._run(dev, advice=None)
+        self.assertEqual(code, 1)
+        self.assertIn("扫描信道", out)
+        self.assertEqual(dev.channels_set, [])      # 没建议就绝不碰设备
+
+    def test_applies_channel_without_touching_band(self):
+        dev = FlakyDev(band=8, channel=13, down_rounds=0)
+        code, out = self._run(dev, advice={"current": 13, "best": 1})
+        self.assertEqual(dev.channels_set, [1])
+        self.assertEqual(dev.channel, 1)
+        self.assertEqual(dev.band, 8)               # 频段一根手指都没碰
+        self.assertIn("已生效", out)
+        self.assertEqual(code, 0)
+
+    def test_same_channel_is_a_no_op(self):
+        dev = FlakyDev(channel=1, down_rounds=0)
+        code, out = self._run(dev, advice={"current": 1, "best": 1})
+        self.assertEqual(dev.channels_set, [])
+        self.assertIn("不用改", out)
+        self.assertEqual(code, 0)
+
+    def test_firmware_without_channel_control_says_so(self):
+        dev = FlakyDev(channel=13, down_rounds=0)
+        caps = dict(dev.capabilities(), can_set_channel=False)
+        code, out = self._run(dev, advice={"current": 13, "best": 1}, caps=caps)
+        self.assertEqual(dev.channels_set, [])
+        self.assertIn("不让改信道", out)
+        self.assertEqual(code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

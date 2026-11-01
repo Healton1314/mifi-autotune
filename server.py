@@ -546,6 +546,10 @@ def channel_scan():
                 "scores": [], "error": scanner.scan_failure_hint()}
     rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
     best = scanner.pick_best_channel(rows)
+    # 顺手把建议存下来：界面上那句「建议固定到 3」下面就跟着「应用建议」，
+    # 用户点了之后引擎得知道该锁哪条 —— 两个进程只能靠文件传。
+    if best:
+        autotune.save_channel_advice(st["channel"], best["ch"])
     return {"current": st["channel"], "best": best["ch"] if best else None,
             "aps": aps, "scores": rows}
 

@@ -1108,5 +1108,82 @@ class HangDetection(unittest.TestCase):
         self.assertGreater(threshold, normal * 2)
 
 
+class QuickFreshness(unittest.TestCase):
+    """下锁时用的那个速度，是不是还新鲜。
+
+    实机 2026-11-01 19:28：18:21:13 快测出 9 Mbps（两次 2 / 9，当时判「测不准，
+    先不动它」），18:28:01 下锁时又拿同一个 9 Mbps 说「快测够用」。一组数字、
+    两个相反结论，中间还隔了 7 分钟 —— 晚高峰的链路足够变一个样。
+    """
+
+    def test_fresh_result_is_usable(self):
+        q = {"mbps": 9, "at": 1000.0}
+        self.assertFalse(A.quick_is_stale(q, now=1000.0 + 60))
+
+    def test_result_older_than_window_is_stale(self):
+        q = {"mbps": 9, "at": 1000.0}
+        self.assertTrue(A.quick_is_stale(q, now=1000.0 + A.GUARD_QUICK_MAX_AGE + 1))
+
+    def test_window_is_shorter_than_the_gap_between_probe_and_lock(self):
+        # 快测在「停 3 分钟」，下锁在「坐满 10 分钟」：窗口必须短于这段时间，
+        # 否则这条规则永远不会生效（等于没加）。
+        self.assertLess(A.GUARD_QUICK_MAX_AGE, A.GUARD_QUICK_SEC * 2 + 120)
+
+    def test_no_timestamp_counts_as_stale(self):
+        # 老版本/手工拼出来的 dict 没有 at，别拿它下结论
+        self.assertTrue(A.quick_is_stale({"mbps": 9}, now=1e9))
+
+    def test_none_is_not_stale(self):
+        # 压根没测过：不该触发「重测」，那是另一条分支的事
+        self.assertFalse(A.quick_is_stale(None, now=1e9))
+
+
+class CollapseCause(unittest.TestCase):
+    """「锁着的这条信号塌了」到底是哪一种塌。
+
+    实机 2026-11-01 19:31：锁着 BAND 40，PCI 288 是 -61dBm，两拍内 PCI 变成
+    222、-97dBm —— 人正坐在餐厅吃饭。旧文案写死「多半是走开了」，把「设备在
+    同一频段里挑了个弱小区」说成「人走了」。处置一样（解锁），但话不能说错。
+    """
+
+    def test_same_band_new_cell_is_not_the_user_leaving(self):
+        why = A.lock_collapse_cause(lock_ref=-61, cur_rsrp=-97, locked_band=40,
+                                    pci_changed=True, band_changed=False)
+        self.assertIn("人没动", why)
+        self.assertIn("BAND 40", why)
+        self.assertNotIn("走开", why)
+
+    def test_no_cell_change_means_the_person_moved(self):
+        why = A.lock_collapse_cause(lock_ref=-70, cur_rsrp=-95, locked_band=3,
+                                    pci_changed=False, band_changed=False)
+        self.assertIn("走开", why)
+
+    def test_band_change_says_so(self):
+        why = A.lock_collapse_cause(lock_ref=-70, cur_rsrp=-95, locked_band=3,
+                                    pci_changed=True, band_changed=True)
+        self.assertIn("别的频段", why)
+
+    def test_missing_reading_does_not_invent_a_reason(self):
+        why = A.lock_collapse_cause(lock_ref=None, cur_rsrp=-95, locked_band=3,
+                                    pci_changed=False, band_changed=False)
+        self.assertIn("拿不到", why)
+
+
+class QuickLine(unittest.TestCase):
+    def test_noisy_result_is_labelled_unmeasurable(self):
+        line = A.quick_line({"mbps": 9, "avg": 65, "loss": 0,
+                             "samples": [3.0, 9.0], "noisy": True,
+                             "grade": "unknown", "ok": True})
+        self.assertIn("测不准", line)
+        self.assertIn("两次差 3.0 倍", line)
+
+    def test_good_result_says_enough(self):
+        line = A.quick_line({"mbps": 26, "avg": 60, "loss": 0,
+                             "samples": [25.0, 26.0], "noisy": False,
+                             "grade": "good", "ok": True})
+        self.assertIn("明确够用", line)
+        self.assertNotIn("测不准", line)
+
+
 if __name__ == "__main__":
     unittest.main()
