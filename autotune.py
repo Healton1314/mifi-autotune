@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.5"
+__version__ = "0.9.3"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -781,17 +781,34 @@ def decide_band(cur_res, candidates, cmp_band, caveats=()):
     if caveats:
         return None, f"测量数据本身不可信（{caveats[0].split('（')[0]}），不拿它当切换依据"
     cur_rsrp = _num((cur_res or {}).get("rsrp"))
+    cur_med = cur_res.get("mbps") or 0
     if cur_rsrp is not None:
         kept = [r for r in cands
                 if not (r.get("rsrp") is not None
                         and r["rsrp"] <= cur_rsrp - BAND_RSRP_DROP)]
         if not kept:
+            # 所有候选都被「信号差太多」这道闸门挡下了。
+            #
+            # 但挡下不等于「不该让用户知道」。2026-11-01 用户原话：
+            # 「体检就是检测和裁定，切不切换在我，而不是他自己就说不建议就不切换」。
+            # 这里不替他否掉，而是把两边的代价都摆出来 —— 速度快多少、信号弱多少，
+            # 剩下的是他的判断。risky 标记让界面知道这条建议附带代价。
+            faster = [r for r in cands
+                      if (r.get("mbps") or 0) > cur_med and r.get("rsrp") is not None]
+            if faster:
+                w = max(faster, key=lambda r: r.get("mbps") or 0)
+                gain = (w.get("mbps") or 0) - cur_med
+                drop = cur_rsrp - w["rsrp"]
+                return {"band": w["band"], "kind": "speed", "small": True, "risky": True,
+                        "rsrp_drop": round(drop),
+                        "reason": f"它快 {gain:.1f} Mbps，但信号弱 {drop:.0f}dB —— "
+                                  f"可能不稳，试不试你自己定",
+                        "gain": round(gain, 1)}, ""
             worst = min(r["rsrp"] for r in cands if r.get("rsrp") is not None)
             return None, (f"其他频段的信号都比当前差一截（最弱 {worst:.0f}dBm，"
-                          f"当前 {cur_rsrp:.0f}dBm），不值得为它断一次网")
+                          f"当前 {cur_rsrp:.0f}dBm），而且没有一个更快，不值得断一次网")
         cands = kept
 
-    cur_med = cur_res.get("mbps") or 0
     cur_cons = _cons_mbps(cur_res)
     cur_ratio = _sample_ratio(cur_res)
 
@@ -1981,7 +1998,11 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         },
         "changes": ([] if not do_band else
                     [f"频段 {cur_label} → {_band_label(picked['band'])}"
-                     + ("（换稳定性）" if picked.get("kind") == "stability" else "")])
+                     + ("（换稳定性）" if picked.get("kind") == "stability" else "")
+                     # 带代价的建议必须把代价写在建议本身里，不能只在日志深处提一句：
+                     # app 的结论卡片上只显示这一行，用户要能一眼看到「这不是白赚的」。
+                     + (f"（信号弱 {picked['rsrp_drop']}dB）"
+                        if picked.get("risky") and picked.get("rsrp_drop") else "")])
                    + ([f"信道 {cur_ch} → {target['channel']}"] if do_ch else []),
     })
     PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")

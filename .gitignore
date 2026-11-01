@@ -51,3 +51,8 @@ android/build/
 *.msi
 *.jks
 *.keystore
+# 唯一例外：debug 签名。它不是密钥，是「同一把锁」的问题 ——
+# CI 每次 runner 都新生成一把，新包装不进手机，只能卸载重装，app 的数据
+# （原始设置、体检结论、位置记忆）每装一次丢一次。放一把固定的在这儿，
+# 覆盖安装就正常了。它只能签 debug 包，公开也没有任何风险。
+!android/debug.keystore

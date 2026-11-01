@@ -107,10 +107,26 @@ class DecideBand(unittest.TestCase):
         self.assertIsNone(opt)
         self.assertIn("不可信", why)
 
-    def test_candidate_with_much_worse_signal_is_skipped(self):
-        """速度快一点、但信号差 24dB —— 不换。今晚就是拿 14dB 换 1 Mbps。"""
+    def test_candidate_with_much_worse_signal_is_offered_with_warning(self):
+        """速度快一点、信号差 24dB —— 不替用户否掉，但必须把代价写进建议里。
+
+        历史（2026-10-30 21:56）：这道闸门当初是为了阻止「拿 14dB 换 1 Mbps」
+        的**自动**切换。现在自动切换本身已经不发生了（要用户点「应用」才切），
+        所以闸门改成「说清代价」而不是「不许出现」——
+        2026-11-01 用户原话：「切不切换在我」。
+        """
         cur = dict(res(40, 30.0, [29.0, 31.0]), rsrp=-78)
         cand = [dict(res(3, 33.0, [32.0, 34.0]), rsrp=-102)]
+        opt, _why = autotune.decide_band(cur, cand, 40)
+        self.assertIsNotNone(opt)
+        self.assertTrue(opt.get("risky"))
+        self.assertEqual(opt["rsrp_drop"], 24)
+        self.assertIn("信号弱", opt["reason"])
+
+    def test_worse_signal_and_slower_stays_silent(self):
+        """信号又差、速度还慢 —— 这种连建议都不该给。"""
+        cur = dict(res(40, 30.0, [29.0, 31.0]), rsrp=-78)
+        cand = [dict(res(3, 20.0, [19.0, 21.0]), rsrp=-102)]
         opt, why = autotune.decide_band(cur, cand, 40)
         self.assertIsNone(opt)
         self.assertIn("信号都比当前差一截", why)

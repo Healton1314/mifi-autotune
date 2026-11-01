@@ -52,7 +52,7 @@ android {
         versionCode = 1
         // 跟 autotune.__version__ 对齐：手机上排查「装的到底是哪一版」时，
         // APK 版本和面板里显示的对不上会白折腾半天。
-        versionName = "0.9.2"
+        versionName = "0.9.3"
 
         // 只要真机 ABI，而且只留 64 位。
         //
@@ -63,9 +63,26 @@ android {
         }
     }
 
+    signingConfigs {
+        getByName("debug") {
+            // 仓库里 android/debug.keystore，不是 ~/.android/ 下那把随机的
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         getByName("debug") {
             isMinifyEnabled = false
+            // 用仓库里那把固定的 debug keystore，不用构建机的默认值。
+            //
+            // 原因不是签名本身，是「同一把锁」：CI 每次 runner 都是全新的，
+            // 默认会现生成一把新的 —— 新包和手机上那一个签名对不上，只能
+            // 先卸载再装，于是 app 的私有数据（原始设置、体检结论、位置
+            // 记忆）每装一次丢一次。debug 签名不保护任何东西，公开无风险。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
