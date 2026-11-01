@@ -569,6 +569,7 @@ class MainActivity : Activity() {
             } else {
                 for (i in 0 until lines.length()) sb.append(lines.optString(i)).append('\n')
             }
+            val n = if (lines == null) 0 else lines.length()
 
             val dlg = Dialog(this)
             val root = LinearLayout(this).apply {
@@ -589,15 +590,19 @@ class MainActivity : Activity() {
                 typeface = Typeface.MONOSPACE
                 setTextIsSelectable(true)
                 setTextColor(LOG_INK)
-                setBackgroundColor(Color.parseColor("#14161A"))
                 setPadding(dp(12), dp(12), dp(12), dp(12))
             }
+            // 底色给 ScrollView，不给 TextView：日志只有两三行的时候，TextView
+            // 只有那么高，黑底就只剩顶上一条，下面一大片白 —— 看着像框破了。
             val sv = ScrollView(this).apply {
+                setBackgroundColor(Color.parseColor("#14161A"))
                 addView(tv, ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
                 isVerticalScrollBarEnabled = true
+                minimumHeight = dp(96)
             }
-            val h = (resources.displayMetrics.heightPixels * 0.52f).toInt()
+            val h = if (n <= 12) ViewGroup.LayoutParams.WRAP_CONTENT
+            else (resources.displayMetrics.heightPixels * 0.52f).toInt()
             root.addView(sv, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, h).apply { topMargin = dp(10) })
 
