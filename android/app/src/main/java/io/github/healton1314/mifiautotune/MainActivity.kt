@@ -300,10 +300,14 @@ class MainActivity : Activity() {
 
             tvBand.text = "BAND ${o.optInt("band", 0).takeIf { it > 0 } ?: "—"}"
             tvChan.text = o.optInt("channel", 0).takeIf { it > 0 }?.toString() ?: "自动"
-            val rsrp = o.optJSONObject("lte")?.optInt("rsrp", 0) ?: 0
-            tvRsrp.text = if (rsrp != 0) "$rsrp dBm" else "—"
-            val sinr = o.optJSONObject("lte")?.optInt("sinr", 0) ?: 0
-            tvSinr.text = if (sinr != 0) "$sinr dB" else "—"
+            // 设备给的是带单位的字符串（"-99dBm" / "3dB"）。浏览器里 parseInt 会
+            // 自动截出数字，Kotlin 的 optInt 直接失败返回 0 —— 这就是前一版这两格
+            // 一直是「—」的原因。这里显式剥掉单位。
+            val lte = o.optJSONObject("lte")
+            val rsrp = num(lte?.optString("rsrp"))
+            val sinr = num(lte?.optString("sinr"))
+            tvRsrp.text = if (rsrp != null) "$rsrp dBm" else "—"
+            tvSinr.text = if (sinr != null) "$sinr dB" else "—"
             tvLat.text = "延迟 " + (if (lat >= 0) "${lat.toInt()} ms" else "—") +
                 " · 丢包 " + (if (loss >= 0) "${loss.toInt()}%" else "—")
         }
@@ -396,6 +400,16 @@ class MainActivity : Activity() {
         JSONObject(s)
     } catch (t: Throwable) {
         null
+    }
+
+    /**
+     * 从 "-99dBm" / "3dB" / "-14.5dB" 这种带单位的串里取数字。
+     * 设备返回的就是这样，别指望它是纯数字。
+     */
+    private fun num(s: String?): Int? {
+        if (s.isNullOrBlank() || s == "null") return null
+        val m = Regex("-?\\d+(?:\\.\\d+)?").find(s) ?: return null
+        return m.value.toDoubleOrNull()?.toInt()
     }
 
     private fun card() = LinearLayout(this).apply {
