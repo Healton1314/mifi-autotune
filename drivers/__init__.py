@@ -27,8 +27,20 @@ def get_driver_class(name=None):
     return None
 
 
-def detect(host="192.168.0.1", user="admin", password="admin", name=None, timeout=5):
-    """返回一个已实例化的驱动；指定 name 时不探测，直接用。"""
+def detect(host=None, user=None, password=None, name=None, timeout=5):
+    """返回一个已实例化的驱动；指定 name 时不探测，直接用。
+
+    None 一律当「用默认」处理。命令行那边有 argparse 的 default 兜着，但 APK
+    的原生界面是手工构造参数对象的，漏填一项就会拼出 "None:80" 这样的地址去
+    连，报错还特别像网络问题（真机上就踩过：守护日志满屏「连不上 None:80」）。
+    注意只兜 None，不管空字符串 —— 空密码是合法输入，不能替用户改成 admin。
+    """
+    if host is None:
+        host = "192.168.0.1"
+    if user is None:
+        user = "admin"
+    if password is None:
+        password = "admin"
     if name:
         return get_driver_class(name)(host, user, password, timeout=timeout)
 
