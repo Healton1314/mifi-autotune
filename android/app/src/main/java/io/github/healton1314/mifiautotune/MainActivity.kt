@@ -345,7 +345,7 @@ class MainActivity : Activity() {
             jobBusy = true
             Py.callFast(this@MainActivity, "job") { txt ->
                 jobBusy = false
-                val o = json(txt) ?: return@call
+                val o = json(txt) ?: return@callFast
                 val running = o.optBoolean("running")
                 // org.json 的 optString 对 JSON null 会返回字符串 "null"，
                 // 直接拿它判空会让日志区一直挂着。这里显式问 isNull。
@@ -389,7 +389,7 @@ class MainActivity : Activity() {
         override fun run() {
             if (guardOn) {
                 Py.callFast(this@MainActivity, "guard_state") { txt ->
-                    val o = json(txt) ?: return@call
+                    val o = json(txt) ?: return@callFast
                     if (!o.optBoolean("running")) {
                         if (guardOn) {
                             guardOn = false
@@ -400,7 +400,7 @@ class MainActivity : Activity() {
                             }
                             tvGuardHint.text = "已经停了。点「查看运行日志」看原因"
                         }
-                        return@call
+                        return@callFast
                     }
                     // 把守护最近一条输出摆出来：不然开关亮着、底下只有一句
                     // 「运行中」，用户根本不知道它到底在干活没有。
@@ -999,9 +999,9 @@ class MainActivity : Activity() {
         // 上面那屏是缓存 —— 点下去立刻就有东西，不依赖 Python 那边。这里再补
         // 一次最新的：长任务在另一条线程上跑，这次往返不会被它堵住，几百毫秒就回。
         Py.callFast(this, "job") { txt ->
-            val arr = json(txt)?.optJSONArray("lines") ?: return@call
+            val arr = json(txt)?.optJSONArray("lines") ?: return@callFast
             logLines = (0 until arr.length()).map { arr.optString(it) }
-            if (!dlg.isShowing) return@call   // 用户已经关掉了，白改
+            if (!dlg.isShowing) return@callFast   // 用户已经关掉了，白改
             tv.text = renderLog(logLines)
             sv.layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, logHeight(logLines.size)

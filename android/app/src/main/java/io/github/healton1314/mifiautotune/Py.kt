@@ -91,6 +91,10 @@ object Py {
     /**
      * 读内存的轻量查询走这条：不会被正在跑的状态查询挡住。
      * 只给 job / guard_state / plan 这类调用用 —— 它们不碰设备。
+     *
+     * 注意：lambda 里的隐式标签跟着**函数名**走，所以这条线上要提前返回得写
+     * `return@callFast`，写成 `return@call` 会编译不过（'return' is prohibited
+     * here）—— 那个标签在 [call] 那个 lambda 里才成立。
      */
     fun callFast(
         ctx: Context,
