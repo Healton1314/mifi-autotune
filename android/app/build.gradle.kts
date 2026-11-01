@@ -43,9 +43,12 @@ android {
         versionCode = 1
         versionName = "0.6.9"
 
-        // 只要真机 ABI：x86 是给模拟器用的，占体积没意义
+        // 只要真机 ABI，而且只留 64 位。
+        //
+        // Python 3.12 起 Chaquopy 只提供 64 位运行时，加上 armeabi-v7a 会直接失败；
+        // arm64 已覆盖近十年的安卓机，32 位老机型不在支持范围内。
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -65,8 +68,16 @@ android {
     }
 }
 
-python {
-    buildPython("python3")
-    // 本项目是纯标准库，没有第三方包要装（这正是它能塞进 APK 的原因）
-    pip {}
+// Kotlin DSL 里这个扩展叫 chaquopy，不叫 python（Groovy 才叫 python）。
+// 写成 python { } 的后果是配置阶段就崩，报的是 Kotlin 脚本求值异常，
+// 完全看不出跟 Python 有关 —— 第一次构建就是这么失败的。
+chaquopy {
+    defaultConfig {
+        // 必须与构建机的 python3 次版本一致，否则 Chaquopy 编译 .pyc 时会拒绝。
+        // GitHub Actions 的 ubuntu-latest 自带 3.12。
+        version = "3.12"
+        buildPython("python3")
+        // 本项目纯标准库，没有第三方包要装 —— 这正是它能塞进 APK 的根本原因
+        pip {}
+    }
 }
