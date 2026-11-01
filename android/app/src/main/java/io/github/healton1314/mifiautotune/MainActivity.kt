@@ -1,7 +1,10 @@
 package io.github.mifiautotune.app
 
 import android.annotation.SuppressLint
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.View
@@ -69,10 +72,19 @@ class MainActivity : Activity() {
     }
 
     private fun bootPanel() {
+        // 扫描桥要定位 / 附近的设备权限，不加这一步「扫描信道」永远是空的。
+        // 权限弹窗是异步的，所以不等着它 —— 桥那边拿不到结果就先写空数组，
+        // 用户点允许之后下一轮自动就有数据了。
+        requestScanPermissions()
+        WifiScanBridge.start(this)
+
         thread(name = "py-boot") {
             val started = runCatching {
                 if (!Python.isStarted()) Python.start(AndroidPlatform(this))
                 val boot = Python.getInstance().getModule("boot")
+                // 先把可写目录告诉 Python：扫描结果、位置记忆、原始设置都落在
+                // 这里，而不是 APK 里那个解压出来的源码目录。
+                boot.callAttr("set_files_dir", filesDir.absolutePath)
                 boot.callAttr("start")
                 boot.callAttr("url").toString()
             }
@@ -88,6 +100,33 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    /** 安卓 13 起扫周边 WiFi 要「附近的设备」，10~12 要「定位」。多问的那个系统会忽略。 */
+    private fun requestScanPermissions() {
+        val need = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            need += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            need += Manifest.permission.NEARBY_WIFI_DEVICES
+        }
+        if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), REQ_SCAN)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // 权限刚给上，启动时写的那份空结果该重写一次，否则用户得等下一轮 60 秒
+        if (requestCode == REQ_SCAN) WifiScanBridge.refresh()
     }
 
     /** 起不来时给两条出路：重试一次，或者把自检报告摊开看是哪一步坏了。 */
@@ -137,5 +176,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val TAG = "MifiApk"
+        private const val REQ_SCAN = 1001
     }
 }

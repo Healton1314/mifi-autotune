@@ -25,6 +25,7 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # ---------------------------------------------------------------- 工具函数
 
@@ -166,6 +167,10 @@ def freq_to_channel(freq):
 
 _LAST_TERMUX = {"stdout": "", "stderr": "", "code": None, "timeout": False, "ts": 0.0}
 
+# APK 里最近一次读原生扫描结果的情况（排障用：扫不到时能说出是「文件没有」
+# 还是「文件太旧」，而不是一句「没扫到」）。
+_LAST_ANDROID = {"ts": 0.0, "age": None, "count": 0}
+
 
 def _termux_recent(max_age=180):
     """拿最近一次 termux-wifi-scaninfo 的结果；没有新鲜的就现跑一次。
@@ -211,28 +216,12 @@ def _api_bridge_ok(timeout=8):
     return ok
 
 
-def _scan_termux():
-    """Android 上通过 Termux:API 拿扫描结果。
+def _parse_scan_array(data):
+    """把 scaninfo 那种 JSON 数组转成内部的 AP 列表。
 
-    需要：装 Termux:API 应用 + `pkg install termux-api` + 授予定位权限
-    （Android 10+ 把 WiFi 扫描算作位置信息，没权限会返回空数组）。
-
-    超时给 60 秒：第一次调用要先唤起 Termux:API 的进程，冷启动 + 一次真实
-    扫描在慢机型上可以跑到 20~40 秒，原来 45 秒偶尔还是不够；而卡死的情况
-    无论如何都要等满，所以不如给足，再用「桥探测」快速判断到底哪里坏了。
+    Termux:API 和 APK 的原生桥吐的是同一套字段，所以解析只有这一份 ——
+    字段兼容、隐藏 SSID、dBm 归一这些踩过的坑，不用在两个地方各踩一遍。
     """
-    if not shutil.which("termux-wifi-scaninfo"):
-        return []
-    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=60)
-    _LAST_TERMUX.update(
-        stdout=out, stderr=err, code=code,
-        timeout="timed out" in (err or "").lower(),
-        ts=time.time(),
-    )
-    try:
-        data = json.loads(out)
-    except Exception:  # noqa: BLE001
-        return []
     if not isinstance(data, list):
         return []
     aps = []
@@ -259,6 +248,63 @@ def _scan_termux():
         aps.append({"ssid": ssid, "bssid": ap.get("bssid", ""),
                     "ch": ch, "sig": sig, "band": None})
     return aps
+
+
+def _scan_termux():
+    """Android 上通过 Termux:API 拿扫描结果。
+
+    需要：装 Termux:API 应用 + `pkg install termux-api` + 授予定位权限
+    （Android 10+ 把 WiFi 扫描算作位置信息，没权限会返回空数组）。
+
+    超时给 60 秒：第一次调用要先唤起 Termux:API 的进程，冷启动 + 一次真实
+    扫描在慢机型上可以跑到 20~40 秒，原来 45 秒偶尔还是不够；而卡死的情况
+    无论如何都要等满，所以不如给足，再用「桥探测」快速判断到底哪里坏了。
+    """
+    if not shutil.which("termux-wifi-scaninfo"):
+        return []
+    out, err, code = run_detail(["termux-wifi-scaninfo"], timeout=60)
+    _LAST_TERMUX.update(
+        stdout=out, stderr=err, code=code,
+        timeout="timed out" in (err or "").lower(),
+        ts=time.time(),
+    )
+    try:
+        data = json.loads(out)
+    except Exception:  # noqa: BLE001
+        return []
+    return _parse_scan_array(data)
+
+
+# ---------------------------------------------------------------- Android APK
+
+
+def _android_scan_file():
+    """APK 里原生层写的扫描结果文件；不在 APK 里就返回 None。"""
+    d = os.environ.get("MIFI_FILES_DIR")
+    if not d:
+        return None
+    p = Path(d) / "wifi_scan.json"
+    return p if p.is_file() else None
+
+
+def _scan_android():
+    """读原生层（Kotlin）写好的 WifiManager 扫描结果。
+
+    为什么不让 Python 直接调 WifiManager：Chaquopy 能调 Java，但扫描是个
+    「注册广播 → 请求 → 等结果回调」的异步流程，放在 Python 侧要跨线程等回调，
+    比在 Kotlin 里做完写个文件麻烦得多。文件方式还有个好处：结果带时间戳，
+    能判断这份数据是不是早就过期了。
+    """
+    p = _android_scan_file()
+    if p is None:
+        return []
+    try:
+        blob = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    _LAST_ANDROID.update(ts=time.time(), age=time.time() - p.stat().st_mtime,
+                         count=len(blob) if isinstance(blob, list) else 0)
+    return _parse_scan_array(blob)
 
 
 # ---------------------------------------------------------------- Linux
@@ -435,6 +481,20 @@ def scan_failure_hint():
     """
     import os
 
+    # APK 里压根没有 termux-api 这回事，扫描结果来自原生层写的 wifi_scan.json。
+    # 不给这个分支，APK 用户会被指去「装 termux-api」—— 他人已经在这个 app 里了。
+    if os.environ.get("MIFI_FILES_DIR"):
+        f = _android_scan_file()
+        if f is None:
+            return ("原生扫描结果还没写出来：多半是「定位」或「附近的设备」权限没给。"
+                    "去设置里给本应用开这两项，再点一次「扫描信道」。"
+                    "（只是跳过信道优化，频段优化不受影响）")
+        age = time.time() - f.stat().st_mtime
+        if age > 600:
+            return (f"上一次扫描是 {int(age / 60)} 分钟前的了。安卓对前台应用有限流"
+                    "（两分钟最多 4 次），等一会儿再扫；锁屏之后系统也会停止扫描。")
+        return "扫到了，但里面没有 2.4G 网络 —— 附近可能真没有，信道优化可以跳过"
+
     is_termux = "com.termux" in os.environ.get("PREFIX", "") or bool(shutil.which("termux-info"))
     if is_termux:
         if not shutil.which("termux-wifi-scaninfo"):
@@ -506,6 +566,10 @@ def scan_once(ssid_hint=None):
         return _scan_windows(ssid_hint)
     if sys.platform == "darwin":
         return _scan_macos()
+    # APK：原生层已经把 WifiManager 的结果写成了 JSON，读文件比走 termux-api 快得多
+    aps = _scan_android()
+    if aps:
+        return aps
     # Android(Termux) 上 nmcli/iw 都不可用，先试 Termux:API
     return _scan_termux() or _scan_linux()
 

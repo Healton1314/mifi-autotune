@@ -7,6 +7,7 @@
 端口失败会往后试几个：8787 万一被别的进程占了，整个 app 不该因此打不开。
 """
 
+import os
 import secrets
 import threading
 import traceback
@@ -14,6 +15,16 @@ import traceback
 import server
 
 _state = {"srv": None, "token": "", "port": 0, "error": ""}
+
+
+def set_files_dir(path):
+    """告诉 Python 侧「应用私有可写目录」在哪。
+
+    原生扫描桥把结果写成 wifi_scan.json 放这儿，scanner.py 通过这个环境变量
+    找它。也让配置文件、位置记忆落在可写的地方，而不是 APK 里那个解压目录。
+    """
+    os.environ["MIFI_FILES_DIR"] = path
+    return path
 
 
 def start(port=8787, tries=6):
