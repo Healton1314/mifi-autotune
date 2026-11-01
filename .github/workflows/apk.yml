@@ -1,18 +1,14 @@
 name: apk
 
 # 为什么在云端构建而不是本机：Chaquopy 要 JDK 17 + Android SDK + Gradle，
-# 本机只有 JDK 8、没有 SDK。云端构建还能保证「push 即出包」，
-# 以后改 Python 代码不用碰任何本地环境。
+# 本机只有 JDK 8、没有 SDK。云端构建还能保证「改 Python 代码不用碰本地环境」。
+#
+# 只手动触发，不在 push 时自动跑：
+#   成品包还在自测阶段，每次提交都自动出一个 APK 塞进 Actions，等于把没验证过
+#   的半成品一直往 GitHub 上堆。要测的时候手动点一次，产物只留 3 天。
+#   （仓库本身不放任何 .apk/.aab，.gitignore 已经挡住了。）
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "android/**"
-      - ".github/workflows/apk.yml"
-      - "*.py"
-      - "drivers/**"
-      - "web/**"
 
 jobs:
   build:
@@ -55,3 +51,5 @@ jobs:
           name: mifi-autotune-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          # 自测阶段的产物，别在 GitHub 上长期堆积
+          retention-days: 3

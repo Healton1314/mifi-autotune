@@ -42,7 +42,12 @@ android/.gradle/
 android/local.properties
 android/app/build/
 android/build/
+# ---- 构建产物：成品只在本机，进版本库的一律是源码 ----
+# 自测阶段尤其要挡死：仓库是公开的，半成品包传上去就等于发了。
 *.apk
 *.aab
+*.ipa
+*.dmg
+*.msi
 *.jks
 *.keystore
