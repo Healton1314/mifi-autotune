@@ -71,9 +71,30 @@ class TestWaitForService(unittest.TestCase):
         """
         dev = FakeDev([state(band=38, rsrp="0")])
         status, waited = autotune.wait_for_service(
-            dev, 38, step=0.05, timeout=5.0, dead_confirm=3)
+            dev, 38, step=0.05, timeout=5.0, dead_confirm=3, grace=0.1)
         self.assertEqual(status, "no_signal")
         self.assertLess(waited, 2.0)      # 5 秒的四成，留足慢机器余量
+
+    def test_no_signal_not_judged_during_grace(self):
+        """刚切过去读不到信号 ≠ 当地没覆盖。
+
+        2026-11-01 实机：用户在自己家里测过很多次都有 BAND 3，某次却被判
+        「无信号（当地没这个频段）」。旧逻辑 3 轮 × 2.5 秒 = 7.5 秒就下结论，
+        而设备切频段后重新注册常要十几秒。宽限期内一律不判死，宁可等。
+        """
+        dev = FakeDev([state(band=38, rsrp="0")])
+        status, waited = autotune.wait_for_service(
+            dev, 38, step=0.05, timeout=3.0, dead_confirm=3, grace=60)
+        self.assertEqual(status, "timeout")
+        self.assertGreaterEqual(waited, 2.9)
+
+    def test_only_on_target_misses_count(self):
+        """设备还停在旧频段时读不到信号，不能算「目标频段没覆盖」。"""
+        # 一直停在 BAND 3，但要求的却是 40，且信号无效
+        dev = FakeDev([state(band=3, rsrp="0")])
+        status, _ = autotune.wait_for_service(
+            dev, 40, step=0.05, timeout=1.0, dead_confirm=3, grace=0.1)
+        self.assertEqual(status, "timeout")
 
     def test_wrong_band_times_out(self):
         """有信号但一直停在别的频段 → 说明锁频段没生效，判 timeout。"""

@@ -43,6 +43,10 @@ CONFIG = HERE / "config.json"
 __version__ = "0.8.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
+# 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
+# 十几秒内 RSRP 读不出来是常态，不是没覆盖。少等这一会儿的代价是误杀一个
+# 能用的频段，进而得出「当前设置已经最好、不用改」的错误结论 —— 得不偿失。
+NO_SIGNAL_GRACE = 18
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
 MIN_BAND_GAIN_MBPS = 3              # 频段带宽改善阈值
 STABILITY_BEST_RATIO = 1.6          # 候选频段「最大/最小」≤1.6 倍才算稳
@@ -417,7 +421,7 @@ def diagnose_signal(sig):
             "advice": "信号中等，切换效果取决于目标频段当时的负载。"}
 
 
-def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
+def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3, grace=None):
     """等设备在目标频段重新注册，并尽快识别"这个频段根本没信号"。
 
     为什么不能只 sleep 固定秒数：
@@ -428,7 +432,8 @@ def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
       2) 连续 dead_confirm 次仍无可用信号 → 判定无服务，立即返回
     返回 (status, 秒数)，status ∈ {"ok", "no_signal", "timeout"}。
     """
-    timeout = SETTLE_SEC + 10 if timeout is None else timeout
+    timeout = SETTLE_SEC + 14 if timeout is None else timeout
+    grace = NO_SIGNAL_GRACE if grace is None else grace
     t0 = time.time()
     miss = 0
     seen_band = False
@@ -439,17 +444,29 @@ def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3):
         except Exception:  # noqa: BLE001
             continue
         now_band = st.get("band")
-        if band and str(now_band) == str(band):
+        on_target = (not band) or str(now_band) == str(band)
+        if on_target:
             seen_band = True
-        if _signal_usable(st):
-            if not band or str(now_band) == str(band):
-                return "ok", round(time.time() - t0, 1)
+        usable = _signal_usable(st)
+
+        if usable and on_target:
+            return "ok", round(time.time() - t0, 1)
+
+        # 「读不到信号」只有在**确认设备已经站在目标频段上**之后才有意义。
+        # 设备还停在旧频段（指令刚下发、或这次切换被拒）时读不到，是因为它
+        # 压根没切过去，不是当地没覆盖 —— 那种情况不能累计 miss。
+        #
+        # 2026-11-01 实机教训：用户在自己家里反复测过很多次都有 BAND 3，
+        # 这次却被判「无信号（当地没这个频段）」。原因是旧逻辑连续 3 次、
+        # 每 2.5 秒读一次，7.5 秒就下结论，而设备从别的频段切回来重新注册
+        # 通常要十几秒 —— 它只是还没注册上，被当成了没覆盖。
+        if on_target and not usable:
             miss += 1
-        else:
-            miss += 1
-        if miss >= dead_confirm and not _signal_usable(st):
-            # 已经过了几轮仍没有任何服务小区 → 当地大概率没这个频段，别等了
+
+        if (seen_band and on_target and miss >= dead_confirm
+                and time.time() - t0 >= grace):
             return "no_signal", round(time.time() - t0, 1)
+
         if not seen_band and time.time() - t0 > timeout - step:
             break
     # 最后再看一眼：可能刚注册上
@@ -804,6 +821,26 @@ def decide_band(cur_res, candidates, cmp_band, caveats=()):
         return {"band": w["band"], "kind": "speed",
                 "reason": f"稳定性差不多（波动 {cur_ratio or 1:.1f} 倍 vs {w_ratio or 1:.1f} 倍），"
                           f"但它快 {gain:.1f} Mbps",
+                "gain": round(gain, 1)}, ""
+
+    # 候选里确实有更快的，只是没到「值得为它断一次网」的幅度。
+    #
+    # 引擎不再替用户按下这个决定，但也不该一声不吭 —— 2026-11-01 用户原话：
+    # 「他可以给我建议，但是我也有权拒绝」「切不切换在我，而不是他自己就
+    # 说不建议就不切换」。之前这里直接返回「都差不多」，app 上就只剩一句
+    # 「当前设置已经合适，不用动」，想锁频段的人根本无处可点。
+    #
+    # 但它必须还是**稳定的**候选：一个 12~98 Mbps 乱跳的频段中位数再高也不能推，
+    # 那不是「快一点」，那是随时会掉下来的坑。
+    faster = [r for r in cands
+              if (r.get("mbps") or 0) > cur_med
+              and (_sample_ratio(r) is None
+                   or _sample_ratio(r) <= STABILITY_BEST_RATIO)]
+    if faster and cur_med > 0:
+        w = max(faster, key=lambda r: r.get("mbps") or 0)
+        gain = (w.get("mbps") or 0) - cur_med
+        return {"band": w["band"], "kind": "speed", "small": True,
+                "reason": f"它快 {gain:.1f} Mbps，差距不大 —— 想换就换，不换也合理",
                 "gain": round(gain, 1)}, ""
     return None, "速度和稳定性都差不多，不值得为它断一次网"
 

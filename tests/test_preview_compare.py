@@ -200,12 +200,17 @@ class ConclusionWording(unittest.TestCase):
         self.assertNotIn("不到 3 Mbps", text)
         self.assertNotIn("值得为它断一次网", text)
 
-    def test_healthy_gap_below_threshold_says_not_worth(self):
+    def test_healthy_gap_below_threshold_still_offered(self):
+        """只高 1 Mbps 也要给建议，只是把「差距不大」说清楚。
+
+        2026-11-01 用户定的规矩：体检负责检测和裁定，切不切换由用户决定，
+        引擎自己说「不建议」就把切换入口藏起来，是不对的。
+        """
         a = band_result(3, 30.0)
         b = band_result(40, 31.0)                    # 只高 1 Mbps，低于阈值
         text = self._run([a, b])
-        self.assertIn("两个门槛", text)               # 说清是「两个门槛都不满足」
-        self.assertIn("本次不改动", text)
+        self.assertIn("可以做的改动", text)           # 给建议，不再一声不吭
+        self.assertNotIn("本次不改动", text)
         self.assertNotIn("数据不足以下结论", text)
 
     def test_low_speed_ratio_boost_counts(self):

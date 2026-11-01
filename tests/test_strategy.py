@@ -66,12 +66,19 @@ class DecideBand(unittest.TestCase):
         self.assertEqual(opt["kind"], "speed")
         self.assertIn("稳定性差不多", opt["reason"])
 
-    def test_no_change_when_both_similar(self):
+    def test_small_gap_is_offered_as_a_choice(self):
+        """只快 1 Mbps：引擎不替用户断网，但要把选择权交出去。
+
+        2026-11-01 用户原话：「体检就是检测和裁定，切不切换在我，
+        而不是他自己就说不建议就不切换」。旧行为返回 None，app 上只剩
+        「当前设置已经合适，不用动」，想锁频段的人根本无处可点。
+        """
         cur = res(3, 30.0, [29.0, 31.0])
         cand = [res(40, 31.0, [30.0, 32.0])]      # 只快 1 Mbps
-        opt, why = autotune.decide_band(cur, cand, 3)
-        self.assertIsNone(opt)
-        self.assertIn("差不多", why)
+        opt, _why = autotune.decide_band(cur, cand, 3)
+        self.assertIsNotNone(opt)
+        self.assertEqual(opt["band"], 40)
+        self.assertTrue(opt.get("small"))          # 标出来：差距不大
 
     def test_refuses_slower_band_even_if_stable(self):
         """更稳但明显更慢，换过去是降速，不能拿「稳」当借口。"""
@@ -153,7 +160,12 @@ class PreviewRendersAutoDecision(unittest.TestCase):
         # 换稳定性不能承诺提速，界面才不会被误导成「能快多少」
         self.assertIsNone(plan["expected"]["mbps_gain"])
 
-    def test_keeps_current_when_nothing_better(self):
+    def test_small_gap_is_offered_not_decided(self):
+        """略快也要给建议 —— 但只给建议，不替用户决定。
+
+        2026-11-01 用户定的规矩：体检负责检测和裁定，切不切换在他。
+        所以 plan 里要指到 BAND 40，同时让 app 有东西可点、也有东西可拒绝。
+        """
         dev = FakeDev()
         got = [res(3, 30.0, [29.0, 31.0]), res(40, 31.0, [30.0, 32.0])]
         out = io.StringIO()
@@ -163,11 +175,9 @@ class PreviewRendersAutoDecision(unittest.TestCase):
                 mock.patch.object(autotune.time, "sleep", lambda s: None), \
                 contextlib.redirect_stdout(out):
             autotune.run_preview(dev, dev.capabilities(), dev.get_state(), args, {}, None, None)
-        text = out.getvalue()
-        self.assertIn("[自动] 保持现状", text)
         plan = json.loads(self.tmp.read_text(encoding="utf-8"))
-        self.assertEqual(plan["target"]["band"], 3)
-        self.assertEqual(plan["changes"], [])
+        self.assertEqual(plan["target"]["band"], 40)
+        self.assertEqual(len(plan["changes"]), 1)
 
 
 class SpeedOption(unittest.TestCase):
