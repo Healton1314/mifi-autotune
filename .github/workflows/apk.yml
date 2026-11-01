@@ -1,0 +1,51 @@
+name: apk
+
+# 为什么在云端构建而不是本机：Chaquopy 要 JDK 17 + Android SDK + Gradle，
+# 本机只有 JDK 8、没有 SDK。云端构建还能保证「push 即出包」，
+# 以后改 Python 代码不用碰任何本地环境。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/apk.yml"
+      - "*.py"
+      - "drivers/**"
+      - "web/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 目标 Python 版本由 Chaquopy 内置决定；这里的 python3 只是构建期的宿主解释器。
+      - name: 宿主机 Python
+        run: python3 -V
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: 构建 debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: 汇总产物信息
+        working-directory: android
+        run: |
+          ls -lh app/build/outputs/apk/debug/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mifi-autotune-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
