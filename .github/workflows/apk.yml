@@ -27,8 +27,14 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # 目标 Python 版本由 Chaquopy 内置决定；这里的 python3 只是构建期的宿主解释器。
-      - name: 宿主机 Python
+      # Chaquopy 要求构建机的 Python 次版本与 APK 里嵌的版本完全一致，
+      # 否则编译 .pyc 时会直接拒绝。runner 自带的 python3 是 3.14，
+      # 而 build.gradle.kts 里钉的是 3.12，必须显式装一个 3.12 顶到 PATH 前面。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确认宿主 Python 版本
         run: python3 -V
 
       - uses: gradle/actions/setup-gradle@v4

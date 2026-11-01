@@ -30,7 +30,16 @@ val stagePython = tasks.register<Copy>("stagePython") {
     includeEmptyDirs = false
 }
 
-tasks.named("preBuild") { dependsOn(stagePython) }
+// stagePython 往 Chaquopy 的源码目录里写文件，Gradle 会认为「mergeDebugPythonSources
+// 用了一个别的任务的产物却没声明依赖」，直接判构建失败。
+//
+// 所以把所有跟 Python 沾边的任务都挂到 stagePython 后面。排除 stagePython 自己 ——
+// 它的名字里也含 Python，不排除就会 dependsOn 自己，变成循环依赖。
+tasks.configureEach {
+    if (name.contains("Python") && name != "stagePython") {
+        dependsOn(stagePython)
+    }
+}
 
 android {
     namespace = "io.github.mifiautotune.app"
