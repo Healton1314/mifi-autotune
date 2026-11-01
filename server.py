@@ -493,41 +493,54 @@ class Handler(SimpleHTTPRequestHandler):
     # ---------- API 实现 ----------
 
     def api_status(self):
-        cfg = autotune.load_config()
-        dev = detect()
-        st = dev.get_state()
-        caps = dev.capabilities()
-        ping = probe.ping_stats(6, cfg["ping_host"])
-        return {
-            "driver": dev.name,
-            "vendor": caps.get("vendor"),
-            "band": st["band"],
-            "channel": st["channel"],
-            "bandwidth": st.get("bandwidth"),
-            "mtu": st.get("mtu"),
-            "max_clients": (st.get("raw", {}).get("wlan") or {}).get("max_clients"),
-            "can_lock_band": caps.get("can_lock_band", False),
-            "lte": st.get("signal") or {},
-            "ping": ping,
-            "ts": int(time.time()),
-        }
+        return device_status()
 
     def api_scan(self):
-        cfg = autotune.load_config()
-        dev = detect()
-        st = dev.get_state()
-        own = cfg.get("own_ssid") or scanner.connected_ssid() or st.get("ssid")
-        aps = scanner.scan_2g(rounds=5, delay=3, own_ssid=own)
-        if not aps:
-            # 面板这里以前写死成「系统语言不支持或无线网卡未启用」—— 手机上那句话
-            # 是错的（真正原因通常是没装 Termux:API 或没给定位权限）。统一走
-            # 扫描层那套病因判断，面板和命令行不能给两套互相矛盾的说法。
-            return {"current": st["channel"], "best": None, "aps": [],
-                    "scores": [], "error": scanner.scan_failure_hint()}
-        rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
-        best = scanner.pick_best_channel(rows)
-        return {"current": st["channel"], "best": best["ch"] if best else None,
-                "aps": aps, "scores": rows}
+        return channel_scan()
+
+def device_status():
+    """读一次设备现状（频段/信号/延迟）。面板和 APK 原生界面共用这一份。
+
+    抽成模块级而不是留在 Handler 里：APK 那边不再走 HTTP，直接调这个函数，
+    两边看到的数据才不会各算各的。
+    """
+    cfg = autotune.load_config()
+    dev = detect()
+    st = dev.get_state()
+    caps = dev.capabilities()
+    ping = probe.ping_stats(6, cfg["ping_host"])
+    return {
+        "driver": dev.name,
+        "vendor": caps.get("vendor"),
+        "band": st["band"],
+        "channel": st["channel"],
+        "bandwidth": st.get("bandwidth"),
+        "mtu": st.get("mtu"),
+        "max_clients": (st.get("raw", {}).get("wlan") or {}).get("max_clients"),
+        "can_lock_band": caps.get("can_lock_band", False),
+        "lte": st.get("signal") or {},
+        "ping": ping,
+        "ts": int(time.time()),
+    }
+
+
+def channel_scan():
+    """扫一轮 2.4G 并打分，返回当前/最优信道与全部周边 AP。"""
+    cfg = autotune.load_config()
+    dev = detect()
+    st = dev.get_state()
+    own = cfg.get("own_ssid") or scanner.connected_ssid() or st.get("ssid")
+    aps = scanner.scan_2g(rounds=5, delay=3, own_ssid=own)
+    if not aps:
+        # 面板这里以前写死成「系统语言不支持或无线网卡未启用」—— 手机上那句话
+        # 是错的（真正原因通常是没装 Termux:API 或没给定位权限）。统一走
+        # 扫描层那套病因判断，面板和命令行不能给两套互相矛盾的说法。
+        return {"current": st["channel"], "best": None, "aps": [],
+                "scores": [], "error": scanner.scan_failure_hint()}
+    rows = scanner.score_channels(aps, dev.capabilities().get("channels") or range(1, 14))
+    best = scanner.pick_best_channel(rows)
+    return {"current": st["channel"], "best": best["ch"] if best else None,
+            "aps": aps, "scores": rows}
 
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

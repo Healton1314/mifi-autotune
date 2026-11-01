@@ -1,0 +1,162 @@
+"""原生界面的 Python 入口：每个函数都返回 JSON 字符串。
+
+为什么全返回字符串，而不是让 Kotlin 直接摸 Python 对象：Chaquopy 能把 dict
+转成 PyObject，但嵌套结构要在 Kotlin 里一层层 get，字段一改两边都得动。
+序列化成 JSON 之后，加字段 Kotlin 完全不用改。
+
+线程：这里不做任何调度。真正的耗时活儿（连设备、体检、守护）由 Kotlin 丢到
+后台线程；界面只负责显示。也没有任何交互式提问 —— prompt/input 在 APK 里
+没有终端可问，会直接把线程卡死。
+"""
+
+import contextlib
+import json
+import threading
+import time
+from types import SimpleNamespace
+
+import autotune
+import server
+
+_guard = {"thread": None, "started": 0.0, "dry": False}
+
+
+def _dumps(obj):
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _err(e):
+    return _dumps({"error": "%s: %s" % (type(e).__name__, e)})
+
+
+# ---------------- 状态与结论 ----------------
+
+def status():
+    """设备现状：频段、信道、信号、延迟/丢包。"""
+    try:
+        return _dumps(server.device_status())
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+def plan():
+    """上次体检留下的结论（plan.json），没有就是 None。"""
+    try:
+        p = server.HERE / "plan.json"
+        if not p.exists():
+            return _dumps({"plan": None})
+        return _dumps({"plan": json.loads(p.read_text(encoding="utf-8"))})
+    except Exception as e:  # noqa: BLE001
+        return _dumps({"plan": None, "error": str(e)})
+
+
+def scan():
+    """扫一轮 2.4G 信道并打分（约 20 秒，不会断网）。"""
+    try:
+        return _dumps(server.channel_scan())
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+# ---------------- 长任务 ----------------
+
+def _start(args, kind):
+    try:
+        ok, msg = server.run_job(args, kind)
+        return _dumps({"ok": ok, "msg": msg})
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+def preview():
+    """体检并预估（3~6 分钟，中途会断网几次）。"""
+    return _start(["--preview"], "preview")
+
+
+def apply_plan():
+    """按上次体检的结论把改动落到设备上。"""
+    return _start(["--apply-plan"], "apply")
+
+
+def restore():
+    """恢复原始设置。"""
+    return _start(["--restore"], "restore")
+
+
+def optimize(mode="all"):
+    args = {"check": [],
+            "wifi": ["--apply", "--wifi-only"],
+            "lte": ["--apply", "--lte-only"],
+            "all": ["--apply"]}.get(mode, ["--apply"])
+    return _start(args, "optimize-" + mode)
+
+
+def job():
+    """当前任务的进度和日志行，界面每秒拉一次。"""
+    with server.JOB_LOCK:
+        snap = dict(server.JOB)
+        snap["lines"] = list(server.JOB["lines"])
+        snap["elapsed"] = (round(time.time() - server.JOB["started"])
+                           if server.JOB["started"] and server.JOB["running"] else None)
+    return _dumps(snap)
+
+
+# ---------------- 守护模式 ----------------
+
+def guard_start(dry=False):
+    """开守护：在动就解锁、坐满就锁定。整个过程不碰界面线程。"""
+    t = _guard["thread"]
+    if t is not None and t.is_alive():
+        return _dumps({"ok": False, "msg": "守护已经在跑"})
+
+    cfg = autotune.load_config()
+    # 这些字段跟命令行一一对应。host/user/password/driver 给 None 就走
+    # detect() 的默认探测，跟 `mifi --guard` 不带宽参数时完全一样。
+    args = SimpleNamespace(
+        host=None, user=None, password=None, driver=None,
+        guard_interval=autotune.GUARD_INTERVAL,
+        guard_settle=autotune.GUARD_SETTLE_SEC,
+        guard_dry_run=bool(dry),
+    )
+
+    def worker():
+        # 守护是往 stdout 打的（终端里就直接看）。APK 里没有终端，把这些行
+        # 接进任务日志缓冲，界面才能像看进度一样看它。
+        sink = server._LineSink()
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                autotune.run_guard(args, cfg)
+        except Exception:  # noqa: BLE001
+            import traceback
+            server.log("[!] 守护异常退出：")
+            for line in traceback.format_exc().splitlines():
+                server.log(line)
+        finally:
+            sink.flush()
+
+    t = threading.Thread(target=worker, daemon=True, name="mifi-guard")
+    _guard.update(thread=t, started=time.time(), dry=bool(dry))
+    t.start()
+    return _dumps({"ok": True, "msg": "started"})
+
+
+def guard_stop():
+    t = _guard["thread"]
+    if t is None or not t.is_alive():
+        _guard["thread"] = None
+        return _dumps({"ok": False, "msg": "守护没在跑"})
+    autotune.guard_request_stop()
+    return _dumps({"ok": True, "msg": "已请求停止（最多等一个采样间隔，约 30 秒）"})
+
+
+def guard_state():
+    t = _guard["thread"]
+    alive = t is not None and t.is_alive()
+    return _dumps({
+        "running": alive,
+        "since": int(_guard["started"]) if alive else None,
+        "elapsed": round(time.time() - _guard["started"]) if alive else None,
+        "dry": _guard["dry"],
+        # 守护的日志复用任务日志缓冲，界面拿它当实时输出看
+        "lines": list(server.JOB["lines"])[-200:],
+    })

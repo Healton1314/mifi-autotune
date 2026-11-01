@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import threading
 import statistics
 import subprocess
 import sys
@@ -125,6 +126,20 @@ SITE_CELL_KEEP = 12                 # 每个位置最多记几个见过的小区
 # 的那三分钟，PCI 自己从 477 跳到 252（-89dBm → -105dBm）—— 信号变弱时设备
 # 会自己重选小区（同频段换扇区），人在原地，PCI 照样跳。
 # 所以判移动要两件事一起看：**PCI 变过几次** + **信号/链路是不是也跟着垮了**。
+# 守护循环的停止开关。
+#
+# 终端里是按 Ctrl+C 停，但 APK 的界面没有 Ctrl+C —— 那边是在线程里跑的守护，
+# 信号处理器装不上（非主线程装不了），只能靠这个 Event 让循环自己退出。
+# 放成模块级是刻意的：一个进程只跑一个守护，两边（命令行 / app）用的是同一份。
+_GUARD_STOP = threading.Event()
+
+
+def guard_request_stop():
+    """请求守护停下。最多等一个采样间隔（30 秒）就真的退出。"""
+    _GUARD_STOP.set()
+    return True
+
+
 GUARD_INTERVAL = 30                 # 采样间隔（秒）：10 个 ping，几百字节
 GUARD_SETTLE_SEC = 600              # 连续这么久 PCI 没变 = 原地不动（10 分钟）
 GUARD_MOVE_WINDOW = 300             # 判定「在移动」的时间窗
@@ -3518,6 +3533,8 @@ def guard_still_reset(*, pci_changed, moving, band_changed=False):
 
 def run_guard(args, cfg):
     """全自动守护：打开一次就一直在，按「人在不在动」管频段锁定。"""
+    # 上一轮如果是被界面停掉的，标志还留着 —— 不清掉这一轮会立刻退出
+    _GUARD_STOP.clear()
     interval = max(15, args.guard_interval)
     settle = max(interval * 4, args.guard_settle)
     quick_sec = max(interval * 2, min(GUARD_QUICK_SEC, settle / 2.0))
@@ -3567,7 +3584,7 @@ def run_guard(args, cfg):
     next_audit = 0.0                     # 下次「锁定复核」的时刻
 
     try:
-        while True:
+        while not _GUARD_STOP.is_set():
             now = time.time()
             # 手机把 Termux 退到后台就会冻结它（Android 12+ 的 phantom process
             # killer 更狠，直接杀）。冻结期间一拍都不采，可屏幕上最后一行还写着
@@ -4079,6 +4096,11 @@ def run_guard(args, cfg):
         _release_wakelock()
         print("\n[守护] 已停止（设备保持当前配置）")
         return 0
+
+    # 从界面点「停止」走的是这条路：循环条件变假，正常退出
+    _release_wakelock()
+    print("\n[守护] 已停止（设备保持当前配置）")
+    return 0
 
 
 # ---------------- 主流程 ----------------
