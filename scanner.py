@@ -485,6 +485,14 @@ def scan_failure_hint():
         if detail:
             return detail
         return "拿到了扫描结果但解析不出可用 AP（可能只返回了当前连接的那个）"
+    # iPhone / iPad 上 sys.platform 也是 darwin，但根因和 macOS 完全不同：
+    # 不是 airport 命令被移除，而是 iOS 根本不开放「扫描周边 Wi-Fi」这个接口。
+    # 不分开说，用户会照着 macOS 那一句去换扫描实现 —— 那是条死路。
+    if "/var/mobile" in os.environ.get("HOME", ""):
+        return ("iPhone / iPad 没有给第三方应用扫描周边 Wi-Fi 的接口，"
+                "信道优化在 iOS 上做不了；频段优化不受影响，照常能跑。"
+                "想要完整体检请换电脑或安卓手机。")
+
     if sys.platform.startswith("win"):
         return "netsh 没抓到 BSSID：系统语言可能不在支持列表，或无线网卡被禁用"
     if sys.platform == "darwin":
