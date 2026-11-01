@@ -39,7 +39,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 MIN_CHANNEL_GAIN = 0.30             # 信道评分改善阈值，低于此不改
@@ -3523,8 +3523,8 @@ def run_guard(args, cfg):
     print("=" * 62)
     print("全自动守护")
     print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包），平时不测速")
-    print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_HITS} 次、或变了且链路垮了 → 解锁"
-          f"（设备自己换频段不算，那只是它重启射频）")
+    print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_CHURN_ONLY} 次，"
+          f"或变了且链路垮了 → 解锁（设备自己换频段不算，那只是它重启射频）")
     print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
     print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
     print("  记忆里的「最优」要是刚测出不够用 → 换记忆里的次优"
