@@ -189,15 +189,20 @@ class ConclusionWording(unittest.TestCase):
                                  args_ns(), {}, None, None)
         return out.getvalue()
 
-    def test_unreliable_wording_does_not_blame_threshold(self):
+    def test_unreliable_current_band_still_advises_and_says_why(self):
+        """当前频段自己飘（[9.9, 46.6]），旁边那个稳稳 40 Mbps。
+
+        原先这里整份结论作废，只印一句「数据不足以下结论」，界面上连个按钮
+        都没有。2026-11-01 用户原话：「band40 数据不可信，为什么 band3 数据可信
+        而且明显比 band8 更好却也不让应用」—— 飘的是它自己，别连累别人。
+        """
         unstable = band_result(3, 28.2)
         unstable["mbps_all"] = [9.9, 46.6]          # 4.7 倍波动
         faster = band_result(40, 40.0)
         text = self._run([unstable, faster])
-        # 真实原因是「数据不可信」，必须这么写；不能套用「差距小、不值得」的说法
-        self.assertIn("数据波动", text)
-        self.assertIn("数据不足以下结论", text)
-        self.assertNotIn("不到 3 Mbps", text)
+        self.assertIn("BAND 40", text)              # 照实给建议
+        self.assertIn("不参与比较", text)            # 也说清谁不可信
+        self.assertNotIn("不到 3 Mbps", text)        # 不是「差距小」那套说法
         self.assertNotIn("值得为它断一次网", text)
 
     def test_healthy_gap_below_threshold_still_offered(self):

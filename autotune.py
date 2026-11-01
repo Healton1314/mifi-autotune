@@ -763,6 +763,30 @@ def _gain_enough(cur_res, cand):
     return False, "none"
 
 
+# assess_reliability 里「某个频段自己波动大」的那条，格式：
+#   BAND 40 多轮结果波动过大（[3.7, 17.8]，最大是最小的 4.8 倍）
+# 它只说明那个频段这次没测准，不该连坐到别的频段。
+_RE_SHAKY_BAND = re.compile(r"^BAND (\d+) 多轮结果波动过大")
+
+
+def split_caveats(caveats):
+    """把「某个频段自己没测准」和「整份结论都不成立」分开。
+
+    前者只是把那个频段踢出比较，后者才该闭嘴。2026-11-01 实测：
+    BAND 40 在晚上本来就容易丢包（自己飘是真的），但不该连累 BAND 3 ——
+    他的原话：「band40 数据不可信，为什么 band3 数据可信而且明显比 band8
+    更好却也不让应用」。
+    """
+    shaky, hard = set(), []
+    for c in caveats or ():
+        m = _RE_SHAKY_BAND.match(str(c))
+        if m:
+            shaky.add(m.group(1))
+        else:
+            hard.append(str(c))
+    return shaky, hard
+
+
 def decide_band(cur_res, candidates, cmp_band, caveats=()):
     """自动裁决换哪个频段。返回 (option 或 None, 不换的原因)。
 
@@ -773,11 +797,12 @@ def decide_band(cur_res, candidates, cmp_band, caveats=()):
     第 1 条刻意用「最差一轮」比较：拿峰值去说「强太多」是在骗人。
 
     2026-10-30 21:56 补两条前置闸门（那次真机把设备从 -81dBm 切到 -95dBm）：
-      · 数据本身不可信（波动过大、测速源抽风）→ 一条建议都不出。
-        原来「自动裁决」不看 caveats，于是「按速度」说「数据不足以下结论」，
-        同一屏「自动」却说「速度强太多，切」，自相矛盾还真的切了。
+      · 测速源抽风、当前频段测不出、最优频段本身质量不过关 → 数字不能当承诺。
       · 候选频段实测 RSRP 比当前差 ≥ BAND_RSRP_DROP → 从候选里剔除。
         速度是过去一分钟的三个样本，信号是结构性的；拿 14dB 换 1 Mbps 不划算。
+
+    2026-11-01 修订：单个频段「多轮结果波动过大」只算它自己不参与比较，
+    不再让整份结论作废 —— 详见下面 shaky 那段。
     """
     if not cur_res or not cur_res.get("ok"):
         return None, "当前频段没有可用数据"
@@ -787,24 +812,30 @@ def decide_band(cur_res, candidates, cmp_band, caveats=()):
         return None, "没有可比的其他频段"
     cur_rsrp = _num((cur_res or {}).get("rsrp"))
     cur_med = cur_res.get("mbps") or 0
-    if caveats:
-        # 数据波动大 = 这条建议不可靠，但不等于「用户不配知道」。
-        #
-        # 2026-11-01 实测：屏幕上明明写着「BAND 8 9.6 Mbps → 最优 BAND 3
-        # 20.6 Mbps」，下面紧跟一句「保持现状」和一个点不动的界面 —— 那句话
-        # 等于白写。他的原话：「他可以给我建议，但是我也有权拒绝他的建议」。
-        # 所以照实给建议、把「这次测的波动大」写进理由，切不切由他定。
+
+    # 「某个频段自己波动大」只是那个频段的数据不可信，不该连坐。
+    # 详见 split_caveats 的说明。
+    shaky, hard = split_caveats(caveats)
+    if shaky:
+        cands = [r for r in cands if str(r.get("band")) not in shaky]
+        if not cands:
+            return None, "其他频段这次都没测准（波动过大），先不动"
+
+    if hard:
+        # 这些是「整份结论都不成立」的问题：当前频段根本测不出、被选为最优的
+        # 那个本身质量也不过关。这种时候数字不能当承诺，但仍然照实交出来 ——
+        # 用户要的是裁定 + 决定权，不是被人替他闭麦。
         faster = [r for r in cands
                   if (r.get("mbps") or 0) - cur_med >= MIN_BAND_GAIN_MBPS]
         if faster:
             w = max(faster, key=lambda r: r.get("mbps") or 0)
             gain = (w.get("mbps") or 0) - cur_med
-            why = caveats[0].split("（")[0]
+            why = hard[0].split("（")[0]
             return {"band": w["band"], "kind": "speed", "small": True, "risky": True,
                     "reason": f"它快 {gain:.1f} Mbps，但这次测量{why} —— "
                               f"数字不一定准，试不试你自己定",
                     "gain": round(gain, 1)}, ""
-        return None, f"测量数据本身不可信（{caveats[0].split('（')[0]}），不拿它当切换依据"
+        return None, f"测量数据本身不可信（{hard[0].split('（')[0]}），不拿它当切换依据"
     if cur_rsrp is not None:
         kept = [r for r in cands
                 if not (r.get("rsrp") is not None
@@ -1974,9 +2005,16 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         # 否则自动裁决按速度又把它选回来，等于白判。
         cands = [r for r in cands if r["band"] != demoted]
     auto, auto_why = decide_band(cur_res, cands, cmp_band, caveats=caveats)
+
+    # 两条手动线跟自动裁决共用同一个「谁不可信」的口径：某个频段自己飘，
+    # 只是它自己不参加比较，别把整个结论拖下水（否则一屏之内又会自相矛盾：
+    # 自动说「可以换」，按速度说「不敢给建议」）。
+    shaky, hard = split_caveats(caveats)
+    trusted = [r for r in cands if str(r.get("band")) not in shaky] if shaky else cands
+    best_trusted = max(trusted, key=lambda r: r.get("mbps") or 0) if trusted else None
     options = {
         "auto": auto,
-        "speed": speed_option(cur_res, best_res, cmp_band, caveats),
+        "speed": speed_option(cur_res, best_trusted, cmp_band, hard),
         "stability": stability_option(cur_res, cands, cmp_band),
     }
     strategy = getattr(args, "strategy", None) or "auto"
@@ -2025,7 +2063,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                      # 带代价的建议必须把代价写在建议本身里，不能只在日志深处提一句：
                      # app 的结论卡片上只显示这一行，用户要能一眼看到「这不是白赚的」。
                      + (f"（信号弱 {picked['rsrp_drop']}dB）"
-                        if picked.get("risky") and picked.get("rsrp_drop") else "")])
+                        if picked.get("risky") and picked.get("rsrp_drop") else "")
+                     # 另一种「不是白赚」：整份数据本身不稳，只能当参考。
+                     + ("（这次测得飘，仅供参考）"
+                        if picked.get("risky") and not picked.get("rsrp_drop") else "")])
                    + ([f"信道 {cur_ch} → {target['channel']}"] if do_ch else []),
     })
     PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2108,12 +2149,19 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         print("  信道：这次没扫到周边 AP，未参与判断（扫描本身的原因见上面 [!] 行）")
 
     print("-" * 56)
-    if caveats:
+    if hard:
         print("[!] 按速度这条线，数据不足以下结论：")
-        for c in caveats:
+        for c in hard:
             print(f"    · {c}")
         print("    原因通常是当前信号太差（看 RSRP/SINR）或测速源不可用。")
         print("    建议：换个测速源（--speed-url）、加轮次（--rounds 3）或等信号好转后再测一次。")
+        print("-" * 56)
+    if shaky:
+        # 「某个频段自己飘」是局部信息，不是全盘作废 —— 单独说，别混进上面那段。
+        print("[!] 这几个频段这次自己测得不稳，不参与比较：")
+        for b in sorted(shaky):
+            print(f"    · BAND {b}")
+        print("    「自己飘」本身就是信息：这个时段它本来就不耐用，换走可能更好。")
         print("-" * 56)
     if plan["changes"]:
         label = {"auto": "自动裁决", "speed": "速度", "stability": "稳定"}.get(strategy, strategy)
@@ -5014,8 +5062,13 @@ def main():
                 print(f"\n      最优频段：BAND {best_res['band']}"
                       f"（中位 {best_res['mbps']} Mbps，单轮 {best_res['mbps_all']}）")
             # 与 --preview 同一套裁决（自动 + 两条单线），否则 --watch 和手动跑会给出不同结论
-            opts = {"auto": decide_band(cur_res, usable, cmp_band)[0],
-                    "speed": speed_option(cur_res, best_res, cmp_band, caveats),
+            shaky, hard = split_caveats(caveats)
+            trusted = ([r for r in usable if str(r.get("band")) not in shaky]
+                       if shaky else usable)
+            best_trusted = (max(trusted, key=lambda r: r.get("mbps") or 0)
+                            if trusted else None)
+            opts = {"auto": decide_band(cur_res, usable, cmp_band, caveats=caveats)[0],
+                    "speed": speed_option(cur_res, best_trusted, cmp_band, hard),
                     "stability": stability_option(cur_res, usable, cmp_band)}
             strat = getattr(args, "strategy", None) or "auto"
             report["options"] = opts

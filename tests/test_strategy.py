@@ -93,19 +93,34 @@ class DecideBand(unittest.TestCase):
         self.assertIsNone(opt)
         self.assertIn("没有可比", why)
 
-    def test_unreliable_data_gives_no_advice(self):
+    def test_unreliable_current_band_still_advises_better_one(self):
         """实机 2026-10-30 21:56（手机）：BAND 40 [3.7, 17.8] vs BAND 3 [8.2, 15.5]。
 
-        按最差一轮算 8.2/3.7 = 2.2 倍，旧逻辑判「速度强太多，切」；
-        可同一屏「按速度」那条线写着「数据不足以下结论」。两条线自相矛盾，
-        而且真的把设备切到了信号差 14dB 的频段。
+        这条原来锁「一条不可信就别说话」，2026-11-01 按用户的话改过来：
+        「band40 数据不可信，为什么 band3 数据可信而且明显比 band8 更好却也不让应用」。
+        现在把不可信的那个踢出比较，剩下的照常裁 —— 即按最差一轮仍快 2.2 倍，给建议。
         """
         cur = res(40, 10.8, [3.7, 17.8])
         cand = [res(3, 11.8, [8.2, 15.5])]
-        opt, why = autotune.decide_band(
+        opt, _ = autotune.decide_band(
             cur, cand, 40, caveats=["BAND 40 多轮结果波动过大（[3.7, 17.8]）"])
-        self.assertIsNone(opt)
-        self.assertIn("不可信", why)
+        self.assertIsNotNone(opt)
+        self.assertEqual(opt["band"], 3)
+
+    def test_unreliable_candidate_is_dropped_not_wholed_out(self):
+        """实机 2026-11-01（住处，晚上）：BAND 8 9.6 Mbps 稳，BAND 40 飘，BAND 3 又快又稳。
+
+        BAND 40 晚上本来就容易丢包，它自己的多轮数据当然不可信 —— 但这不该
+        连累 BAND 3。原来一份结论被一条 caveat 全否，界面只剩「保持现状」。
+        """
+        cur = res(8, 9.6, [9.0, 10.2])
+        shaky = res(40, 30.0, [3.7, 17.8])          # 看着最快，但它自己飘
+        good = res(3, 20.6, [19.5, 21.7])
+        opt, _ = autotune.decide_band(
+            cur, [shaky, good], 8,
+            caveats=["BAND 40 多轮结果波动过大（[3.7, 17.8]，最大是最小的 4.8 倍）"])
+        self.assertIsNotNone(opt)
+        self.assertEqual(opt["band"], 3)            # 选可信的那个，不选飘的
 
     def test_candidate_with_much_worse_signal_is_offered_with_warning(self):
         """速度快一点、信号差 24dB —— 不替用户否掉，但必须把代价写进建议里。

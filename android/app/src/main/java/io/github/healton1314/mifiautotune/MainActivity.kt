@@ -71,6 +71,9 @@ class MainActivity : Activity() {
     private var guardOn = false
     // 体检跑完、plan.json 里确实有可改的项 → 主按钮切换成「应用结论」
     private var planReady = false
+    // 这条建议来自哪：体检出来的频段（band）还是扫描出来的信道（channel）。
+    // 两者落地路径不同 —— 信道只动信道，绝不能顺手把频段也切了。
+    private var applyKind = "band"
     // 详情默认展开：那几个数就是用户打开 app 最想先看到的，藏起来反而多一步。
     // 「收起」还留着 —— 想只看按钮和开关的人可以收掉。
     private var detailOpen = true
@@ -509,11 +512,12 @@ class MainActivity : Activity() {
         return String.format(java.util.Locale.US, "实测 %.1f Mbps，现在 %.1f Mbps", best, now)
     }
 
-    private fun showVerdict(title: String, sub: String) {
+    private fun showVerdict(title: String, sub: String, kind: String = "band") {
         tvVerdict.text = if (title.startsWith("建议")) title else "建议：$title"
         tvVerdictSub.text = sub
         tvVerdictSub.visibility = if (sub.isEmpty()) View.GONE else View.VISIBLE
         verdictBox.visibility = View.VISIBLE
+        applyKind = kind
         // 主按钮让位：结论已经自带「应用建议 / 不用了」，再摆一个只会让人选错
         btnMain.visibility = View.GONE
     }
@@ -550,7 +554,10 @@ class MainActivity : Activity() {
         btnMain.text = "正在应用…"
         btnMain.isEnabled = false
         btnMain.alpha = 0.6f
-        runTask("apply_plan") { "正在应用，中途会断网" }
+        // 信道的建议只改信道：那条建议是刚扫出来的，跟体检时的频段结论没有关系，
+        // 用 apply_plan 会顺手把频段也切了 —— 那等于替用户多做一次决定。
+        val fn = if (applyKind == "channel") "apply_channel" else "apply_plan"
+        runTask(fn) { "正在应用，中途会断网" }
     }
 
     private fun confirmRestore() {
@@ -606,16 +613,26 @@ class MainActivity : Activity() {
             val err = if (o == null || o.isNull("error")) "" else o.optString("error")
             val best = if (o == null || o.isNull("best")) 0 else o.optInt("best", 0)
             val cur = if (o == null || o.isNull("current")) 0 else o.optInt("current", 0)
-            showLog(when {
-                o == null -> "扫描失败：${txt.take(200)}"
-                err.isNotEmpty() -> "扫描失败：$err"
-                best <= 0 -> "扫到了，但没有可推荐的信道"
+            when {
+                o == null -> showLog("扫描失败：${txt.take(200)}")
+                err.isNotEmpty() -> showLog("扫描失败：$err")
+                best <= 0 -> showLog("扫到了，但没有可推荐的信道")
                 // 信道设成「自动」时设备报回来的是 0，直接拼进句子就成了
                 // 「现在信道 0」—— 用户会以为自己看错了。
-                cur <= 0 -> "信道现在是自动的，建议固定到 $best"
-                best == cur -> "信道 $cur 已经是周围最干净的"
-                else -> "现在信道 $cur，建议换到 $best"
-            })
+                best == cur -> showLog("信道 $cur 已经是周围最干净的")
+                else -> {
+                    // 信道建议也要能落地：2026-11-01 用户原话「信道也是一样的
+                    // 问题，我都点击了，你还给我建议了，但是没有应用建议和
+                    // 不用了的按钮」。所以结论卡片对频段和信道是同一套。
+                    showVerdict(
+                        "把信道固定在 $best",
+                        if (cur <= 0) "现在是自动的，设备自己挑的未必最干净"
+                        else "现在是 $cur，$best 号周围最空",
+                        "channel"
+                    )
+                    tvMainHint.text = "换信道会断一次网 · 不想改就点「不用了」"
+                }
+            }
         }
     }
 
