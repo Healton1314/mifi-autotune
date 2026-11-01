@@ -39,10 +39,14 @@ def start(port=8787, tries=6):
 
 
 def url():
-    """WebView 要打开的地址（带令牌，首次访问就会写进 Cookie）。"""
+    """WebView 要打开的地址（带令牌，首次访问就会写进 Cookie）。
+
+    app=1 让面板收起「装 Termux」「持续检测」那几块 —— 那些只对电脑上的
+    浏览器有意义，在 app 里出现只会让人以为这东西还是个终端工具的壳。
+    """
     if not _state["port"]:
         return ""
-    return "http://127.0.0.1:%d/?k=%s" % (_state["port"], _state["token"])
+    return "http://127.0.0.1:%d/?k=%s&app=1" % (_state["port"], _state["token"])
 
 
 def status():

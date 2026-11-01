@@ -67,9 +67,26 @@
   .jobstat{font-size:12px;margin-top:8px;min-height:16px;color:#185FA5;font-variant-numeric:tabular-nums}
   .jobstat.done{color:#1D9E75}
   .jobstat.fail{color:#D64545}
+  .log{background:#111;color:#c9d1c9;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;
+       padding:10px 12px;border-radius:10px;white-space:pre-wrap;word-break:break-all;
+       max-height:250px;overflow:auto;margin-top:10px}
+
+  /* ---- APK 模式（?app=1）----
+     同一个面板跑在 APK 里时，两件事不该出现：
+       1. 「装 Termux 才能摆脱电脑」—— 人已经在这台手机上跑着了，这段是给电脑用户看的；
+       2. 「持续检测」—— APK 里没有独立解释器，常驻循环停不下来，面板那边会拒绝。
+     用单独一个 class 收口，而不是各写一遍 display:none，以后加界面块只要加一条。 */
+  .in-app #phoneSec, .in-app #watchSec {display:none}
 </style>
 </head>
 <body>
+<script>
+  // APK 里的 WebView 用 ?app=1 打开，据此收起「装 Termux」「持续检测」这些
+  // 只有电脑端才讲得通的东西。放在最前面，避免那几块先画出来再消失。
+  if (new URLSearchParams(location.search).get("app")) {
+    document.documentElement.classList.add("in-app");
+  }
+</script>
 <h1>随身WiFi 调优</h1>
 <div class="sub" id="conn"><span class="dot"></span>连接中…</div>
 <div class="banner" id="banner" style="display:none"></div>
