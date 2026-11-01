@@ -68,6 +68,8 @@ class MainActivity : Activity() {
     private lateinit var tvGuardHint: TextView
 
     private var busy = false
+    // 正在跑的是哪种任务。只用来决定「要不要冻住读数」：体检要冻，其余不冻。
+    private var busyKind = ""
     private var statusBusy = false
     private var guardOn = false
     // 体检跑完、plan.json 里确实有可改的项 → 主按钮切换成「应用结论」
@@ -361,11 +363,15 @@ class MainActivity : Activity() {
 
                 if (!running && busy) {
                     busy = false
+                    busyKind = ""
                     btnMain.isEnabled = true
                     btnMain.alpha = 1f
                     // 体检成功不代表没事可做，也不代表该「优化」—— plan.json 里
                     // changes 为空就是「现在这设置已经最好，别折腾」。让按钮去说实话。
                     if (kind == "preview" && exit == 0) afterPreview() else resetMain()
+                    // 立刻刷一次读数，别等下一个 5 秒的轮询。改完设置最想看的就是
+                    // 「变了没有」，这几秒的空窗会被读成「没生效」。
+                    refreshStatus()
                 }
             }
             Main.postDelayed(this, 1200)
@@ -410,9 +416,13 @@ class MainActivity : Activity() {
     private fun refreshStatus() {
         // 上一次还没回来就别再发：每次 status 都要真连设备，堆起来只会越来越慢
         if (statusBusy || !Py.isReady) return
-        // 体检中设备会反复重启射频，这时候去查必然「连不上」—— 那不是故障，
-        // 是过程。老老实实说在体检，别让状态行红一下绿一下地吓人。
-        if (busy) {
+        // 体检时设备会反复重启射频，这时候去查必然「连不上」—— 那不是故障，是过程。
+        //
+        // 但**只有体检**该冻住数字：它要挨个切十几个频段，读数一路乱跳，看着像坏了。
+        // 手动设频段/信道只切一次、全程十几秒，冻住反而像卡死 —— 用户的原话是
+        // 「运行日志里面都改了，但是显示界面一直没有改」。所以这里按 kind 区分，
+        // 别再一刀切。
+        if (busy && busyKind == KIND_PREVIEW) {
             tvConn.text = "体检中，中途会断网"
             tvConn.setTextColor(MUTED)
             return
@@ -497,6 +507,7 @@ class MainActivity : Activity() {
             return
         }
         busy = true
+        busyKind = KIND_PREVIEW
         hideVerdict()   // 重新测就别让上一条结论还挂在那儿
         btnMain.text = "体检中…约 3~6 分钟"
         btnMain.isEnabled = false
@@ -585,6 +596,7 @@ class MainActivity : Activity() {
         planReady = false
         hideVerdict()
         busy = true
+        busyKind = "apply"
         btnMain.text = "正在应用…"
         btnMain.isEnabled = false
         btnMain.alpha = 0.6f
@@ -605,6 +617,7 @@ class MainActivity : Activity() {
             .setNegativeButton("算了", null)
             .setPositiveButton("恢复") { _, _ ->
                 busy = true
+                busyKind = "restore"
                 btnMain.text = "正在恢复…"
                 btnMain.isEnabled = false
                 btnMain.alpha = 0.6f
@@ -687,6 +700,7 @@ class MainActivity : Activity() {
     private fun startManual(fn: String, value: Int, busyText: String) {
         if (busy) return
         busy = true
+        busyKind = fn
         // 手动改过之后，屏幕上那条体检结论就过期了。留着它等于骗人 ——
         // 用户会以为「建议里写的是 BAND 3」，而设备已经被他自己改成别的了。
         hideVerdict()
@@ -1134,6 +1148,9 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "MifiApk"
         private const val REQ_SCAN = 1001
+
+        // 任务种类。目前只有体检需要冻住读数（它要挨个切频段，数字会乱跳）。
+        private const val KIND_PREVIEW = "preview"
 
         private val BG = Color.parseColor("#F7F7F5")
         private val INK = Color.parseColor("#16181D")
