@@ -52,11 +52,12 @@ class MainActivity : Activity() {
     // 主操作
     private lateinit var btnMain: TextView
     private lateinit var tvMainHint: TextView
-    // 体检结论（测完才显示）
+    // 体检结论（测完才显示）：一句话 + 两个按钮
     private lateinit var verdictBox: LinearLayout
     private lateinit var tvVerdict: TextView
     private lateinit var tvVerdictSub: TextView
-    private lateinit var tvReject: TextView
+    private lateinit var btnApply: TextView
+    private lateinit var btnDecline: TextView
     // 日志最新一屏缓存在这儿：点「查看运行日志」直接用，不用等 Python 那边
     private var logLines: List<String> = emptyList()
     private var jobBusy = false
@@ -224,29 +225,26 @@ class MainActivity : Activity() {
         verdictBox.addView(tvVerdict)
         verdictBox.addView(tvVerdictSub)
 
-        // 建议就是建议，不是命令。拒绝的入口必须看得见，但不能抢主按钮的风头。
-        val rejectRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-        }
-        tvReject = TextView(this).apply {
-            text = "不用了，保持现状"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(MUTED)
-            setPadding(dp(14), dp(10), 0, 0)
-            isClickable = true
-            isFocusable = true
-        }
-        tvReject.setOnClickListener { declineVerdict() }
-        rejectRow.addView(tvReject)
-        verdictBox.addView(rejectRow)
+        // 两个按钮并排，一样大：应用 / 不用。
+        // 建议就是建议，不是命令 —— 拒绝的入口不能藏成一行小字，那样等于没有。
+        // 结论出现时主按钮藏起来，界面上永远只有一组动作，不会让人对着
+        // 「应用结论」和「应用建议」两个键发愣。
+        val acts = row()
+        btnApply = actionButton("应用建议", true)
+        btnApply.setOnClickListener { applyNow() }
+        btnDecline = actionButton("不用了", false)
+        btnDecline.setOnClickListener { declineVerdict() }
+        acts.addView(btnApply, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
+        acts.addView(spacerW(10))
+        acts.addView(btnDecline, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
+        verdictBox.addView(acts)
 
         box.addView(verdictBox)
 
         btnMain = actionButton("开始体检并优化", true)
-        // 同一个按钮两段含义：第一次是「测」，测完出了结论就变成「应用」。
-        // 不想摆第二个按钮 —— 屏幕上只有一个大按钮的时候，没人会点错。
-        btnMain.setOnClickListener { if (planReady) applyNow() else startPreview() }
+        btnMain.setOnClickListener { startPreview() }
         box.addView(btnMain)
 
         tvMainHint = TextView(this).apply {
@@ -487,11 +485,10 @@ class MainActivity : Activity() {
                 tvMainHint.text = "当前设置已经合适，不用动"
             } else {
                 planReady = true
-                btnMain.text = "应用结论"
                 val list = (0 until n).map { changes!!.optString(it) }
                 showVerdict(list.joinToString("，"), verdictSub(p))
-                // 提醒拒绝也合法：这是建议，不是它替你做的决定
-                tvMainHint.text = "应用会断一次网 · 不想改点上面「不用了」"
+                // 两件事说清楚：会断网、可以不改
+                tvMainHint.text = "应用会断一次网 · 不想改就点「不用了」"
             }
         }
     }
@@ -517,10 +514,13 @@ class MainActivity : Activity() {
         tvVerdictSub.text = sub
         tvVerdictSub.visibility = if (sub.isEmpty()) View.GONE else View.VISIBLE
         verdictBox.visibility = View.VISIBLE
+        // 主按钮让位：结论已经自带「应用建议 / 不用了」，再摆一个只会让人选错
+        btnMain.visibility = View.GONE
     }
 
     private fun hideVerdict() {
         verdictBox.visibility = View.GONE
+        btnMain.visibility = View.VISIBLE
     }
 
     /** 拒绝建议：界面回到「还没测」的样子，不再追着问。 */
@@ -532,6 +532,7 @@ class MainActivity : Activity() {
 
     private fun resetMain() {
         planReady = false
+        btnMain.visibility = View.VISIBLE
         btnMain.text = "开始体检并优化"
         tvMainHint.text = "约 3~6 分钟，中途会断网"
     }
