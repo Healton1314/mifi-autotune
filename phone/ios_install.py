@@ -47,6 +47,18 @@ def is_ios():
     return "/var/mobile" in os.environ.get("HOME", "")
 
 
+def local_copy():
+    """引导命令已经把 zip 解开在当前目录了，这里就别再下一遍。
+
+    引导是一条 python3 -c 单行命令，它先解压再执行本文件；如果不认这个
+    已经解压好的目录，用户会白等一次重复下载（国内下 GitHub 还不一定快）。
+    """
+    for cand in ("mifi-autotune-main", "mifi-autotune"):
+        if os.path.isfile(os.path.join(cand, "autotune.py")):
+            return os.path.abspath(cand)
+    return None
+
+
 def fetch():
     import urllib.request
 
@@ -65,6 +77,34 @@ def fetch():
     return None
 
 
+def _backup(dest):
+    keep = {}
+    if os.path.isdir(dest):
+        for fn in PRESERVE:
+            src = os.path.join(dest, fn)
+            if os.path.isfile(src):
+                with open(src, "rb") as fh:
+                    keep[fn] = fh.read()
+    return keep
+
+
+def _restore(dest, keep):
+    for fn, blob in keep.items():
+        with open(os.path.join(dest, fn), "wb") as fh:
+            fh.write(blob)
+    return len(keep)
+
+
+def install_from_dir(src, dest):
+    parent = os.path.dirname(dest)
+    os.makedirs(parent, exist_ok=True)
+    keep = _backup(dest)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    return _restore(dest, keep)
+
+
 def install(data, dest):
     parent = os.path.dirname(dest)
     os.makedirs(parent, exist_ok=True)
@@ -72,14 +112,7 @@ def install(data, dest):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         names = zf.namelist()
         top = names[0].split("/")[0]
-
-        keep = {}
-        if os.path.isdir(dest):
-            for fn in PRESERVE:
-                src = os.path.join(dest, fn)
-                if os.path.isfile(src):
-                    with open(src, "rb") as fh:
-                        keep[fn] = fh.read()
+        keep = _backup(dest)
 
         tmp = dest + ".new"
         if os.path.isdir(tmp):
@@ -101,13 +134,7 @@ def install(data, dest):
             shutil.rmtree(dest)
         os.rename(tmp, dest)
 
-        restored = 0
-        for fn, blob in keep.items():
-            with open(os.path.join(dest, fn), "wb") as fh:
-                fh.write(blob)
-            restored += 1
-
-    return restored
+    return _restore(dest, keep)
 
 
 def make_launcher(dest):
@@ -146,20 +173,25 @@ def main():
     say(f"安装到 {dest}")
     say("")
 
-    say("[1/3] 下载")
-    data = fetch()
-    if data is None:
-        say("")
-        say("[×] 四个下载源都没成功。多半是网络问题：")
-        say("    · 先确认这个 Wi-Fi 能上外网（能打开网页）")
-        say("    · 换成 iSH 再试（App Store 也有，自带 apk 包管理，网络更稳）")
-        say("    · 或者让电脑把 zip 传到你手机上，再用 a-Shell 执行：")
-        say("      python3 -c \"import zipfile;zipfile.ZipFile('mifi.zip').extractall('.')\"")
-        return 1
-
-    say(f"    拿到 {len(data) // 1024} KB")
-    say("[2/3] 解压")
-    restored = install(data, dest)
+    src = local_copy()
+    if src:
+        say(f"[1/3] 直接使用已下载的 {os.path.basename(src)}")
+        say("[2/3] 复制")
+        restored = install_from_dir(src, dest)
+    else:
+        say("[1/3] 下载")
+        data = fetch()
+        if data is None:
+            say("")
+            say("[×] 四个下载源都没成功。多半是网络问题：")
+            say("    · 先确认这个 Wi-Fi 能上外网（能打开网页）")
+            say("    · 换成 iSH 再试（App Store 也有，自带 apk 包管理，网络更稳）")
+            say("    · 或者让电脑把 zip 传到你手机上，再用 a-Shell 执行：")
+            say("      python3 -c \"import zipfile;zipfile.ZipFile('mifi.zip').extractall('.')\"")
+            return 1
+        say(f"    拿到 {len(data) // 1024} KB")
+        say("[2/3] 解压")
+        restored = install(data, dest)
     if restored:
         say(f"    保留了 {restored} 个本地文件（位置记忆 / 当前设置）")
 
