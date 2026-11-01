@@ -132,6 +132,12 @@ class ZteRtaClient:
                 m = re.search(r"<login_status>([A-Za-z_]+)</login_status>", txt or "")
                 if m:
                     unauthorized = m.group(1)
+                    # file=login 本来就是最可靠的挑战来源（前端登录页也走它），
+                    # 它都已经明确回「没有会话」了，后面三个页面不会给出更好的
+                    # 答案。继续问只是多发三个请求 —— 实测这台设备上正是 wan 和
+                    # status1 最慢（0.9s / 1.4s），白等 2.3 秒。
+                    if f == "login":
+                        break
                 continue
             info = {}
             for k in ("realm", "nonce", "qop"):
@@ -202,6 +208,17 @@ class ZteRtaClient:
             last = (code, txt)
             if code == 200 and len(txt) > 40 and "UNAUTHORIZED" not in txt and "KICKOFF" not in txt:
                 return txt
+            if i == 0:
+                # 会话刚建好时，设备常先回一次几十字节的「还没就绪」
+                # （200 + <login_status>，实测正好 89 字节）。这是过渡态：
+                # 原样重发一次通常就过了。
+                #
+                # 老代码在这里直接丢掉 nonce 去重新挑战，代价是 sleep 1 秒
+                # 再加七八个请求（挑战、login.cgi、把三个页面重读一遍），
+                # 一次偶发就多花 3 秒 —— 而且恰好撞在用户点按钮的那一刻，
+                # 表现就是「点了没反应」。
+                time.sleep(0.15)
+                continue
             self._nonce = None          # 会话失效，下次重试重新拿 nonce
             time.sleep(1.0)
         if last_err is not None and last[1] == "":
@@ -230,23 +247,41 @@ class ZteRtaDriver(DeviceDriver):
 
     BANDS = [3, 8, 38, 39, 40, 41]
 
-    def __init__(self, *a, **kw):
+    def __init__(self, *a, client=None, **kw):
         super().__init__(*a, **kw)
-        self.c = ZteRtaClient(self.host, self.user, self.password, self.timeout)
+        # 复用探测阶段已经认证好的客户端，省掉一次完整会话（实测 3 秒左右）。
+        # 只复用「同一线程、紧接着」的那一个，绝不做跨线程共享：Digest 的
+        # nonce/_nc 计数被两个线程同时推进，设备会直接判会话失效。
+        self.c = client or ZteRtaClient(self.host, self.user, self.password, self.timeout)
         # get_state() 已经取过一份 wlan 设置，capabilities() 别再取一遍。
         # 这台设备每次请求都要重走一遍 Digest，界面上就是「点一下先卡一下」。
         self._wlan_memo = None
 
     @classmethod
     def identify(cls, host, user, password, timeout=5) -> bool:
+        return cls.identify_client(host, user, password, timeout=timeout)[0]
+
+    @classmethod
+    def identify_client(cls, host, user, password, timeout=5):
+        """探测，并把**已经认证好的客户端**一并交回来。
+
+        为什么要交回来：这台设备建一次会话，得「撞一次 401 → 拿 nonce → 可能
+        还要走 login.cgi」，实测 3 秒上下。老代码 identify() 建个客户端问完就
+        扔，detect() 紧接着又 new 一个从零再认证一遍 —— 一次状态查询里建了两遍
+        会话，用户点一下按钮，就先卡这一下。
+
+        调用方拿到非 None 的客户端时直接用它构造驱动，别再建新的。
+        """
         try:
             c = ZteRtaClient(host, user, password, timeout)
             txt = c.get("wan", retries=0)
-            return "<wan>" in txt
+            if "<wan>" in txt:
+                return True, c
+            return False, None
         except DeviceBusy:
             raise                      # 设备在但拒答，交给上层说清楚，别当成"不是这个驱动"
         except Exception:  # noqa: BLE001
-            return False
+            return False, None
 
     def capabilities(self):
         try:
