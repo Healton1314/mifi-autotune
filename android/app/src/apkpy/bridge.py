@@ -150,6 +150,11 @@ def guard_stop():
 
 
 def guard_state():
+    """守护跑没跑。只给状态，不给日志 —— 界面上不摆那一大坨输出。
+
+    返回的 lines 曾经是 200 行原文，但界面根本不显示（用户明确嫌吵），
+    每次轮询还白传几十 KB。要看日志走 job()。
+    """
     t = _guard["thread"]
     alive = t is not None and t.is_alive()
     return _dumps({
@@ -157,6 +162,4 @@ def guard_state():
         "since": int(_guard["started"]) if alive else None,
         "elapsed": round(time.time() - _guard["started"]) if alive else None,
         "dry": _guard["dry"],
-        # 守护的日志复用任务日志缓冲，界面拿它当实时输出看
-        "lines": list(server.JOB["lines"])[-200:],
     })

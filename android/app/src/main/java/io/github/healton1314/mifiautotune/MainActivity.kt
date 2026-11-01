@@ -78,6 +78,7 @@ class MainActivity : Activity() {
 
         Main.post(pollStatus)
         Main.post(pollJob)
+        Main.post(pollGuard)
     }
 
     // ---------------- 界面 ----------------
@@ -170,6 +171,12 @@ class MainActivity : Activity() {
         tools.addView(restore, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         box.addView(spacer(12))
         box.addView(tools)
+
+        // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿调
+        val logBtn = actionButton("查看运行日志", false)
+        logBtn.setOnClickListener { showLogFromBuffer() }
+        box.addView(spacer(10))
+        box.addView(logBtn)
         return box
     }
 
@@ -261,10 +268,10 @@ class MainActivity : Activity() {
                 // 直接拿它判空会让日志区一直挂着。这里显式问 isNull。
                 val kind = if (o.isNull("kind")) "" else o.optString("kind")
                 val exit = if (o.isNull("exit")) 0 else o.optInt("exit", 0)
-                val hasLines = (o.optJSONArray("lines")?.length() ?: 0) > 0
-                // hasLines 这一条是给守护用的：守护不走 JOB 的 running/kind，
-                // 只往日志缓冲里写，不加这行它一整套输出都会被判成「没事可显示」。
-                if (running || kind.isNotEmpty() || exit != 0 || hasLines) showJob(o)
+                // 只有「体检/应用这类一次性任务」才把日志摆出来。
+                // 守护是常驻的，每 30 秒刷一行，摆出来就是一大坨噪音 —— 它的
+                // 状态放在开关下面那一行就够了；真要看日志去详情里点。
+                if (running || kind.isNotEmpty() || exit != 0) showJob(o)
                 if (!running && busy) {
                     busy = false
                     btnMain.text = "开始体检并优化"
@@ -273,6 +280,33 @@ class MainActivity : Activity() {
                 }
             }
             Main.postDelayed(this, 1200)
+        }
+    }
+
+    /**
+     * 盯着守护还活着没有。
+     *
+     * 守护是常驻线程，连不上设备、异常退出都会让它悄悄停下，而开关还亮着 ——
+     * 用户以为它在守，其实早就不干了。这里每 5 秒问一次，发现没了就把开关
+     * 如实地拨回去，并告诉他去哪儿看原因。
+     */
+    private val pollGuard = object : Runnable {
+        override fun run() {
+            if (guardOn) {
+                Py.call(this@MainActivity, "guard_state") { txt ->
+                    val o = json(txt) ?: return@call
+                    if (!o.optBoolean("running") && guardOn) {
+                        guardOn = false
+                        swGuard.setOnCheckedChangeListener(null)
+                        swGuard.isChecked = false
+                        swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean ->
+                            toggleGuard(x)
+                        }
+                        tvGuardHint.text = "已经停了。点「详情 → 查看运行日志」看原因"
+                    }
+                }
+            }
+            Main.postDelayed(this, 5000)
         }
     }
 
@@ -407,6 +441,29 @@ class MainActivity : Activity() {
     private fun showLog(text: String) {
         tvJob.text = text
         jobBox.visibility = View.VISIBLE
+    }
+
+    /**
+     * 从「详情」里主动要日志。
+     *
+     * 平时不显示是有意的：守护每 30 秒刷一行，摆出来就是一屏噪音。但排障时
+     * 又确实需要看到它，所以留这个入口 —— 点完把它滚到可见位置。
+     */
+    private fun showLogFromBuffer() {
+        Py.call(this, "job") { txt ->
+            val o = json(txt)
+            val lines = o?.optJSONArray("lines")
+            if (o == null || lines == null || lines.length() == 0) {
+                showLog("还没有日志。跑一次体检，或把守护打开一会儿再看。")
+            } else {
+                showJob(o)
+            }
+            jobBox.post {
+                jobBox.requestRectangleOnScreen(
+                    android.graphics.Rect(0, 0, jobBox.width, jobBox.height), true
+                )
+            }
+        }
     }
 
     private fun showJob(o: JSONObject) {
