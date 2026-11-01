@@ -47,9 +47,13 @@ def init(files_dir=""):
 # ---------------- 状态与结论 ----------------
 
 def status():
-    """设备现状：频段、信道、信号、延迟/丢包。"""
+    """设备现状：频段、信道、信号、延迟/丢包。
+
+    只测 3 包：界面每 5 秒问一次，而这个数字只是给个参考；手机上没有 ICMP，
+    每包都要走一次 TCP 握手，6 包会让一次查询拖到好几秒，把调用线程占死。
+    """
     try:
-        return _dumps(server.device_status())
+        return _dumps(server.device_status(ping_n=3))
     except Exception as e:  # noqa: BLE001
         return _err(e)
 

@@ -34,6 +34,17 @@ object Py {
      */
     private val longRunner = Executors.newSingleThreadExecutor { r -> Thread(r, "mifi-py-long") }
 
+    /**
+     * 轻量查询专用线程：job / guard_state / plan 这类「只读内存、几毫秒」的调用。
+     *
+     * 为什么非得单独一条：[io] 上的 status 每次都要真连设备（认证 + 测延迟），
+     * 一趟一两秒，而界面每 5 秒就来一次 —— 那条线几乎永远是满的。进度查询和
+     * 「任务结束该复位按钮了」的判断都排在它后面，用户看到的就是
+     * 「点了没反应、跑完了按钮还挂着『正在…』」。
+     * 读内存的调用不该等网络。
+     */
+    private val fast = Executors.newSingleThreadExecutor { r -> Thread(r, "mifi-py-fast") }
+
     @Volatile
     private var module: PyObject? = null
 
@@ -76,6 +87,17 @@ object Py {
         vararg args: Any,
         onResult: (String) -> Unit
     ) = submit(longRunner, ctx, fn, args, onResult)
+
+    /**
+     * 读内存的轻量查询走这条：不会被正在跑的状态查询挡住。
+     * 只给 job / guard_state / plan 这类调用用 —— 它们不碰设备。
+     */
+    fun callFast(
+        ctx: Context,
+        fn: String,
+        vararg args: Any,
+        onResult: (String) -> Unit
+    ) = submit(fast, ctx, fn, args, onResult)
 
     private fun submit(
         pool: java.util.concurrent.Executor,

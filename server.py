@@ -498,7 +498,32 @@ class Handler(SimpleHTTPRequestHandler):
     def api_scan(self):
         return channel_scan()
 
-def device_status():
+_PING_CACHE = {"ts": 0.0, "key": None, "val": None}
+PING_CACHE_SEC = 10
+
+
+def _cached_ping(n, host, ttl=PING_CACHE_SEC):
+    """给状态轮询用的 ping，带 10 秒缓存。
+
+    为什么必须缓存：`ping -c 6` 在电脑上是 6 秒（每秒一包），在安卓上没有
+    ICMP 权限、退回「6 次 TCP 握手」，也要好几秒。而界面每 5 秒就来问一次
+    —— 于是那条调用线程**永远在处理上一个请求**，用户点任何东西都得排队，
+    表现就是「点了没反应、任务结束了按钮还挂着『正在…』」。
+
+    延迟数字晚 10 秒不影响任何判断（本来就是个参考值），但「点了不动」
+    很影响。真要最新值，去看设备页或跑一次 --status。
+    """
+    key = (host, n)
+    now = time.time()
+    c = _PING_CACHE
+    if c["val"] is not None and c["key"] == key and now - c["ts"] < ttl:
+        return c["val"]
+    val = probe.ping_stats(n, host)
+    c.update(ts=now, key=key, val=val)
+    return val
+
+
+def device_status(ping_n=6):
     """读一次设备现状（频段/信号/延迟）。面板和 APK 原生界面共用这一份。
 
     抽成模块级而不是留在 Handler 里：APK 那边不再走 HTTP，直接调这个函数，
@@ -508,7 +533,7 @@ def device_status():
     dev = detect()
     st = dev.get_state()
     caps = dev.capabilities()
-    ping = probe.ping_stats(6, cfg["ping_host"])
+    ping = _cached_ping(ping_n, cfg["ping_host"])
     # 「频段」有两个含义，别混：band 是锁定值（0 = 自动），serving_band 是
     # 设备此刻实际驻留的。恢复默认之后锁定被解除，band 就是 0 —— 界面上如果
     # 只认 band，就会显示成一个「—」，看着像设备坏了，其实它只是变回自动了。

@@ -140,5 +140,43 @@ class LockBandZero(unittest.TestCase):
         cleared.assert_not_called()
 
 
+class StatusPingCache(unittest.TestCase):
+    """状态轮询的延迟数字必须缓存，否则那条调用线程永远被占着。
+
+    实测代价：`ping -c 6` 在电脑上是 6 秒；安卓没有 ICMP 权限、退回 6 次
+    TCP 握手，也要好几秒。而界面每 5 秒问一次状态 —— 不缓存的话，进度查询
+    和「任务结束该复位按钮了」永远排在它后面，用户看到的就是
+    「点了没反应 / 跑完了按钮还挂着『正在…』」。
+    """
+
+    def setUp(self):
+        import server
+        self.server = server
+        server._PING_CACHE.update(ts=0.0, key=None, val=None)
+
+    def test_second_call_hits_cache(self):
+        with mock.patch.object(self.server.probe, "ping_stats",
+                               return_value={"avg": 50, "loss": 0}) as m:
+            a = self.server._cached_ping(3, "223.5.5.5")
+            b = self.server._cached_ping(3, "223.5.5.5")
+        self.assertEqual(a, b)
+        self.assertEqual(m.call_count, 1, "10 秒内不该再测一次")
+
+    def test_different_host_or_count_misses(self):
+        with mock.patch.object(self.server.probe, "ping_stats",
+                               return_value={"avg": 50, "loss": 0}) as m:
+            self.server._cached_ping(3, "223.5.5.5")
+            self.server._cached_ping(6, "223.5.5.5")   # 包数不同 = 新的一次
+            self.server._cached_ping(3, "119.29.29.29")
+        self.assertEqual(m.call_count, 3)
+
+    def test_expires(self):
+        with mock.patch.object(self.server.probe, "ping_stats",
+                               return_value={"avg": 50, "loss": 0}) as m:
+            self.server._cached_ping(3, "223.5.5.5")
+            self.server._cached_ping(3, "223.5.5.5", ttl=0)
+        self.assertEqual(m.call_count, 2, "缓存过期后要重新测")
+
+
 if __name__ == "__main__":
     unittest.main()

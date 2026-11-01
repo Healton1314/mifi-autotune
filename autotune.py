@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -4765,7 +4765,7 @@ def run_here(dev, args):
     return 0
 
 
-def run_lock_band(dev, args):
+def run_lock_band(dev, args, st0=None):
     """直接锁到指定频段：不测速、不裁决，只切一次。
 
     为什么需要这条：用户的场景是「BAND 40 丢包严重，我知道 BAND 3 才是首选」。
@@ -4779,8 +4779,10 @@ def run_lock_band(dev, args):
         print("\n[解锁] 解除频段锁定，交回设备自己选（只切一次，不测量）")
     else:
         print(f"\n[锁定] 直接切到 BAND {band}（不测量、不裁决，只切一次）")
+    # main() 进门就读过一次状态了，别为了这一行再跑一趟设备 ——
+    # 每次往返都要重新认证，手机上就是「点一下先卡两秒」。
     try:
-        print(f"  当前：{dev.get_state().get('band') or '自动'}")
+        print(f"  当前：{(st0 or {}).get('band') or '自动'}")
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -4831,7 +4833,7 @@ def run_lock_band(dev, args):
     return 0
 
 
-def run_set_channel(dev, args):
+def run_set_channel(dev, args, st0=None):
     """直接把 WiFi 信道设成指定值：不扫描、不评分、只写一次。
 
     和 run_lock_band 是同一类命令 —— 用户已经知道答案（邻居全挤在 6，
@@ -4846,7 +4848,7 @@ def run_set_channel(dev, args):
     label = "自动" if ch == 0 else f"信道 {ch}"
     print(f"\n[设置] 直接改到{label}（不扫描、不评分，只写一次）")
     try:
-        before = dev.get_state().get("channel") or 0
+        before = (st0 or {}).get("channel") or 0
         print(f"  当前：{'自动' if not before else f'信道 {before}'}")
     except Exception:  # noqa: BLE001
         pass
@@ -4861,7 +4863,7 @@ def run_set_channel(dev, args):
         print(f"[×] 设置失败：{type(e).__name__}: {e}")
         return 1
     # 改信道比换频段回来得快，但手机自己也要重连一次，60 秒是宽裕值。
-    if not wait_device_back(dev, timeout=60, poll=3):
+    if not wait_device_back(dev, timeout=60, poll=1.5):
         print("[!] 设备 60 秒没回来；指令多半已生效，稍后用 --status 确认")
         return 1
     try:
@@ -5193,10 +5195,10 @@ def main():
     # 0 是合法输入（解除锁定 / 交回自动），所以只判 None —— 写成 `if args.lock_band:`
     # 会把「自动」这条最常用的选项直接吞掉，界面上点了没反应。
     if args.lock_band is not None:
-        return run_lock_band(dev, args)
+        return run_lock_band(dev, args, st0)
 
     if args.set_channel is not None:
-        return run_set_channel(dev, args)
+        return run_set_channel(dev, args, st0)
 
     if args.here:
         return run_here(dev, args)

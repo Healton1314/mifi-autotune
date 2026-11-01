@@ -343,7 +343,7 @@ class MainActivity : Activity() {
                 return
             }
             jobBusy = true
-            Py.call(this@MainActivity, "job") { txt ->
+            Py.callFast(this@MainActivity, "job") { txt ->
                 jobBusy = false
                 val o = json(txt) ?: return@call
                 val running = o.optBoolean("running")
@@ -388,7 +388,7 @@ class MainActivity : Activity() {
     private val pollGuard = object : Runnable {
         override fun run() {
             if (guardOn) {
-                Py.call(this@MainActivity, "guard_state") { txt ->
+                Py.callFast(this@MainActivity, "guard_state") { txt ->
                     val o = json(txt) ?: return@call
                     if (!o.optBoolean("running")) {
                         if (guardOn) {
@@ -518,7 +518,7 @@ class MainActivity : Activity() {
 
     /** 体检跑完了：去 plan.json 里看看有没有值得改的，再决定按钮说什么。 */
     private fun afterPreview() {
-        Py.call(this, "plan") { txt ->
+        Py.callFast(this, "plan") { txt ->
             val p = json(txt)?.optJSONObject("plan")
             val changes = p?.optJSONArray("changes")
             val n = changes?.length() ?: 0
@@ -998,7 +998,7 @@ class MainActivity : Activity() {
 
         // 上面那屏是缓存 —— 点下去立刻就有东西，不依赖 Python 那边。这里再补
         // 一次最新的：长任务在另一条线程上跑，这次往返不会被它堵住，几百毫秒就回。
-        Py.call(this, "job") { txt ->
+        Py.callFast(this, "job") { txt ->
             val arr = json(txt)?.optJSONArray("lines") ?: return@call
             logLines = (0 until arr.length()).map { arr.optString(it) }
             if (!dlg.isShowing) return@call   // 用户已经关掉了，白改
