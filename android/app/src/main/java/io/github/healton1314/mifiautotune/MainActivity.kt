@@ -23,20 +23,23 @@ import org.json.JSONObject
 import kotlin.concurrent.thread
 
 /**
- * 原生界面。上半屏是「现在怎么样 + 一键体检」，下半屏是「守护模式」。
+ * 原生界面。默认只回答三个问题：现在好不好、要不要优化、守护开没开。
  *
- * 为什么从 WebView 换成原生：网页那套是给电脑浏览器设计的，搬到手机上
- * 一堆只读卡片长得像按钮、点不动；而且面板里还塞着「装 Termux」这种
- * 跟 app 无关的内容。原生的好处是每个可点的东西就是一个真按钮，不可点的
- * 就明确不长得像按钮。
+ * 设计上刻意克制：默认一屏只有「一句话状态 + 一个主按钮 + 守护开关」。
+ * 频段、信号、信道、延迟这些数字全收进「详情」，点一下才展开 —— 主界面
+ * 不是仪表盘，是给人做决定的。日志只在真的在跑东西时出现。
  *
- * 数据全部来自 Python（bridge.py），这里只负责显示；所有跨语言调用都走
- * Py.call，它保证串行 + 后台 + 异常转文字。
+ * 数据全部来自 Python（bridge.py），这里只负责显示；跨语言调用统一走
+ * Py.call，它保证串行 + 后台线程 + 异常转文字。
  */
 class MainActivity : Activity() {
 
-    // 状态区
+    // 状态：一句话，可点开详情
     private lateinit var tvConn: TextView
+    private lateinit var tvChevron: TextView
+    private lateinit var detailBox: LinearLayout
+
+    // 详情里的读数
     private lateinit var tvBand: TextView
     private lateinit var tvChan: TextView
     private lateinit var tvRsrp: TextView
@@ -56,6 +59,7 @@ class MainActivity : Activity() {
     private var busy = false
     private var statusBusy = false
     private var guardOn = false
+    private var detailOpen = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,60 +80,56 @@ class MainActivity : Activity() {
         Main.post(pollJob)
     }
 
-    private fun requestScanPermissions() {
-        val need = mutableListOf<String>()
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            need += Manifest.permission.ACCESS_FINE_LOCATION
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            need += Manifest.permission.NEARBY_WIFI_DEVICES
-        }
-        if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), REQ_SCAN)
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        // 权限刚给上，启动时写的空结果该重写一次，不用等下一轮 60 秒
-        if (requestCode == REQ_SCAN) WifiScanBridge.refresh()
-    }
-
-    // ---------------- 界面搭建 ----------------
+    // ---------------- 界面 ----------------
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
-            setPadding(dp(18), dp(44), dp(18), dp(28))
+            setPadding(dp(20), dp(52), dp(20), dp(28))
         }
 
         root.addView(TextView(this).apply {
             text = "随身WiFi 调优"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(INK)
         })
 
+        // ---- 一句话状态，点一下展开详情 ----
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
         tvConn = TextView(this).apply {
             text = "正在连接…"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTextColor(MUTED)
-            setPadding(0, dp(6), 0, dp(16))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        root.addView(tvConn)
+        tvChevron = TextView(this).apply {
+            text = "详情"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(ACCENT)
+            setPadding(dp(8), dp(2), 0, dp(2))
+        }
+        statusRow.addView(tvConn)
+        statusRow.addView(tvChevron)
+        statusRow.setOnClickListener { toggleDetail() }
+        root.addView(statusRow)
 
-        root.addView(statusCard())
+        // ---- 详情：默认收起 ----
+        detailBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(14), 0, 0)
+        }
+        detailBox.addView(detailCard())
+        root.addView(detailBox)
+
         root.addView(primaryCard())
         root.addView(guardCard())
-        root.addView(toolsCard())
 
         return ScrollView(this).apply {
             isFillViewport = true
@@ -137,15 +137,15 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 上半屏：四个读数。明确做成「不可点」的样子 —— 没有按钮边框、没有按压反馈。 */
-    private fun statusCard(): View {
+    /** 详情：四个读数 + 底部的两个低频操作。全部藏在「详情」后面。 */
+    private fun detailCard(): View {
         val box = card()
         val row1 = row()
         val row2 = row()
 
-        tvBand = metric(row1, "LTE 频段", "—", big = true)
-        tvChan = metric(row1, "WiFi 信道", "—", big = true)
-        tvRsrp = metric(row2, "信号强度", "—", big = false)
+        tvBand = metric(row1, "频段", "—", big = true)
+        tvChan = metric(row1, "信道", "—", big = true)
+        tvRsrp = metric(row2, "信号", "—", big = false)
         tvSinr = metric(row2, "信噪比", "—", big = false)
 
         box.addView(row1)
@@ -153,27 +153,39 @@ class MainActivity : Activity() {
         box.addView(row2)
 
         tvLat = TextView(this).apply {
-            text = "延迟 — · 丢包 —"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            text = "延迟 —"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setTextColor(MUTED)
             setPadding(0, dp(12), 0, 0)
         }
         box.addView(tvLat)
+
+        val tools = row()
+        val scan = actionButton("扫描信道", false)
+        scan.setOnClickListener { doScan(scan) }
+        val restore = actionButton("恢复默认", false)
+        restore.setOnClickListener { runTask("restore") { "已请求恢复默认设置" } }
+        tools.addView(scan, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        tools.addView(spacerW(10))
+        tools.addView(restore, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        box.addView(spacer(12))
+        box.addView(tools)
         return box
     }
 
-    /** 主操作：一个大按钮 + 展开后才出现的进度区。 */
+    /** 主操作：一个按钮，一句时长说明。没有第二句。 */
     private fun primaryCard(): View {
         val box = card()
 
-        btnMain = actionButton("开始体检并优化", primary = true)
+        btnMain = actionButton("开始体检并优化", true)
         btnMain.setOnClickListener { startPreview() }
         box.addView(btnMain)
 
         box.addView(TextView(this).apply {
-            text = "会逐个切换频段实测，约 3~6 分钟，中途断网几次；跑完给结论，不点应用就不改设备"
+            text = "约 3~6 分钟，中途会断网"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(MUTED)
+            setGravity(Gravity.CENTER)
             setPadding(0, dp(10), 0, 0)
         })
 
@@ -190,8 +202,8 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#14161A"))
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
-        // 必须是可滚动的：体检和守护都能刷出上百行，直接塞进固定高度的
-        // TextView 只会把超出的部分裁掉，用户以为卡住了。
+        // 必须是可滚动的：体检和守护都能刷出上百行，塞进固定高度的 TextView
+        // 只会把超出的部分裁掉，用户以为卡住了。
         jobScroll = ScrollView(this).apply { addView(tvJob) }
         jobBox.addView(jobScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(200)
@@ -200,7 +212,7 @@ class MainActivity : Activity() {
         return box
     }
 
-    /** 下半屏：守护模式。开关是真开关，旁边写清楚它现在在干什么。 */
+    /** 守护：一行标题 + 开关 + 四个字的状态。说明只在真开着的时候给一句。 */
     @SuppressLint("UseSwitchCompatOrMaterialCode")
     private fun guardCard(): View {
         val box = card()
@@ -222,34 +234,16 @@ class MainActivity : Activity() {
         box.addView(head)
 
         tvGuardHint = TextView(this).apply {
-            text = "关着。打开后它自己盯着：你一走动就松开频段锁，坐满 10 分钟才锁住，换个地方会自己重选。"
+            text = "关着"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setTextColor(MUTED)
-            setLineSpacing(dp(3).toFloat(), 1f)
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(6), 0, 0)
         }
         box.addView(tvGuardHint)
         return box
     }
 
-    private fun toolsCard(): View {
-        val box = card()
-        val r = row()
-
-        val scan = actionButton("扫描信道", primary = false)
-        scan.setOnClickListener { doScan(scan) }
-        val restore = actionButton("恢复默认", primary = false)
-        restore.setOnClickListener { runTask("restore") { "已请求恢复默认设置" } }
-
-        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        r.addView(scan, lp)
-        r.addView(spacerW(10))
-        r.addView(restore, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        box.addView(r)
-        return box
-    }
-
-    // ---------------- 数据刷新 ----------------
+    // ---------------- 刷新 ----------------
 
     private val pollStatus = object : Runnable {
         override fun run() {
@@ -288,30 +282,33 @@ class MainActivity : Activity() {
         statusBusy = true
         Py.call(this, "status") { txt ->
             statusBusy = false
-            val o = json(txt) ?: run {
-                tvConn.text = "● 连不上设备"
+            val o = json(txt)
+            if (o == null || o.has("error")) {
+                tvConn.text = "没连上随身WiFi"
                 tvConn.setTextColor(ERR)
                 return@call
             }
-            if (o.has("error")) {
-                tvConn.text = "● 连不上：${o.optString("error").take(60)}"
-                tvConn.setTextColor(ERR)
-                return@call
-            }
-            val ping = o.optJSONObject("ping") ?: JSONObject()
-            val loss = ping.optDouble("loss", -1.0)
-            val lat = ping.optDouble("avg", -1.0)
-            tvConn.text = "● 已连接" +
-                (if (lat >= 0) " · 延迟 ${lat.toInt()}ms" else "") +
-                (if (loss >= 0) " · 丢包 ${loss.toInt()}%" else "")
-            tvConn.setTextColor(OK)
 
-            tvBand.text = "BAND ${o.optInt("band", 0).takeIf { it > 0 } ?: "—"}"
+            val lte = o.optJSONObject("lte")
+            val ping = o.optJSONObject("ping")
+            val loss = if (ping == null || ping.isNull("loss")) -1.0 else ping.optDouble("loss", -1.0)
+            val lat = if (ping == null || ping.isNull("avg")) -1.0 else ping.optDouble("avg", -1.0)
+            val band = o.optInt("band", 0)
+
+            // 状态行只说一句人话：好不好。数字都放详情里。
+            val slow = (loss >= 8) || (lat >= 200)
+            tvConn.text = when {
+                slow -> "网络偏慢" + if (band > 0) " · BAND $band" else ""
+                else -> "网络正常" + if (band > 0) " · BAND $band" else ""
+            }
+            tvConn.setTextColor(if (slow) WARN else OK)
+
+            // 详情里的数
+            tvBand.text = if (band > 0) "BAND $band" else "—"
             tvChan.text = o.optInt("channel", 0).takeIf { it > 0 }?.toString() ?: "自动"
             // 设备给的是带单位的字符串（"-99dBm" / "3dB"）。浏览器里 parseInt 会
             // 自动截出数字，Kotlin 的 optInt 直接失败返回 0 —— 这就是前一版这两格
             // 一直是「—」的原因。这里显式剥掉单位。
-            val lte = o.optJSONObject("lte")
             val rsrp = num(lte?.optString("rsrp"))
             val sinr = num(lte?.optString("sinr"))
             tvRsrp.text = if (rsrp != null) "$rsrp dBm" else "—"
@@ -323,21 +320,25 @@ class MainActivity : Activity() {
 
     // ---------------- 动作 ----------------
 
+    private fun toggleDetail() {
+        detailOpen = !detailOpen
+        detailBox.visibility = if (detailOpen) View.VISIBLE else View.GONE
+        tvChevron.text = if (detailOpen) "收起" else "详情"
+    }
+
     private fun startPreview() {
         if (busy) return
         // 守护开着的时候它自己也在连设备、也在切频段。这时候再跑体检，两边会
         // 抢同一台路由器的登录和射频状态，结果是谁都不准。先说清楚，别硬跑。
         if (guardOn) {
-            jobBox.visibility = View.VISIBLE
-            tvJob.text = "守护模式正在运行，体检会和它抢设备。\n先在上面把守护关掉，再体检。"
+            showLog("守护模式正在运行，体检会和它抢设备。\n先把下面那个开关关掉，再体检。")
             return
         }
         busy = true
-        btnMain.text = "体检中…（约 3~6 分钟）"
+        btnMain.text = "体检中…约 3~6 分钟"
         btnMain.isEnabled = false
         btnMain.alpha = 0.6f
-        jobBox.visibility = View.VISIBLE
-        tvJob.text = "正在启动…"
+        showLog("正在启动…")
         runTask("preview") { "已开始体检" }
     }
 
@@ -345,11 +346,9 @@ class MainActivity : Activity() {
         Py.call(this, fn) { txt ->
             val o = json(txt)
             if (o != null && o.optBoolean("ok", false)) {
-                jobBox.visibility = View.VISIBLE
-                tvJob.text = okMsg()
+                showLog(okMsg())
             } else {
-                jobBox.visibility = View.VISIBLE
-                tvJob.text = "启动失败：" + (o?.optString("msg") ?: txt.take(200))
+                showLog("启动失败：" + (o?.optString("msg") ?: txt.take(200)))
                 busy = false
                 btnMain.isEnabled = true
                 btnMain.alpha = 1f
@@ -366,15 +365,13 @@ class MainActivity : Activity() {
             btn.isEnabled = true
             btn.text = old
             val o = json(txt)
-            jobBox.visibility = View.VISIBLE
-            tvJob.text = when {
+            showLog(when {
                 o == null -> "扫描失败：${txt.take(200)}"
                 o.optString("error").isNotEmpty() -> "扫描失败：${o.optString("error")}"
                 o.optInt("best", 0) > 0 ->
-                    "当前信道 ${o.optInt("current")}，建议换到 ${o.optInt("best")}\n" +
-                    "周边 ${o.optJSONArray("aps")?.length() ?: 0} 个 AP"
+                    "当前信道 ${o.optInt("current")}，建议换到 ${o.optInt("best")}"
                 else -> "扫到了，但没有可推荐的信道"
-            }
+            })
         }
     }
 
@@ -390,21 +387,27 @@ class MainActivity : Activity() {
                     tvGuardHint.text = "没起来：" + (o?.optString("msg") ?: txt.take(120))
                 } else {
                     guardOn = true
-                    tvGuardHint.text = "正在运行。它每 30 秒看一眼：在动就松开频段锁，坐满 10 分钟才锁住。"
+                    tvGuardHint.text = "运行中 · 你走动时它会松开频段锁"
                     // 这里不主动把日志区拉出来：守护第一行输出要等它连上设备，
                     // 先摆一个空黑框只会让人以为又卡住了。日志一到 showJob 会显示。
                 }
             }
         } else {
             guardOn = false
-            tvGuardHint.text = "正在停止（最多等 30 秒，它会先把手头这一轮跑完）…"
+            tvGuardHint.text = "正在停…"
             Py.call(this, "guard_stop") { _ ->
-                tvGuardHint.text = "已请求停止，设备保持当前设置。"
+                tvGuardHint.text = "关着"
             }
         }
     }
 
     // ---------------- 小工具 ----------------
+
+    /** 日志区统一入口：有内容才露出来，避免空黑框。 */
+    private fun showLog(text: String) {
+        tvJob.text = text
+        jobBox.visibility = View.VISIBLE
+    }
 
     private fun showJob(o: JSONObject) {
         val lines = o.optJSONArray("lines") ?: return
@@ -463,7 +466,7 @@ class MainActivity : Activity() {
         })
         val v = TextView(this).apply {
             text = value
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (big) 22f else 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (big) 20f else 16f)
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(INK)
             setPadding(0, dp(4), 0, 0)
@@ -476,14 +479,14 @@ class MainActivity : Activity() {
     private fun actionButton(text: String, primary: Boolean) = TextView(this).apply {
         this.text = text
         gravity = Gravity.CENTER
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, if (primary) 16f else 14f)
         setTypeface(typeface, Typeface.BOLD)
         setTextColor(if (primary) Color.WHITE else INK)
         background = GradientDrawable().apply {
             cornerRadius = dp(14).toFloat()
             setColor(if (primary) ACCENT else Color.parseColor("#EFEFF3"))
         }
-        setPadding(dp(16), dp(14), dp(16), dp(14))
+        setPadding(dp(16), if (primary) dp(16) else dp(12), dp(16), if (primary) dp(16) else dp(12))
         isClickable = true
         isFocusable = true
         layoutParams = LinearLayout.LayoutParams(
@@ -502,6 +505,34 @@ class MainActivity : Activity() {
     private fun dp(v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
 
+    // ---------------- 权限 ----------------
+
+    private fun requestScanPermissions() {
+        val need = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            need += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            need += Manifest.permission.NEARBY_WIFI_DEVICES
+        }
+        if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), REQ_SCAN)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // 权限刚给上，启动时写的空结果该重写一次，不用等下一轮 60 秒
+        if (requestCode == REQ_SCAN) WifiScanBridge.refresh()
+    }
+
     override fun onDestroy() {
         Main.clear()   // 轮询是自我重投递的，必须显式清掉，否则界面销毁后还在跑
         super.onDestroy()
@@ -516,6 +547,7 @@ class MainActivity : Activity() {
         private val MUTED = Color.parseColor("#8A8F98")
         private val ACCENT = Color.parseColor("#1B6EF3")
         private val OK = Color.parseColor("#1FA971")
+        private val WARN = Color.parseColor("#E8890C")
         private val ERR = Color.parseColor("#D94A3D")
         private val LOG_INK = Color.parseColor("#C9D1C9")
     }
