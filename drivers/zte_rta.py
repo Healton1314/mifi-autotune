@@ -233,6 +233,9 @@ class ZteRtaDriver(DeviceDriver):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.c = ZteRtaClient(self.host, self.user, self.password, self.timeout)
+        # get_state() 已经取过一份 wlan 设置，capabilities() 别再取一遍。
+        # 这台设备每次请求都要重走一遍 Digest，界面上就是「点一下先卡一下」。
+        self._wlan_memo = None
 
     @classmethod
     def identify(cls, host, user, password, timeout=5) -> bool:
@@ -247,7 +250,7 @@ class ZteRtaDriver(DeviceDriver):
 
     def capabilities(self):
         try:
-            w = _flat(self.c.get("uapxb_wlan_basic_settings"))
+            w = self._wlan_memo or _flat(self.c.get("uapxb_wlan_basic_settings"))
             lo = int(w.get("first_channel") or 1)
             hi = int(w.get("last_channel") or 13)
             channels = list(range(lo, hi + 1))
@@ -268,6 +271,7 @@ class ZteRtaDriver(DeviceDriver):
         wan = _flat(self.c.get("wan"))
         try:
             wlan = _flat(self.c.get("uapxb_wlan_basic_settings"))
+            self._wlan_memo = wlan          # 留给 capabilities() 复用
         except Exception:  # noqa: BLE001
             wlan = {}
         try:

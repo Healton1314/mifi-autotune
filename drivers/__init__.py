@@ -3,6 +3,8 @@
 新增机型时，只需要在 DRIVERS 里加一行，autotune / server 都不用改。
 """
 
+import time
+
 from .base import DeviceBusy, DeviceDriver, Unsupported
 from .zte_rta import ZteRtaDriver
 
@@ -13,6 +15,28 @@ DRIVERS = [
 ]
 
 REGISTRY = {d.name: d for d in DRIVERS}
+
+# 探测结果的短期记忆：host/账号 → 驱动类。
+#
+# 为什么不缓存**实例**：客户端带着 Digest 的 nonce 计数（_nc / _nonce），
+# 两个线程同时用同一个实例会把会话搅乱。只记「这台设备是哪个驱动」就够省
+# 掉最贵的那几趟了 —— identify() 要发一次请求、撞 401、再发一次，中途可能
+# 还要走 login.cgi，是每次状态查询里最大的一块。
+#
+# 代价：60 秒内换了设备会被误判成旧驱动，此时请求会失败，重试一次即恢复。
+_DETECT_MEMO = {}
+DETECT_MEMO_SEC = 60
+
+
+def _memo_driver(host, user, password):
+    key = (host, user, password)
+    hit = _DETECT_MEMO.get(key)
+    if not hit:
+        return None
+    if time.time() - hit[0] > DETECT_MEMO_SEC:
+        _DETECT_MEMO.pop(key, None)
+        return None
+    return hit[1]
 
 
 def list_drivers():
@@ -44,9 +68,14 @@ def detect(host=None, user=None, password=None, name=None, timeout=5):
     if name:
         return get_driver_class(name)(host, user, password, timeout=timeout)
 
+    memo = _memo_driver(host, user, password)
+    if memo is not None:
+        return memo(host, user, password, timeout=timeout)
+
     for cls in DRIVERS:
         try:
             if cls.identify(host, user, password, timeout=timeout):
+                _DETECT_MEMO[(host, user, password)] = (time.time(), cls)
                 return cls(host, user, password, timeout=timeout)
         except DeviceBusy:
             raise                       # 设备可达但拒答，原因比"没驱动"重要得多

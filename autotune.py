@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -2321,6 +2321,16 @@ def _cli():
     return "mifi" if probe.is_termux() else "python autotune.py"
 
 
+def _tcp_up(host, port=80, timeout=1.0):
+    """端口通不通。只用来判断「设备回来了没有」，不读任何数据。"""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=min(timeout, 1.0)):
+            return True
+    except OSError:
+        return False
+
+
 def wait_device_back(dev, timeout=45, poll=5):
     """等设备的 web 后台重新可达。
 
@@ -2329,8 +2339,18 @@ def wait_device_back(dev, timeout=45, poll=5):
     改信道等于把手机的网先掐了，还得等系统自动重连。
     所以「发完指令立刻读状态」必然失败，那不是出错，是还没连上。
     轮询比盲睡可靠：设备 6 秒回来就不必等 26 秒。
+
+    先用 TCP 连接探活，再读状态：一次 get_state 要发 3 个请求、每个都要
+    重新认证，在这个 20~40 秒的重连窗口里按 1.5 秒轮询，光等待就能打出
+    上百个请求，还要和手机自身的重连抢带宽。端口探活便宜得多，也能探得更勤。
     """
     t0 = time.time()
+    host = getattr(dev, "host", None)
+    if host:
+        while time.time() - t0 < timeout:
+            if _tcp_up(host):
+                break
+            time.sleep(min(poll, 0.75))
     while time.time() - t0 < timeout:
         try:
             dev.get_state()
