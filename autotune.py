@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -194,6 +194,21 @@ GUARD_RESCUE_WINDOW = 900
 # provisional 标记；下次再来才补一次完整体检。理由：新地方多半只待一两小时，
 # 花 15 分钟找全局最优不划算，而「别让它自己乱跳」当场就有收益。
 GUARD_NEW_SITE = "这个位置没测过"
+
+# 新地方第二次来，能不能不再从零试一遍？
+# provisional 原来的结局是：只要没跑过完整体检，就永远是「临时记录」，下次来
+# 还是等 10 分钟 + 快测 + 锁当前这条。可餐厅这种地方天天去，昨天已经证明
+# 「在这儿锁 BAND 40 能用」—— 一次实测都没做过，却每次都要从头猜，说不过去。
+# 折中：不算速度，只看「锁住了能不能撑住」。锁住 10 分钟、链路还干净，记一次
+# 「这地方这条守得住」；攒够两次才升成正式记忆（一次可能是运气好，两次不像）。
+GUARD_CONFIRM_SEC = 600             # 锁住这么久还正常 = 这地方这条守得住一次
+GUARD_CONFIRM_LOCKS = 2             # 守得住这么多次，才升成正式记忆
+# 升成正式记忆之后，同一个地方就不必再等满 10 分钟：站够 5 分钟就锁。
+# 为什么敢缩短：10 分钟那道坎是为了「别给路过的人锁频段」，而这里是**已经**在
+# 同一个 PCI、同一条频段上守过两次的地方 —— 认得出来的场景，风险小得多。
+# 仍然只缩短到一半，且只在「当前驻留的正是那条」时生效：要切到别的频段去锁，
+# 那是另一个场景，照旧等满。
+GUARD_KNOWN_SETTLE = 300
 
 # 停下多久先「快测」当前这条（只测不锁）。实测中 的规则：人从老地方
 # 走到新地方，路上本来就是解锁状态（按信号保底有网）；停下来的地方很可能只是
@@ -3409,6 +3424,113 @@ def _band_slot(data, key, band):
     return bands.setdefault(str(int(band)), {})
 
 
+def _guard_confirmed(rec):
+    """这个位置，守护「锁住并守住了」够次数的频段。返回 (频段, 次数) 或 None。
+
+    只看守护自己攒的账（`confirmed`），不看体检数据：这是「没测过速度，但确实
+    在这儿守住了两回」的那一档，专门用来兜住 provisional 永远升不了级的问题。
+    多条都够次数时取次数最多的；一样多就取小的，保证同样的记录每次算出同一个答案。
+    """
+    best = None
+    for b, s in ((rec or {}).get("confirmed") or {}).items():
+        try:
+            n = int((s or {}).get("n") or 0)
+            band = int(b)
+        except (TypeError, ValueError):
+            continue
+        if n < GUARD_CONFIRM_LOCKS:
+            continue
+        if best is None or n > best[1] or (n == best[1] and band < best[0]):
+            best = (band, n)
+    return best
+
+
+def note_guard_confirm(key, band, loss=None, avg=None, rsrp=None):
+    """守护锁住一条频段、守住了十分钟 → 替这个位置记一次「这条能行」。
+
+    返回 (累计次数, 是否刚升成正式记忆, 没升的原因)。
+
+    为什么不写速度、也不动 ok：这里没有测速，只有「锁住了没垮」。把速度格留空、
+    ok 留 0，这条记录在数据上仍然是「没实测过」—— 将来真跑一次体检，该测的
+    还是会测；但它不再是「什么都不知道」，够两次就能当记忆用。
+
+    为什么不干脆凭一次就升级：一次可能是运气（那会儿基站不挤、邻居没下载），
+    两次落在不同时间点上还成立，才像「这地方这频段就是能用」。
+
+    升不升级还要过 band_flap：样本是守护自己写进来的（note_band_loss），
+    要是这条在本地记着周期性掉包，攒够次数也不升 —— 否则等于亲手把一条
+    「信号好看但会掉包」的频段封成「这个位置的最优」。
+    """
+    if not key or band is None:
+        return 0, False, ""
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key))
+        if not rec:
+            # 连记录都没有：不凭一次「锁住了」就凭空造一条位置记忆。
+            # 记录本身由 mark_site_provisional / _band_slot 建，这里只管升级。
+            return 0, False, ""
+        conf = rec.setdefault("confirmed", {})
+        slot = conf.setdefault(str(int(band)), {"n": 0})
+        slot["n"] = int(slot.get("n") or 0) + 1
+        slot["last"] = datetime.now().isoformat(timespec="seconds")
+        for name, v in (("loss", loss), ("avg", avg), ("rsrp", rsrp)):
+            num = _num(v)
+            if num is not None:
+                slot[name] = int(round(num))
+        if rsrp is not None:
+            # 这条正是当前驻留的，不存在「把别人的 RSRP 记到它名下」那个坑
+            # （见 note_band_rsrp_at）。写进去下次信号闸门才有据可依。
+            v = _band_slot(data, key, band)
+            if isinstance(v, dict):
+                v["rsrp"] = v["rsrp_med"] = int(round(float(rsrp)))
+                v["rsrp_at"] = slot["last"]
+        n = slot["n"]
+        if n < GUARD_CONFIRM_LOCKS or not rec.get("provisional"):
+            save_sites(data)
+            return n, False, ""
+        v = (rec.get("bands") or {}).get(str(int(band))) or {}
+        if band_flap(v)[0] or (v.get("dead") or 0) >= DEAD_SKIP_MIN:
+            save_sites(data)
+            return n, False, (f"不升成正式记忆：记忆里 BAND {band} 在本地"
+                              f"会周期性掉包，守着好看不代表能用")
+        rec.pop("provisional", None)
+        rec["best"] = int(band)
+        rec["last"] = slot["last"]
+        rec["promoted_at"] = slot["last"]
+        save_sites(data)
+        return n, True, ""
+    except (TypeError, ValueError):
+        return 0, False, ""
+
+
+def guard_known_settle(st, serving, base):
+    """认得的位置可以少等一会儿。返回 (该等多久, 说明)。
+
+    只认两种情况同时成立：这地方被守护守住过 GUARD_CONFIRM_LOCKS 次，而且
+    **当前驻留的正是那条**。要切到别的频段去锁是另一个场景，照旧等满。
+    记忆本身还得是 fresh —— 一个月前的「守得住」不算数。
+    """
+    if base <= GUARD_KNOWN_SETTLE:
+        return base, ""
+    key = _site_key(st)
+    if not key:
+        return base, ""
+    data = load_sites()
+    rec = data.get(find_site(data, key)) or {}
+    got = _guard_confirmed(rec)
+    if not got:
+        return base, ""
+    band, n = got
+    if str(band) != str(serving):
+        return base, ""
+    if site_memory_state(rec) != "fresh":
+        return base, ""
+    return GUARD_KNOWN_SETTLE, (f"这地方守过 BAND {band} {n} 次、现在就驻留在它上面，"
+                                f"站够 {max(1, int(GUARD_KNOWN_SETTLE / 60))} 分钟就锁")
+
+
+
 def note_band_rsrp(key, band, rsrp):
     """把「此刻这条频段的信号」补进记忆，让下次的信号闸门有据可依。
 
@@ -3527,9 +3649,18 @@ def describe_site_memory(st):
         head_line = (f"位置：{head}｜记忆已过期"
                      f"（上次 {_fmt_age(site_age_hours(rec))}），下次会全部重测")
     else:
+        # 同 guard_memory_band：「测过」和「守住过」必须分开写。守护攒的
+        # confirmed 记录里没有速度，说成「测过 N 次」会让人以为这地方全测过了。
+        if _site_measured(rec):
+            how = f"{_fmt_age(site_age_hours(rec))}测过 {int(rec.get('seen') or 0)} 次"
+            tail = ""
+        else:
+            got = _guard_confirmed(rec)
+            how = f"守护守住过 {got[1]} 次、没跑过体检" if got else "没有实测数据"
+            tail = (f"，站够 {max(1, int(GUARD_KNOWN_SETTLE / 60))} 分钟就锁"
+                    if got else "")
         head_line = (f"位置：{head}｜记忆里最优 BAND {int(best)}"
-                     f"（{_fmt_age(site_age_hours(rec))}测过 "
-                     f"{int(rec.get('seen') or 0)} 次）")
+                     f"（{how}{tail}）")
         # 记忆里的「最优」会周期性掉包时，守护不会锁它，而是换记忆里另一条稳的。
         # 状态行得跟着说同一件事，否则用户看到「最优 BAND 40」、守护却锁了 3，
         # 只会以为工具又没听话。（2026-10-31 22:07 实机：BAND 40 当场测出
@@ -3627,8 +3758,16 @@ def guard_memory_band(st):
         return None, f"记忆里的最优 BAND {band} 会周期性掉包"
     nm = str(rec.get("name") or "").strip()
     where = f"「{nm}」" if nm else "这个位置"
-    return band, (f"{where} {_fmt_age(site_age_hours(rec))}测过 "
-                  f"{int(rec.get('seen') or 0)} 次，最优 BAND {band}")
+    # 「测过 N 次」和「守住过 N 次」是两件事，不能混着说：前者是真跑过体检、
+    # 每条频段都量过速度；后者只是「在这儿锁住、十分钟没垮」。写成前者就是撒谎，
+    # 而且会让人以为「这地方已经全测过了、不用再测」。
+    if _site_measured(rec):
+        how = f"{_fmt_age(site_age_hours(rec))}测过 {int(rec.get('seen') or 0)} 次"
+    else:
+        got = _guard_confirmed(rec)
+        how = (f"守护守住过 {got[1]} 次（没跑过完整体检）" if got
+               else f"{_fmt_age(site_age_hours(rec))}没测过")
+    return band, f"{where}{how}，最优 BAND {band}"
 
 
 def _guard_lock_band(dev, band):
@@ -3836,6 +3975,10 @@ def run_guard(args, cfg):
           f"或变了且链路垮了 → 解锁（设备自己换频段不算，那只是它重启射频）")
     print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
     print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
+    print(f"  认得的点（这地方同一条频段守过 {GUARD_CONFIRM_LOCKS} 次、现在正驻留在它上面）"
+          f"不用等满：站够 {int(GUARD_KNOWN_SETTLE)}s 就锁")
+    print(f"  锁住 {int(GUARD_CONFIRM_SEC / 60)} 分钟还正常 → 记一次「这儿这条守得住」，"
+          f"攒够 {GUARD_CONFIRM_LOCKS} 次就升成正式记忆")
     print("  记忆里的「最优」要是刚测出不够用 → 换记忆里的次优"
           "（信号好看不代表快：基站拥塞时 -78dBm 也可能只有 3 Mbps）")
     print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
@@ -3867,6 +4010,8 @@ def run_guard(args, cfg):
     lock_rsrp_hist = deque(maxlen=GUARD_LOCK_SIGNAL_WIN)   # 锁住这条原本有多少信号
     lock_ref_band = 0                    # 参考值是给哪条频段记的（换条就重来）
     lock_weak_hits = 0                   # 连续几拍发现「锁的这条信号塌了」
+    locked_since = 0.0                   # 这一轮锁定是从哪一刻开始的
+    lock_confirmed = False               # 这一轮锁定已经记过账了（一次锁定只记一次）
     last_beat = 0.0                      # 上一拍的开始时刻（用来发现被系统挂起）
     hangs = 0                            # 被系统挂起过几次
     next_audit = 0.0                     # 下次「锁定复核」的时刻
@@ -3941,6 +4086,10 @@ def run_guard(args, cfg):
                     lock_rsrp_hist.clear()
                     lock_weak_hits = 0
                     next_audit = now + GUARD_LOCK_AUDIT_SEC
+                    # 换了一条频段 = 新的一轮锁定：「守了多久」从头算，
+                    # 「这一轮记过账没有」也清零。
+                    locked_since = now
+                    lock_confirmed = False
                 lock_ref_band = locked_band
                 if rsrp is not None:
                     lock_rsrp_hist.append(rsrp)
@@ -3948,6 +4097,8 @@ def run_guard(args, cfg):
                 lock_ref_band = 0
                 lock_rsrp_hist.clear()
                 lock_weak_hits = 0
+                locked_since = 0.0
+                lock_confirmed = False
             lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
             lock_weak_hits = (lock_weak_hits + 1
                               if lock_signal_collapsed(lock_ref, rsrp) else 0)
@@ -4072,6 +4223,11 @@ def run_guard(args, cfg):
                 quick, quick_done = None, False     # 一动，之前那次快测就作废了
             # 没锁着才需要看记忆：锁着的时候只关心「它还能不能撑住」
             memo, memo_why = (None, "") if locked else guard_memory_band(st)
+            # 认得的位置（守护在这儿守过两次同一条，且现在就驻留在它上面）
+            # 不必等满 10 分钟：那道坎是给「路过的人」设的，而这儿已经认出来了。
+            settle_eff = settle
+            if not locked:
+                settle_eff, _ = guard_known_settle(st, serving, settle)
             # 「用户亲手指定过这条」优先级最高：--lock-band 3 是人的判断，
             # 不是程序猜的。信号闸门（差 10dB 就不锁）在这里必须让路 ——
             # 实机 2026-10-31 16:13：BAND 3 是 -103dBm、BAND 40 是 -82dBm，
@@ -4128,11 +4284,14 @@ def run_guard(args, cfg):
                 # 还有动作」。实机 2026-10-31 19:42 用户就是这么看的。
                 # 只有真要等到点才决策的状态才值得倒计时。
                 tag = "监控中"
-            elif still >= settle:
+            elif still >= settle_eff:
                 # 已经达标就别再印「2/1 分钟」——分母不动、分子一直涨，看着像坏了。
                 tag = f"静止 {int(still / 60)} 分钟（够久了）"
             else:
-                tag = f"静止 {int(still / 60)}/{max(1, int(settle / 60))} 分钟"
+                tag = f"静止 {int(still / 60)}/{max(1, int(settle_eff / 60))} 分钟"
+                if settle_eff < settle:
+                    # 分母变小了，得说清凭什么 —— 否则看的人以为是 bug。
+                    tag += "（认得的点）"
             if band_changed and not moving:
                 # 换频段和换小区都会被当成「PCI 变了」，必须分开写清楚：
                 # 前者是设备自己换频段（WiFi 会重启，那几秒必然丢包），
@@ -4145,6 +4304,30 @@ def run_guard(args, cfg):
             print(f"{_now_hm()}  {who:<18} PCI {pci if pci is not None else '—':<4} "
                   f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
                   flush=True)
+
+            # 「这地方这条守不守得住」—— 锁住十来分钟、链路还干净，就记一次。
+            # 攒够两次，这个位置就能从「临时记录」升成正式记忆，下次来不再从零试。
+            # 为什么不直接用 20 分钟复核：那要真坐满 20 分钟才跑到，一顿饭常常等不到；
+            # 而「锁了 10 分钟没垮」比「锁上那一刻信号好看」硬得多，还不额外测速。
+            if (locked and not dry and not lock_confirmed and not moving and not bad_now
+                    and locked_since and now - locked_since >= GUARD_CONFIRM_SEC
+                    and str(serving) == str(locked_band)):
+                n, promoted, blocked = note_guard_confirm(
+                    _site_key(st), locked_band, ping.get("loss"),
+                    ping.get("avg"), rsrp)
+                lock_confirmed = True
+                if n:
+                    wait = int((now - locked_since) / 60)
+                    print(f"      · 这条在本地守了 {wait} 分钟、链路还正常", flush=True)
+                    if promoted:
+                        print(f"      · 这儿攒够 {n} 次了 → 记成正式记忆，"
+                              f"下次来站 {max(1, int(GUARD_KNOWN_SETTLE / 60))} 分钟就锁",
+                              flush=True)
+                    elif blocked:
+                        print(f"      · {blocked}", flush=True)
+                    elif n < GUARD_CONFIRM_LOCKS:
+                        print(f"      · 第 {n}/{GUARD_CONFIRM_LOCKS} 次，"
+                              f"再来一次这地方就能当记性用", flush=True)
 
             # 锁定复核：锁上之后按设计就不再看记忆、不测速了，免得反复断网 ——
             # 但「人换了个地方、这条变慢、还没慢到丢包/延迟阈值」就没了出口。
@@ -4173,7 +4356,7 @@ def run_guard(args, cfg):
                     print(f"      复核结论：{mbps:.0f} Mbps，够用，继续守着", flush=True)
 
             action, why = guard_decide(
-                moving=moving, still_sec=still, settle_sec=settle, locked=locked,
+                moving=moving, still_sec=still, settle_sec=settle_eff, locked=locked,
                 bad_streak=bad_streak, cooldown_left=max(0.0, next_allowed - now),
                 outage_after_unlock=outage_after_unlock,
                 signal_collapsed=signal_collapsed)

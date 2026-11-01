@@ -1210,5 +1210,115 @@ class MemoryPortability(unittest.TestCase):
             A.import_memory({"kind": A.MEMORY_KIND, "sites": []})
 
 
+class GuardConfirm(unittest.TestCase):
+    """守护自己攒的账：同一处守过两次，就不该再当「没测过」。
+
+    实机 2026-11-01 晚上：第一次去餐厅，守护锁了 BAND 40、守了 4 分钟信号塌了
+    → 解锁。整晚没跑体检，于是这地方永远停在 provisional，下次来还得从零试。
+    可「在这儿锁住十分钟没垮」本身就是证据，攒两次足够当记性用。
+    """
+
+    KEY = "236-CMCC"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        self._p = mock.patch.object(A, "SITES", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _provisional(self, samples=None):
+        self.tmp.write_text(json.dumps({self.KEY: {
+            "seen": 0, "provisional": True, "best": 40,
+            "observed": ago(hours=1),
+            "bands": {"40": {"samples": samples or []}}}}, ensure_ascii=False),
+            encoding="utf-8")
+
+    def _rec(self):
+        return json.loads(self.tmp.read_text(encoding="utf-8"))[self.KEY]
+
+    def _st(self, band=40):
+        return {"band": band, "signal": {"pci": "236", "operator": "CMCC"}}
+
+    def test_first_confirm_does_not_promote(self):
+        self._provisional()
+        n, promoted, why = A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        self.assertEqual(n, 1)
+        self.assertFalse(promoted)
+        self.assertEqual(why, "")
+        rec = self._rec()
+        self.assertTrue(rec.get("provisional"))      # 一次不算数，仍是「没测过」
+        self.assertEqual(rec["confirmed"]["40"]["n"], 1)
+
+    def test_second_confirm_promotes(self):
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        n, promoted, _ = A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        self.assertEqual((n, promoted), (2, True))
+        rec = self._rec()
+        self.assertNotIn("provisional", rec)
+        self.assertEqual(rec["best"], 40)
+        self.assertTrue(rec.get("last"))
+        # 没测速就不许假装测过：ok 仍是 0，速度样本也没被编出来
+        self.assertEqual(rec["bands"]["40"].get("ok", 0), 0)
+        self.assertFalse(A._site_measured(rec))
+
+    def test_promoted_site_becomes_memory(self):
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        band, why = A.guard_memory_band(self._st())
+        self.assertEqual(band, 40)
+        self.assertIn("守住过", why)          # 不能吹成「测过 N 次」
+
+    def test_flapping_band_is_never_promoted(self):
+        # 丢包样本是守护自己写的（note_band_loss）：在这地方会周期性掉包，
+        # 攒够次数也不能封成「这儿的最优」，否则等于亲手把烂频段记成推荐。
+        self._provisional([[19, None, 60, 90, -80], [19, None, 80, 120, -82]])
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        n, promoted, why = A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        self.assertEqual(n, 2)
+        self.assertFalse(promoted)
+        self.assertIn("掉包", why)
+        self.assertTrue(self._rec().get("provisional"))
+
+    def test_unknown_site_is_not_invented(self):
+        self.assertEqual(A.note_guard_confirm("999-?", 40, 0, 57, -66), (0, False, ""))
+        self.assertFalse(self.tmp.exists())
+
+    def test_known_site_waits_less(self):
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        eff, why = A.guard_known_settle(self._st(40), 40, 600)
+        self.assertEqual(eff, A.GUARD_KNOWN_SETTLE)
+        self.assertIn("守过", why)
+
+    def test_other_band_still_waits_full(self):
+        # 认出来的是 BAND 40，可这回设备驻留在 3 → 要切过去，属于另一个场景，等满
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        eff, why = A.guard_known_settle(self._st(3), 3, 600)
+        self.assertEqual(eff, 600)
+        self.assertEqual(why, "")
+
+    def test_only_once_confirmed_still_waits_full(self):
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        eff, _ = A.guard_known_settle(self._st(40), 40, 600)
+        self.assertEqual(eff, 600)
+
+    def test_user_settle_shorter_than_known_wins(self):
+        # --guard-settle 120 是人自己调的，比「认得的点」还短，不能被它拉长
+        self._provisional()
+        A.note_guard_confirm(self.KEY, 40, 0, 57, -66)
+        A.note_guard_confirm(self.KEY, 40, 0, 61, -68)
+        eff, why = A.guard_known_settle(self._st(40), 40, 120)
+        self.assertEqual(eff, 120)
+        self.assertEqual(why, "")
+
+
 if __name__ == "__main__":
     unittest.main()
