@@ -1347,3 +1347,29 @@ class DevicePinTTL(unittest.TestCase):
             note = A.pin_note()
         self.assertIn("BAND 3", note)
         self.assertIn("超过", note)
+
+
+class QuickLineFormat(unittest.TestCase):
+    """快测那行字得能看懂。
+
+    实机日志里出现过「两次 3 / 0，两次差 10.3 倍」—— 0 其实是 0.29 Mbps，
+    被四舍五入成了 0。0 和 3 之间「差 10.3 倍」，看的人只会以为程序算错了。
+    """
+
+    def test_sub_one_is_not_shown_as_zero(self):
+        q = {"band": 40, "ok": False, "grade": "poor", "mbps": 1.6,
+             "samples": [3.0, 0.29], "avg": 87, "loss": 0}
+        line = A.quick_line(q)
+        self.assertIn("<1", line)
+        self.assertNotIn("两次 3 / 0", line)
+
+    def test_normal_values_stay_integers(self):
+        q = {"band": 40, "ok": True, "grade": "good", "mbps": 32.4,
+             "samples": [31.0, 33.0], "avg": 60, "loss": 0}
+        self.assertIn("32 Mbps", A.quick_line(q))
+
+    def test_missing_speed(self):
+        q = {"band": 40, "ok": False, "grade": "poor", "samples": [],
+             "avg": None, "loss": 100}
+        line = A.quick_line(q)
+        self.assertIn("延迟 不通", line)

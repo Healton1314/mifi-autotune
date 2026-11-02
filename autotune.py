@@ -2940,6 +2940,23 @@ def lock_collapse_cause(*, lock_ref, cur_rsrp, locked_band, pci_changed,
     return f"信号从 {int(lock_ref)} 掉到 {cur_rsrp}dBm，多半是走开了"
 
 
+def _mbps_text(v):
+    """速度数字的显示格式。
+
+    0.4 Mbps 印成「0」是错的 —— 实测日志里出现过「两次 3 / 0，两次差 10.3 倍」，
+    0 和 3 差 10 倍这件事，看的人只会以为程序算错了。低于 1 就写「<1」。
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if v <= 0:
+        return "0"
+    if v < 1:
+        return "<1"
+    return f"{v:.0f}"
+
+
 def quick_line(q):
     """把一次快测结果排成一行人话。
 
@@ -2950,13 +2967,13 @@ def quick_line(q):
     gcn = {"good": "明确够用", "fair": "勉强够用",
            "unknown": "测不准（两次差太多）", "poor": "不够用"}
     g = q.get("grade") or ("good" if q.get("ok") else "poor")
-    sam = " / ".join(f"{x:.0f}" for x in (q.get("samples") or []))
+    sam = " / ".join(_mbps_text(x) for x in (q.get("samples") or []))
     vals = [x for x in (q.get("samples") or []) if x]
     spread = ""
     if len(vals) >= 2 and min(vals) > 0 and max(vals) / min(vals) >= 1.5:
         spread = f"，两次差 {max(vals) / min(vals):.1f} 倍"
     lat = f"{q['avg']}ms" if q.get("avg") is not None else "不通"
-    return (f"{float(q.get('mbps') or 0):.0f} Mbps（两次 {sam}{spread}）｜ "
+    return (f"{_mbps_text(q.get('mbps'))} Mbps（两次 {sam}{spread}）｜ "
             f"延迟 {lat} ｜ 丢包 {q.get('loss')}% → {gcn.get(g, g)}"
             f"（{'先不动它' if q.get('ok') else '坐久了会重新选'}）")
 
@@ -4211,9 +4228,23 @@ def run_guard(args, cfg):
                       f"（正常约 {interval} 秒）—— 这段时间被系统挂起了，没在采样",
                       flush=True)
                 if hangs == 1:
-                    print("      手机把 Termux 放后台就会冻结它。两个开关任选："
-                          "下拉通知栏点 Termux 的 Acquire wakelock；"
-                          "或 设置 → 应用 → Termux → 电池 → 不受限制", flush=True)
+                    print("      这段时间它没在看。让它别被冻住：设置 → 应用 → 本应用 →"
+                          " 电池 → 不受限制（Termux 里跑的话就点通知栏的 Acquire wakelock）",
+                          flush=True)
+                # 冻结期间一拍都没采，旧信息全部作废 —— 人可能已经走了、设备可能
+                # 已经换了小区。不重置的话，醒来第一拍 still 会是个巨大的数，
+                # 直接满足「坐满 10 分钟」→ 立刻下锁，锁的还是冻结前那个位置的
+                # 结论。实机 2026-11-02 出现 238 秒空档的那次就埋着这个风险。
+                last_beat = now
+                stable_since = now
+                pci_log.clear()
+                move_rsrp_hist.clear()
+                quick, quick_done = None, False
+                # 冻了这么久，Digest nonce 多半也过期了，别拿旧的去撞一次
+                drop = getattr(dev, "drop_session", None) if dev else None
+                if drop:
+                    drop()
+                continue        # 这一拍不作决策，立刻重新采一次
             last_beat = now
             if dev is None:
                 try:
@@ -4489,6 +4520,13 @@ def run_guard(args, cfg):
             elif still >= settle_eff:
                 # 已经达标就别再印「2/1 分钟」——分母不动、分子一直涨，看着像坏了。
                 tag = f"静止 {int(still / 60)} 分钟（够久了）"
+                _cd = max(0.0, next_allowed - now)
+                if _cd > 0:
+                    # 坐够了但还在冷却里。不写出来的话，看的人只会觉得
+                    # 「明明够久了，它怎么不锁」—— 实机 2026-11-02 09:22~09:24
+                    # 连着三行「静止 25/26/27 分钟（够久了）」，一锁都没下，
+                    # 屏幕上没有任何解释（解锁后那 300 秒冷却）。
+                    tag += f"（冷却中，{int(_cd)}s 后可动）"
             else:
                 tag = f"静止 {int(still / 60)}/{max(1, int(settle_eff / 60))} 分钟"
                 if settle_eff < settle:

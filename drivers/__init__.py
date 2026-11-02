@@ -23,37 +23,43 @@ REGISTRY = {d.name: d for d in DRIVERS}
 _DETECT_MEMO = {}
 DETECT_MEMO_SEC = 60
 
-# 每个线程一份驱动实例，连着 Digest 会话一起复用。
+# 一个进程只留一份驱动实例，连着 Digest 会话一起复用。
 #
-# 为什么必须按线程分：客户端带着 nonce 计数（_nonce / _nc），两个线程同时推进
-# 同一个计数，设备立刻判会话失效。所以「复用」和「线程安全」在这里是同一件事，
-# 不能只做一半。
+# 为什么不是「每线程一份」（2026-11-01 到 11-02 之间试过那版）：
+# 会话是设备侧的一份共享状态，两个线程各持一份，就是两个管理员会话在互相顶。
+# 实测（PC 直连 192.168.0.1，模拟 App 里守护线程 3 秒 / 界面线程 5 秒的节奏）：
 #
-# 为什么非复用不可（2026-11-01 实测，PC 直连设备）：
-#   get_state() 本身只要 3 个请求、约 2.7 秒；
-#   可每建一次会话，还要再花 4 个请求、约 1 秒去「撞 401 → login.cgi → 验一次」。
-#   而界面每 5 秒查一次状态，等于每秒都在为同一个会话反复付钱 —— 用户感受到的
-#   就是「点一下先卡几秒」。会话留着，这一整块就没了。
+#     各持一份：avg 4.49s / 5.21s，max 7.88s / 9.23s
+#     共用一份：avg 3.66s / 3.70s，max 4.48s / 6.05s   （单线程稳态 2.66s）
 #
-# 会话失效（设备重启射频、被浏览器后台顶掉）时不用特殊处理：客户端自己的
-# get() 会丢 nonce、重新挑战、必要时重新登录。
-_LOCAL = threading.local()
+# 各持一份时，两边都在替对方付「会话被顶掉 → 重新登录」的钱。共用 + 方法级锁
+# （见 base._serialized）之后，这件事就没了。
+#
+# 为什么值得这么在意：界面每 5 秒查一次状态，守护每 30 秒查一次，一次会话要
+# 4 个请求、约 1 秒；不复用等于一直在为同一个会话反复付费，用户感受到的就是
+# 「点一下先卡几秒」。
+_SHARED = {}
+_SHARED_LOCK = threading.RLock()
 
 
-def _thread_cache():
-    d = getattr(_LOCAL, "by_key", None)
-    if d is None:
-        d = _LOCAL.by_key = {}
-    return d
+def _shared_cache():
+    return _SHARED
 
 
-def forget_thread_driver(host=None, user=None, password=None):
-    """丢掉本线程缓存的实例。换设备、或怀疑会话已经不可用时调用。"""
-    cache = _thread_cache()
-    if host is None:
-        cache.clear()
-    else:
-        cache.pop((host, user, password), None)
+def forget_driver(host=None, user=None, password=None):
+    """丢掉缓存的实例。换设备、或怀疑会话已经不可用时调用。
+
+    注意它不再区分线程 —— 缓存本来就是进程级的一份。
+    """
+    with _SHARED_LOCK:
+        if host is None:
+            _SHARED.clear()
+        else:
+            _SHARED.pop((host, user, password), None)
+
+
+# 旧名字，外部和测试里用过；行为一致，别让调用方去找新名字。
+forget_thread_driver = forget_driver
 
 
 def _memo_driver(host, user, password):
@@ -97,40 +103,40 @@ def detect(host=None, user=None, password=None, name=None, timeout=5):
         return get_driver_class(name)(host, user, password, timeout=timeout)
 
     key = (host, user, password)
-    cache = _thread_cache()
-    hit = cache.get(key)
-    if hit is not None:
-        # 与驱动记忆同一个节拍失效：万一换了一台设备（同 IP 不同固件），
-        # 最多 60 秒就能自愈，不会在这一条线程上永久卡着旧会话。
-        if time.time() - hit[0] <= DETECT_MEMO_SEC:
-            return hit[1]
-        cache.pop(key, None)
+    with _SHARED_LOCK:
+        hit = _SHARED.get(key)
+        if hit is not None:
+            # 与驱动记忆同一个节拍失效：万一换了一台设备（同 IP 不同固件），
+            # 最多 60 秒就能自愈，不会永久卡着旧会话。
+            if time.time() - hit[0] <= DETECT_MEMO_SEC:
+                return hit[1]
+            _SHARED.pop(key, None)
 
-    memo = _memo_driver(host, user, password)
-    if memo is not None:
-        dev = memo(host, user, password, timeout=timeout)
-        cache[key] = (time.time(), dev)
-        return dev
+        memo = _memo_driver(host, user, password)
+        if memo is not None:
+            dev = memo(host, user, password, timeout=timeout)
+            _SHARED[key] = (time.time(), dev)
+            return dev
 
-    for cls in DRIVERS:
-        try:
-            # 驱动若能在探测时把「已认证的会话」交回来，就用它构造 —— 否则这里
-            # 等于让用户为同一个会话付两次钱（见 zte_rta.identify_client）。
-            prober = getattr(cls, "identify_client", None)
-            ok, client = prober(host, user, password, timeout=timeout) if prober else (
-                cls.identify(host, user, password, timeout=timeout), None)
-            if ok:
-                _DETECT_MEMO[(host, user, password)] = (time.time(), cls)
-                if client is not None:
-                    dev = cls(host, user, password, timeout=timeout, client=client)
-                else:
-                    dev = cls(host, user, password, timeout=timeout)
-                cache[key] = (time.time(), dev)
-                return dev
-        except DeviceBusy:
-            raise                       # 设备可达但拒答，原因比"没驱动"重要得多
-        except Exception:  # noqa: BLE001
-            continue
+        for cls in DRIVERS:
+            try:
+                # 驱动若能在探测时把「已认证的会话」交回来，就用它构造 —— 否则这里
+                # 等于让用户为同一个会话付两次钱（见 zte_rta.identify_client）。
+                prober = getattr(cls, "identify_client", None)
+                ok, client = prober(host, user, password, timeout=timeout) if prober else (
+                    cls.identify(host, user, password, timeout=timeout), None)
+                if ok:
+                    _DETECT_MEMO[(host, user, password)] = (time.time(), cls)
+                    if client is not None:
+                        dev = cls(host, user, password, timeout=timeout, client=client)
+                    else:
+                        dev = cls(host, user, password, timeout=timeout)
+                    _SHARED[key] = (time.time(), dev)
+                    return dev
+            except DeviceBusy:
+                raise                       # 设备可达但拒答，原因比"没驱动"重要得多
+            except Exception:  # noqa: BLE001
+                continue
     # 走到这里有两种完全不同的原因，必须分开说：设备就在那儿但驱动不认识，
     # 还是**根本没连上它**。实机 2026-10-30 21:43（手机）：换完频段 WiFi 还没
     # 重连，守护连打四行「没有驱动认得这台设备」，看起来像工具坏了，其实只是

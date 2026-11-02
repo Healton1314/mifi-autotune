@@ -75,8 +75,19 @@ class DetectMemo(unittest.TestCase):
         self.assertEqual(dev.name, "zte_rta")
         self.assertIs(dev, again)
 
-    def test_other_thread_gets_its_own_instance(self):
-        """跨线程绝不能共用：两个线程同时推进 nonce 计数，设备直接判会话失效。"""
+    def test_other_thread_shares_the_same_instance(self):
+        """跨线程共用一份会话，靠 base 的方法级锁串行 —— 不是各持一份。
+
+        上一版是「每线程一份」，理由是「两个线程同时推进 nonce 计数会判会话失效」。
+        担心是对的，解法错了：各持一份等于两个管理员会话互相顶，双方都在替对方付
+        重登的钱。实测（PC 直连设备，守护线程 3s / 界面线程 5s 的节奏）：
+
+            各持一份：avg 4.49s / 5.21s，max 7.88s / 9.23s
+            共用一份：avg 3.66s / 3.70s，max 4.48s / 6.05s   （单线程 2.66s）
+
+        串行由 base.DeviceDriver.__init_subclass__ 自动套在会碰设备的方法上，
+        所以「共用」和「不并发推进 nonce」同时成立。
+        """
         with mock.patch.object(drivers.ZteRtaDriver, "identify_client",
                                side_effect=_probe_ok):
             mine = self._detect()
@@ -84,9 +95,50 @@ class DetectMemo(unittest.TestCase):
             t = threading.Thread(target=lambda: other.append(self._detect()))
             t.start()
             t.join()
-        self.assertIsNot(mine, other[0])
+        self.assertIs(mine, other[0])
 
-    def test_thread_cache_expires_with_memo(self):
+    def test_device_methods_are_serialized(self):
+        """两个线程同时读状态，不能同时进驱动内部。
+
+        这条防的是「只加了缓存、忘了加锁」：那样两个线程会共用同一个实例却仍
+        并发推进 nonce，症状是偶发变慢，不报错，极难查。
+        """
+        import drivers.base as base
+
+        inside, overlapped = [], []
+
+        class Fake(base.DeviceDriver):
+            name = "fake"
+
+            def identify(self, *a, **kw):
+                return True
+
+            def get_state(self):
+                if inside:
+                    overlapped.append(1)
+                inside.append(1)
+                time.sleep(0.05)
+                inside.pop()
+                return {}
+
+            def capabilities(self):
+                return {}
+
+            def set_band(self, band):
+                pass
+
+            def set_channel(self, ch):
+                pass
+
+        d = Fake()
+        ts = [threading.Thread(target=d.get_state) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(overlapped, [])
+
+    def test_shared_cache_expires_with_memo(self):
         """缓存过期后重建实例：换了一台设备（同 IP 不同固件）也能自愈。"""
         drivers.DETECT_MEMO_SEC = 0
         with mock.patch.object(drivers.ZteRtaDriver, "identify_client",
