@@ -41,7 +41,19 @@ def init(files_dir=""):
     """
     if files_dir:
         os.environ["MIFI_FILES_DIR"] = files_dir
-    return _dumps({"files": os.environ.get("MIFI_FILES_DIR", "")})
+        # 运行期文件（记忆、配置、账本、日志）搬到应用私有目录。
+        #
+        # 不能留在代码目录：那是 Chaquopy 的解包目录，**每次装新版本都会被
+        # 重新解包并清空**。实测中 一天丢了两回 —— 住处的
+        # `pin_band: 3`、sites.json 的位置记忆、刚攒的账本，装完新包全没了。
+        # autotune.set_data_dir 会把老目录里的文件搬过来（首次升级不丢数据）。
+        try:
+            data = autotune.set_data_dir(os.path.join(files_dir, "data"))
+            server.set_data_dir(data)
+        except Exception as e:  # noqa: BLE001
+            return _dumps({"files": files_dir, "data": "", "error": str(e)})
+    return _dumps({"files": os.environ.get("MIFI_FILES_DIR", ""),
+                   "data": str(autotune.DATA_DIR)})
 
 
 # ---------------- 状态与结论 ----------------

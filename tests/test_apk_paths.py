@@ -135,3 +135,63 @@ class LogSurvivesRestart(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DataDir(unittest.TestCase):
+    """运行期文件必须放在「升级不会清空」的地方。
+
+    2026-11-02 一天丢了两回：sites.json、config.json 里的 pin_band、刚攒的账本。
+    原因是它们写在 Chaquopy 的解包目录里，而那个目录每次装新包都会被整个换掉。
+    """
+
+    NAMES = ("DATA_DIR", "STATE", "LOG", "CONFIG", "PLAN", "CHANNEL_ADVICE",
+             "SITES", "DECISIONS")
+
+    def setUp(self):
+        self.old = {n: getattr(A, n) for n in self.NAMES}
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old_dir = self.tmp / "code_dir"
+        self.new_dir = self.tmp / "files" / "data"
+        self.old_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        for n, v in self.old.items():
+            setattr(A, n, v)
+
+    def test_paths_move(self):
+        A.set_data_dir(self.new_dir)
+        self.assertEqual(A.DATA_DIR, self.new_dir)
+        self.assertEqual(A.SITES, self.new_dir / "sites.json")
+        self.assertEqual(A.DECISIONS, self.new_dir / "decisions.json")
+        self.assertEqual(A.CONFIG, self.new_dir / "config.json")
+        self.assertEqual(A.PLAN, self.new_dir / "plan.json")
+
+    def test_migrates_old_files(self):
+        A.set_data_dir(self.old_dir)
+        A.SITES.write_text('{"236-CMCC": {"best": 3}}', encoding="utf-8")
+        A.CONFIG.write_text('{"pin_band": 3}', encoding="utf-8")
+        A.set_data_dir(self.new_dir)
+        self.assertEqual(A.SITES.read_text(encoding="utf-8"),
+                         '{"236-CMCC": {"best": 3}}')
+        self.assertEqual(A.CONFIG.read_text(encoding="utf-8"), '{"pin_band": 3}')
+
+    def test_never_overwrites_existing(self):
+        A.set_data_dir(self.new_dir)
+        A.SITES.write_text('{"new": 1}', encoding="utf-8")
+        A.set_data_dir(self.old_dir)
+        (self.old_dir / "sites.json").write_text('{"old": 1}', encoding="utf-8")
+        A.set_data_dir(self.new_dir)
+        self.assertEqual(A.SITES.read_text(encoding="utf-8"), '{"new": 1}')
+
+    def test_server_audit_log_moves_too(self):
+        old = S.AUDIT_LOG
+        try:
+            S.AUDIT_LOG = self.old_dir / "run-log.txt"
+            S.AUDIT_LOG.write_text("旧日志\n", encoding="utf-8")
+            S._TAIL = None
+            S.set_data_dir(self.new_dir)
+            self.assertEqual(S.AUDIT_LOG, self.new_dir / "run-log.txt")
+            self.assertIn("旧日志", S.AUDIT_LOG.read_text(encoding="utf-8"))
+        finally:
+            S.AUDIT_LOG = old
+            S._TAIL = None

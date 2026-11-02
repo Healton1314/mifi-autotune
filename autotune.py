@@ -35,13 +35,22 @@ from drivers import detect, list_drivers
 from drivers.base import DeviceBusy, DeviceUnreachable, Unsupported
 
 HERE = Path(__file__).resolve().parent
-STATE = HERE / "state.json"
-LOG = HERE / "autotune-log.jsonl"
-CONFIG = HERE / "config.json"
+
+# 运行期文件（记忆、配置、账本、日志）放哪个目录。
+#
+# 默认就是代码目录（电脑上当脚本跑，行为和以前一样）。但 APK 里**必须换掉**：
+# Chaquopy 把 Python 解包到 files/chaquopy/AssetFinder/app，每次装新版本都会
+# 重新解包、把那个目录清空 —— 实测中 一天里就丢了两回：住处的
+# `pin_band: 3`、sites.json 的位置记忆、还有下午刚攒的账本，全没了。
+# 现在由 bridge.init() 调 set_data_dir() 指到应用私有目录（files/），升级不再动它。
+DATA_DIR = HERE
+STATE = DATA_DIR / "state.json"
+LOG = DATA_DIR / "autotune-log.jsonl"
+CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.19"
+__version__ = "0.9.20"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -67,16 +76,16 @@ BAND_RSRP_DROP = 10
 MAX_USABLE_LOSS = 20                # 丢包 ≥20%：带宽数字再好看也不能选
 MAX_USABLE_PING_MS = 800            # 延迟 ≥800ms：同上
 OBSERVE_SEC = 90                    # 应用后盯多久，确认「能一直通」
-PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
-CHANNEL_ADVICE = HERE / "channel_advice.json"   # 「扫描信道」的建议，单独存
-SITES = HERE / "sites.json"         # 位置记忆：每个 PCI 下哪些频段有覆盖、哪个最好
+PLAN = DATA_DIR / "plan.json"       # 体检结论，供「一键应用」复用
+CHANNEL_ADVICE = DATA_DIR / "channel_advice.json"   # 「扫描信道」的建议，单独存
+SITES = DATA_DIR / "sites.json"     # 位置记忆：每个 PCI 下哪些频段有覆盖、哪个最好
 # 「为什么锁这条」的账本，**故意不和 sites.json 放一起**。
 #
 # 2026-11-02 实机踩到：守护线程和界面/状态查询线程各自「读文件 → 改 → 写回」，
 # 后写的一方拿的是自己读到的旧快照，于是刚记下的账目被整段覆盖掉 —— 界面里
 # 就是「明明锁过，账本还是空的」。两个线程写同一个 JSON 就会这样。
 # 账本是只追加的，给它一个自己的文件，就不会被别人的读改写连累。
-DECISIONS = HERE / "decisions.json"
+DECISIONS = DATA_DIR / "decisions.json"
 
 # 守护模式（--watch）的劣化判定阈值。
 # 三段式：min(上限, max(基线×倍数, 下限))
@@ -1149,6 +1158,43 @@ def load_sites():
         return json.loads(SITES.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def set_data_dir(root):
+    """把运行期文件换到 root 下（APK 里由 bridge.init 调用）。
+
+    为什么要搬：老版本把 sites.json / config.json 写在代码解包目录里，
+    那儿每次升级都会被清空。第一次切过来时如果新目录还是空的，就把老目录里
+    那份复制过来 —— 用户的记忆不该因为一次搬迁丢掉。
+
+    返回真正生效的目录。
+    """
+    global DATA_DIR, STATE, LOG, CONFIG, PLAN, CHANNEL_ADVICE, SITES, DECISIONS
+    root = Path(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return DATA_DIR                    # 建不出来就维持原样，别把功能弄挂
+    old_root = DATA_DIR
+    DATA_DIR = root
+    STATE = root / "state.json"
+    LOG = root / "autotune-log.jsonl"
+    CONFIG = root / "config.json"
+    PLAN = root / "plan.json"
+    CHANNEL_ADVICE = root / "channel_advice.json"
+    SITES = root / "sites.json"
+    DECISIONS = root / "decisions.json"
+    if old_root != root:
+        for name in ("state.json", "autotune-log.jsonl", "config.json",
+                     "plan.json", "channel_advice.json", "sites.json",
+                     "decisions.json"):
+            src, dst = old_root / name, root / name
+            try:
+                if src.exists() and not dst.exists():
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+    return DATA_DIR
 
 
 def save_sites(data):

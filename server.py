@@ -147,7 +147,8 @@ def _env():
 # 运行日志只存在内存里 —— App 进程一被系统回收，历史就没了。实测中
 # 下午跑完守护再回来问「日志还在吗」，只能答「没了」，而那时正好在排查问题。
 # 这里同时落一份到磁盘（滚动保留最近 AUDIT_KEEP 行），重开 App 还能翻到上一次。
-AUDIT_LOG = HERE / "run-log.txt"
+DATA_DIR = HERE                     # 运行期文件目录，APK 里由 set_data_dir 换掉
+AUDIT_LOG = DATA_DIR / "run-log.txt"
 AUDIT_KEEP = 600
 _TAIL = None
 _TAIL_LOCK = threading.Lock()
@@ -178,6 +179,26 @@ def log(line):
             AUDIT_LOG.write_text("\n".join(tail) + "\n", encoding="utf-8")
         except OSError:
             pass
+
+
+def set_data_dir(root):
+    """运行期文件换目录（和 autotune.set_data_dir 配套，由 bridge.init 调）。"""
+    global DATA_DIR, AUDIT_LOG, _TAIL
+    root = Path(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return DATA_DIR
+    old = AUDIT_LOG
+    DATA_DIR = root
+    AUDIT_LOG = root / "run-log.txt"
+    _TAIL = None                        # 让下次 log() 重新从新路径读
+    try:
+        if old.exists() and not AUDIT_LOG.exists():
+            AUDIT_LOG.write_text(old.read_text(encoding="utf-8"), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+    return DATA_DIR
 
 
 def saved_log():
@@ -454,7 +475,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if path == "/api/scan":
                     return self._json(self.api_scan())
                 if path == "/api/plan":
-                    plan = HERE / "plan.json"
+                    plan = autotune.PLAN
                     if plan.exists():
                         try:
                             return self._json({"plan": json.loads(plan.read_text(encoding="utf-8"))})
