@@ -340,5 +340,35 @@ class MeasureEta(unittest.TestCase):
         self.assertEqual(A._measure_eta(), "约 5~8 分钟")
 
 
+class NoCooldownNoiseWhenLocked(unittest.TestCase):
+    """锁稳了就别再喊「冷却中」。
+
+    实机 2026-11-02 20:01~20:07：BAND 3 锁好之后屏幕上连着五行
+    「→ 冷却中（269s）(228s)(186s)…」，看着像还在等什么，其实无事可做。
+    """
+
+    def test_locked_does_not_report_cooldown(self):
+        action, why = A.guard_decide(
+            moving=False, still_sec=600, settle_sec=600, locked=True,
+            bad_streak=0, cooldown_left=269, outage_after_unlock=False)
+        self.assertIsNone(action)
+        self.assertNotIn("冷却", why)
+
+    def test_unlocked_still_reports_cooldown(self):
+        action, why = A.guard_decide(
+            moving=False, still_sec=600, settle_sec=600, locked=False,
+            bad_streak=0, cooldown_left=269, outage_after_unlock=False)
+        self.assertIsNone(action)
+        self.assertIn("冷却", why)
+
+    def test_locked_still_unlocks_on_outage(self):
+        """别把自救也挡掉了：锁着但连续不通，冷却期里照样要解。"""
+        action, _ = A.guard_decide(
+            moving=False, still_sec=600, settle_sec=600, locked=True,
+            bad_streak=A.GUARD_BAD_HITS, cooldown_left=269,
+            outage_after_unlock=False)
+        self.assertEqual(action, "unlock")
+
+
 if __name__ == "__main__":
     unittest.main()

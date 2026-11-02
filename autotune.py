@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.22"
+__version__ = "0.9.23"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -3291,7 +3291,11 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
             return None, ("解锁后仍然不通，而且整条链路此刻是断的 —— 体检只会测出 0，"
                           "先等网络恢复（不反复折腾设备）")
         return "measure", f"解锁后仍然 {bad_streak} 次不通 —— 不是频段问题，换一个试试"
-    if cooldown_left > 0:
+    if cooldown_left > 0 and not locked:
+        # 锁着的时候不报「冷却中」。冷却管的是「别反复主动切频段」，而已经锁好
+        # 的状态本来就没有动作可做 —— 报出来只是噪音。实机 2026-11-02
+        # 20:01~20:07 锁稳 BAND 3 之后，屏幕上连着五行
+        # 「→ 冷却中（269s）(228s)(186s)…」，看着像还在等什么，其实什么都不用做。
         return None, f"冷却中（{int(cooldown_left)}s）"
     if not moving and not locked and still_sec >= settle_sec:
         return "lock", f"原地待了 {int(still_sec / 60)} 分钟，该把频段定下来了"
