@@ -4594,6 +4594,9 @@ def run_guard(args, cfg):
           f"（只测不切：够不够用，不够就换备选/解锁）")
     print(f"  Ctrl+C 停止（按不出来就在另一个窗口跑 mifi --stop）"
           f"{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
+    # 打上版本号：APK 里 Python 是打进 assets 的，装完新包到底跑的是哪一版，
+    # 光看界面看不出来（Kotlin 换新了、pyc 还是旧的那种情况排查起来极费劲）。
+    print(f"  引擎版本 {__version__}")
     print("=" * 62, flush=True)
     # 把「你亲手钉的那条」是什么时候设的说出来。实测中 在办公区眼看着
     # 程序要锁 BAND 40、结果被改成 BAND 3，屏幕上完全没有线索说明为什么 ——
