@@ -14,8 +14,12 @@
 
     <!-- 体检要连跑 3~6 分钟，中间还要断网重连，没有前台服务会被系统杀掉 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 起前台服务必须声明类型，守护归 specialUse（见下面 service） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 引导用户把本应用加进电池优化白名单；不给也能跑，只是更容易被冻住 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="@string/app_name"
@@ -33,5 +37,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            守护模式的保活服务。守护本身是进程内的 Python 线程，没有它托着，
+            用户一退后台进程就被冻住 —— 实机日志里 238 秒的采样空档就是这么来的。
+        -->
+        <service
+            android:name=".GuardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="WiFi 频段守护：持续采样信号与链路质量，按位置变化自动释放频段锁" />
+        </service>
     </application>
 </manifest>

@@ -467,11 +467,53 @@ class MemoIsTheServingBand(unittest.TestCase):
             memo_rsrp=-78, cur_rsrp=-78, alt_band=3)
         self.assertEqual((band, kind), (40, "memo"))
 
-    def test_pin_still_wins(self):
+    def test_pin_still_wins_over_memory(self):
+        """pin 和「记忆说的最优」冲突时，pin 赢 —— 这条没变。
+
+        记忆是程序自己攒的；pin 是人亲手测过、比过之后留下的。
+        """
         band, kind = A.guard_pick_lock(
-            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo=3, memo_mbps=44.6, serving=40, quick=self._q(40, 32.0, "good"),
             memo_rsrp=-78, cur_rsrp=-78, alt_band=3, pinned_band=40)
         self.assertEqual((band, kind), (40, "pinned"))
+
+    def test_pin_yields_when_that_band_measures_bad(self):
+        """pin 的那条**此刻就在用**、却刚测出 3 Mbps → 不再盲从。
+
+        实机 2026-11-02：办公区里程序算出来该锁 BAND 40，被 10-31 设的
+        `--lock-band 3` 直接改成 BAND 3，而 BAND 3 当时 -99dBm、快测 2 Mbps。
+        这时的矛盾不是「程序猜 vs 人说的」，而是「上一次说的」vs「此刻的实测」。
+        """
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78, pinned_band=40)
+        self.assertEqual(kind, "memo_bad")
+        self.assertIsNone(band)
+
+    def test_pin_yields_to_alt_when_that_band_measures_bad(self):
+        # 同上，但记忆里还有一条能换 → 先换过去，别锁这条烂的
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=40)
+        self.assertEqual((band, kind), (8, "memo_bad_alt"))
+
+    def test_pin_is_kept_when_we_are_not_on_it(self):
+        """pin 的不是当前这条 → 无法当场证伪，照办（换过去再看）。
+
+        此时手里的快测测的是 serving，对 pin 那条什么也没说。
+        """
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=3)
+        self.assertEqual((band, kind), (3, "pinned"))
+
+    def test_pin_yields_when_link_is_dropping_packets(self):
+        """pin 那条正在丢一半以上的包，就别等快测了 —— 现在就不行。"""
+        band, kind = A.guard_pick_lock(
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 30.0, "good"),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=40,
+            cur_loss=80)
+        self.assertEqual((band, kind), (8, "memo_bad_alt"))
 
 
 class PlanLockReadsAltFromMemory(unittest.TestCase):
@@ -598,6 +640,66 @@ class MovingDetection(unittest.TestCase):
         # 2 次还是放行：住处坐着不动，设备自己在两个扇区之间重选也能凑到 2 次
         self.assertFalse(self._move(churn=True, pci_changed=True, churn_n=2))
 
+    def test_two_cells_when_locked_is_moving(self):
+        """锁着频段的时候，2 次就够。
+
+        设备被锁住之后换不了频段，剩下能变的只有「同频段内换小区」—— 这种情况
+        要么人挪了位置，要么信号掉到边缘触发重选。
+
+        2026-11-02 上午的漏判就是这样：08:22 锁 BAND 3，一路上换了两个小区、
+        链路一直还行（延迟 72~85ms、丢包 0%），三个判据全不成立，人走了 57 分钟
+        没被发现，屏幕一直写「监控中」，09:19 才解开。
+        """
+        self.assertTrue(self._move(churn=True, pci_changed=True, churn_n=2,
+                                   locked=True))
+
+    def test_one_cell_when_locked_is_not_moving(self):
+        # 只跳了一次不认：单次重选在静止时很常见
+        self.assertFalse(self._move(churn=False, pci_changed=True, churn_n=1,
+                                    locked=True))
+
+    def test_falling_signal_when_locked_is_moving(self):
+        """换着小区、信号还一路往下 —— 走出覆盖的形状，链路没垮也认。
+
+        走出一栋楼时对面小区照样能给你 -100dBm、延迟 80ms，「PCI 变了 + 链路垮」
+        永远等不到，于是人明明在走，守护一路「监控中」。
+        """
+        self.assertTrue(self._move(churn=False, pci_changed=True, churn_n=1,
+                                   locked=True, rsrp_falling=True))
+
+    def test_falling_signal_alone_is_not_moving(self):
+        # 没有换小区、只是信号在掉 → 可能是基站侧的事，不动
+        self.assertFalse(self._move(churn=False, pci_changed=False,
+                                    rsrp_falling=True, locked=True))
+
+
+class FallingSignal(unittest.TestCase):
+    """RSRP 是「一路走低」还是「跳一下」，形状不一样。"""
+
+    def test_monotonic_drop_is_falling(self):
+        self.assertTrue(A.rsrp_is_falling([-78, -85, -92]))
+
+    def test_big_drop_over_more_samples(self):
+        self.assertTrue(A.rsrp_is_falling([-61, -70, -80, -95]))
+
+    def test_reselection_plateau_is_not_falling(self):
+        # 设备重选到弱小区：-89 → -105 之后稳在 -105，不是一路走低
+        self.assertFalse(A.rsrp_is_falling([-89, -105, -105]))
+
+    def test_small_drop_is_not_falling(self):
+        # 累积只掉 4dB，抖动范围内
+        self.assertFalse(A.rsrp_is_falling([-80, -82, -84]))
+
+    def test_rising_is_not_falling(self):
+        self.assertFalse(A.rsrp_is_falling([-95, -85, -78]))
+
+    def test_not_enough_samples(self):
+        self.assertFalse(A.rsrp_is_falling([-78, -92]))
+        self.assertFalse(A.rsrp_is_falling([]))
+
+    def test_none_entries_are_skipped(self):
+        self.assertTrue(A.rsrp_is_falling([-78, None, -85, -92]))
+
 
 class StillReset(unittest.TestCase):
     """「坐满 10 分钟才锁」不能被移动判定的尾巴拖长。
@@ -628,6 +730,25 @@ class StillReset(unittest.TestCase):
         # 实机 21:46 这一下白等了 2 分钟；设备要是爱换，就永远坐不满 10 分钟。
         self.assertFalse(A.guard_still_reset(pci_changed=True, moving=False,
                                             band_changed=True))
+
+    def test_weak_evidence_does_not_reset(self):
+        """放宽后的「移动」不能顺带清零。
+
+        实测中 的原话：「不想它识别不出我在移动，但也不想它一直判我在动、
+        坐不到十分钟一直不锁」。两件事的代价不对称：多解锁一次只是几十秒，清零
+        却要人从头再坐十分钟。所以解锁用宽判据，清零只认严格那套。
+        """
+        self.assertFalse(A.guard_still_reset(pci_changed=True, moving=True,
+                                             strong_moving=False))
+
+    def test_strong_evidence_still_resets(self):
+        # 真在走（严格判据也成立）→ 照常清零
+        self.assertTrue(A.guard_still_reset(pci_changed=True, moving=True,
+                                            strong_moving=True))
+
+    def test_omitting_strong_falls_back_to_moving(self):
+        # 不传就是旧行为，别把别处的调用悄悄改掉
+        self.assertTrue(A.guard_still_reset(pci_changed=True, moving=True))
 
     def test_ten_minutes_means_ten_minutes(self):
         # 每秒一拍地模拟：第 0 秒换过小区，之后 moving 还要挂 300 秒。
@@ -1187,3 +1308,42 @@ class QuickLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DevicePinTTL(unittest.TestCase):
+    """「你亲手钉的那条」也要有时效。
+
+    实机 2026-11-02 办公区：程序算出来该锁 BAND 40（那是当场实测的结论），
+    被 10-31 在住处设的 `--lock-band 3` 直接改成 BAND 3 —— 而当时 BAND 3
+    是 -99dBm、快测 2 Mbps。屏幕上没有任何线索说明为什么。
+
+    一次 --lock-band 说的是「当时、那个地方」。放一周还照样压过所有判断，
+    等于让一条旧命令永远赢。
+    """
+
+    def _pin(self, cfg):
+        with mock.patch.object(A, "load_config", return_value=cfg):
+            return A.device_pin()
+
+    def _at(self, days):
+        return (A.datetime.now() - A.timedelta(days=days)).isoformat(timespec="seconds")
+
+    def test_recent_pin_is_honoured(self):
+        self.assertEqual(self._pin({"pin_band": 3, "pin_at": self._at(1)}), 3)
+
+    def test_expired_pin_is_ignored(self):
+        self.assertIsNone(self._pin({"pin_band": 3, "pin_at": self._at(30)}))
+
+    def test_pin_without_timestamp_is_ignored(self):
+        # 老版本写的数据说不清是什么时候钉的，而那恰恰是最可能过时的一批
+        self.assertIsNone(self._pin({"pin_band": 3}))
+
+    def test_no_pin(self):
+        self.assertIsNone(self._pin({}))
+
+    def test_pin_note_explains_expiry(self):
+        with mock.patch.object(A, "load_config",
+                               return_value={"pin_band": 3, "pin_at": self._at(30)}):
+            note = A.pin_note()
+        self.assertIn("BAND 3", note)
+        self.assertIn("超过", note)

@@ -102,7 +102,13 @@ class MainActivity : Activity() {
         thread(name = "py-init") {
             runCatching { Py.start(this) }
                 .onFailure { Log.e(TAG, "Python 启动失败", it) }
-            Main.post { refreshStatus() }
+            Main.post {
+                refreshStatus()
+                // 守护有可能是「上次开着、App 被系统回收、服务又被 START_STICKY
+                // 拉起来」的状态。这时开关默认是关的，界面会说「关着」，可它其实
+                // 在跑 —— 用户会以为没生效，再点一次开关反而重复启动。开机对一次。
+                syncGuardOnce()
+            }
         }
 
         Main.post(pollStatus)
@@ -393,6 +399,8 @@ class MainActivity : Activity() {
                     if (!o.optBoolean("running")) {
                         if (guardOn) {
                             guardOn = false
+                            // 线程没了，前台服务还挂着只会留一条骗人的通知
+                            GuardService.stop(this@MainActivity)
                             swGuard.setOnCheckedChangeListener(null)
                             swGuard.isChecked = false
                             swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean ->
@@ -893,12 +901,47 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 打开 App 时对一次守护的真实状态。
+     *
+     * 两种情况会不一致：
+     *   · 守护还在跑、但界面是新起的（开关默认关着）→ 要拨成开；
+     *   · 守护已经没了、通知还挂着 → 要把服务收掉。
+     * 不和的话，用户会看到「关着」却一直在跑，点开关等于又启动一次。
+     */
+    private fun syncGuardOnce() {
+        Py.callFast(this, "guard_state") { txt ->
+            val o = json(txt) ?: return@callFast
+            val running = o.optBoolean("running")
+            if (running) {
+                guardOn = true
+                swGuard.setOnCheckedChangeListener(null)
+                swGuard.isChecked = true
+                swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean ->
+                    toggleGuard(x)
+                }
+                // 服务不一定还在（进程被杀过），补起来
+                GuardService.start(this@MainActivity)
+            } else {
+                GuardService.stop(this@MainActivity)
+            }
+        }
+    }
+
     private fun toggleGuard(on: Boolean) {
         if (on) {
             tvGuardHint.text = "正在启动…"
+            // 顺序很讲究：前台服务必须从**前台**的 Activity 起来（Android 12+
+            // 不许后台启动前台服务），所以先起服务、再起 Python 线程。
+            // 起反了的话，guard_start 会在别的线程跑，那会儿 Activity 可能已经
+            // 退到后面，服务就起不来 —— 表现是「开关亮着，一按 Home 就停」。
+            GuardService.start(this)
+            askNotificationPermission()
             Py.call(this, "guard_start") { txt ->
                 val o = json(txt)
                 if (o?.optBoolean("ok", false) != true) {
+                    // 没起来就把服务收掉，别留一条「守护在跑」的通知骗人
+                    GuardService.stop(this@MainActivity)
                     swGuard.setOnCheckedChangeListener(null)
                     swGuard.isChecked = false
                     swGuard.setOnCheckedChangeListener { _: CompoundButton, x: Boolean -> toggleGuard(x) }
@@ -908,15 +951,65 @@ class MainActivity : Activity() {
                     tvGuardHint.text = "运行中 · 你走动时它会松开频段锁"
                     // 这里不主动把日志区拉出来：守护第一行输出要等它连上设备，
                     // 先摆一个空黑框只会让人以为又卡住了。日志一到 showJob 会显示。
+                    suggestBatteryUnrestricted()
                 }
             }
         } else {
             guardOn = false
             tvGuardHint.text = "正在停…"
+            // 先撤服务，再停线程：反过来会有一小段时间「线程还在跑，但已经不算
+            // 前台」，那几秒正好是最容易被系统抓住杀掉的时候。
+            GuardService.stop(this)
             Py.call(this, "guard_stop") { _ ->
                 tvGuardHint.text = "关着"
             }
         }
+    }
+
+    /**
+     * Android 13+ 没给通知权限的话，前台服务的通知不显示，但服务仍然在跑。
+     * 不显示等于用户没法从通知栏看到「它还在」，也没法一眼确认它还活着 ——
+     * 所以请求一次，拒了也不影响功能。
+     */
+    private fun askNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 12)
+    }
+
+    /**
+     * 问一次「要不要把它加进电池优化白名单」。
+     *
+     * 前台服务能挡住 AOSP 的回收，但挡不住 MIUI 自己那层省电策略 —— 实机日志里
+     * 那次 238 秒的采样空档就是它干的。这一步能明显减少那种情况，所以值得多问
+     * 一次；用户拒绝也不影响其他功能，只是后台被冻的概率高一些。
+     *
+     * 只问一次：记在 SharedPreferences 里，别每次开守护都弹，那会变成骚扰。
+     */
+    private fun suggestBatteryUnrestricted() {
+        val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val sp = getSharedPreferences("mifi", MODE_PRIVATE)
+        if (sp.getBoolean("asked_battery", false)) return
+        sp.edit().putBoolean("asked_battery", true).apply()
+
+        AlertDialog.Builder(this)
+            .setTitle("让它一直在后台跑")
+            .setMessage(
+                "守护要靠每 30 秒采一次样才知道你有没有在走动。\n\n" +
+                "系统默认会把这类的后台活动冻住——日志里已经出现过一次" +
+                "「隔了 238 秒才醒来」的记录，那段时间它在睡觉，你走了它也不知道。\n\n" +
+                "把本应用设为「不受电池优化限制」能明显减少这种情况。")
+            .setPositiveButton("去设置") { _, _ ->
+                runCatching {
+                    startActivity(android.content.Intent(
+                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        android.net.Uri.parse("package:$packageName")))
+                }
+            }
+            .setNegativeButton("先不用", null)
+            .show()
     }
 
     // ---------------- 小工具 ----------------

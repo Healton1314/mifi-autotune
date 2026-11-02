@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.10"
+__version__ = "0.9.11"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -171,6 +171,26 @@ GUARD_LOCK_SIGNAL_WIN = 4           # 参考值取锁定后最近几拍里最好
 # 为什么不是 GUARD_MOVE_HITS(2)：住处坐着不动，设备自己在两个扇区之间重选也能
 # 凑到 2 次（2026-10-31 实机坐了 144 分钟被误判移动）。3 次基本只有真走路才有。
 GUARD_MOVE_CHURN_ONLY = 3
+# 「你亲手钉的那条频段」多久之后不再自动生效。
+# 一次 --lock-band 说的是「当时、那个地方」。住处里 BAND 3 好，不等于一周后办公区
+# 里的 BAND 3 也好 —— 而 pin 现在排在所有判断之前，连刚测出来的数据都推翻。
+# 实机 2026-11-02：办公区里程序算出来该锁 BAND 40，被 10-31 设的 pin 直接改成 3。
+GUARD_PIN_TTL_DAYS = 7
+# 锁着频段时的门槛，比上面那条松一档。
+#
+# 依据：设备被锁住之后**换不了频段**，剩下能变的只有「同频段内换小区」。而锁定
+# 期间同频段换小区，要么是人挪了位置，要么是信号掉到边缘触发了重选 —— 后者在
+# 一个坐着不动的位置上很少连续发生。所以锁定时 2 次就够当证据。
+#
+# 代价不对称：漏判一次，人带着住处那条锁在路上/办公区里待一整天（2026-11-02 上午
+# 就是这样，08:22 锁 BAND 3，09:19 才解开，中间 57 分钟全是「监控中」）；误判
+# 一次，只是丢掉锁、重新等 10 分钟。所以宁可松一档。
+GUARD_MOVE_CHURN_LOCKED = 2
+# 锁着的时候还有一条独立线索：信号一路走低。人走出覆盖时 RSRP 是单调往下掉的，
+# 而设备自己重选到弱小区是「跳」一下就不是了（-89 → -105 之后一直 -105）。
+# 所以要求连续几拍都在降、且累计掉够，才算「在往外走」。
+GUARD_MOVE_RSRP_WIN = 3             # 看最近几拍（约 90 秒）
+GUARD_MOVE_RSRP_DROP = 8            # 累计掉这么多 dB 且每拍都在降 = 人在往外走
 # 锁定之后每隔这么久复核一次「锁定这条还够不够用」。
 # 为什么必须有：锁上之后就再也不看记忆、不测速了（设计如此，免得反复断网），
 # 于是「人换了个地方、这条变慢但还没到丢包/延迟阈值」这种情况没有任何出口。
@@ -2818,7 +2838,28 @@ def _pci_num(v):
         return None
 
 
-def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False, churn_n=0):
+def rsrp_is_falling(hist, drop=GUARD_MOVE_RSRP_DROP):
+    """信号是不是在「一路走低」。hist 是最近几拍的 RSRP（新→旧都行，按时间顺序）。
+
+    为什么要单独一条：锁着频段时链路（丢包/延迟）往往是好的 —— 走出一栋楼，
+    对面小区照样给你 -100dBm、延迟 80ms。这时候「PCI 变了 + 链路没垮」的判据
+    全部落空，人明明在走，守护却一路「监控中」。
+
+    和「设备重选到弱小区」的区别在形状：重选是**跳一下**（-89 → -105 之后稳在
+    -105），人是**一路往下**（-78 → -85 → -92 → -100）。所以要求每一拍都比上
+    一拍低，且累计掉够 drop —— 单调下降这个条件把绝大部分重选挡在外面。
+    """
+    vals = [v for v in hist if v is not None]
+    if len(vals) < 3:
+        return False
+    for a, b in zip(vals, vals[1:]):
+        if b >= a:                      # 有一拍没降就不算「一路」
+            return False
+    return (vals[0] - vals[-1]) >= drop
+
+
+def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False, churn_n=0,
+                    locked=False, rsrp_falling=False):
     """人到底动没动。抽成纯函数，因为这条判断直接决定「要不要解锁」。
 
     PCI 变只是**必要条件**。2026-10-30 的实测推翻了这个假设：坐在住处里、
@@ -2840,6 +2881,15 @@ def guard_is_moving(*, churn, pci_changed, bad_now, band_changed=False, churn_n=
         # 先判这一条，再判「换了几次小区」。设备自己换频段时 PCI 必变、
         # churn 必定累积，人却坐着没动 —— 2026-10-31 15:59 就是这么被解锁的。
         return False
+    if locked and churn_n >= GUARD_MOVE_CHURN_LOCKED:
+        # 锁着频段时门槛降一档，理由见 GUARD_MOVE_CHURN_LOCKED。
+        # 2026-11-02 上午漏判的就是这条：锁 BAND 3 期间换了 2 个小区、链路一直
+        # 还行（延迟 72~85ms、丢包 0%），于是三个判据全不成立，人走了 57 分钟
+        # 没被发现，屏幕一直写「监控中」。
+        return True
+    if locked and rsrp_falling and pci_changed:
+        # 换着小区、信号还一路往下 —— 走出覆盖的形状。链路没垮也认。
+        return True
     if churn and bad_now:
         # 光「换了几次小区」不够：2026-10-31 实机在住处坐了 144 分钟，
         # 设备在两个扇区之间自己重选，5 分钟内变 2 次 → churn 成立 → 判「移动中」，
@@ -3175,7 +3225,7 @@ def clear_site_pins(reason=""):
 
 
 def device_pin():
-    """设备级「上次你亲手指定的频段」。None = 没指定过。
+    """设备级「上次你亲手指定的频段」。None = 没指定过（或已经过期）。
 
     为什么不能只靠 site_pinned：那个挂在 `PCI-运营商` 键上，而 PCI 是**当前驻留
     小区**，同一条频段才有意义。锁 BAND 3 读到 350，设备回 auto 后驻留 BAND 40
@@ -3185,12 +3235,55 @@ def device_pin():
 
     人说的是「这台设备要 3」，不是「这个小区的这条记录要 3」。所以另存一份设备级，
     放在 config.json 里，跟位置无关；`--restore` 会清掉它（那是「我要 auto」的意思）。
+
+    **时效**：一次 `--lock-band` 说的只是「当时、那个地方」。住处里 BAND 3 好，不
+    等于一周后办公区里的 BAND 3 也好；而这条 pin 会一直压在所有判断之上（连刚测出
+    来的数据都推翻）。所以超过 GUARD_PIN_TTL_DAYS 天就不再自动生效 —— 想继续用
+    就再设一次，那本来也只要一条命令。
     """
     try:
-        b = load_config().get("pin_band")
-        return int(b) if b else None
+        cfg = load_config()
+        b = cfg.get("pin_band")
+        if not b:
+            return None
+        if _pin_age_days(cfg) > GUARD_PIN_TTL_DAYS:
+            return None
+        return int(b)
     except (TypeError, ValueError):
         return None
+
+
+def _pin_age_days(cfg):
+    """这条 pin 是几天前设的。没有时间戳（老版本写的）一律当作「已经过期」。
+
+    老数据说不清是什么时候钉的，而它恰恰是最可能过时的那一批 —— 2026-10-31 设的
+    BAND 3，到 11-02 还在推翻「办公区该锁 BAND 40」的结论。宁可让它失效一次，
+    让实测重新说话。
+    """
+    at = cfg.get("pin_at")
+    if not at:
+        return 1e9
+    try:
+        t = datetime.fromisoformat(str(at))
+    except (TypeError, ValueError):
+        return 1e9
+    return (datetime.now() - t).total_seconds() / 86400.0
+
+
+def pin_note():
+    """给日志用的一句话：这条 pin 是哪天设的、还剩多久。空字符串 = 没有 pin。"""
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return ""
+    b = cfg.get("pin_band")
+    if not b:
+        return ""
+    age = _pin_age_days(cfg)
+    if age > GUARD_PIN_TTL_DAYS:
+        return (f"BAND {b}（{int(age)} 天前设的，已超过 {GUARD_PIN_TTL_DAYS} 天，"
+                f"这次按实测重新判断）")
+    return f"BAND {b}（{int(age)} 天前设的）"
 
 
 def set_device_pin(band):
@@ -3200,6 +3293,7 @@ def set_device_pin(band):
     try:
         cfg = load_config()
         cfg["pin_band"] = int(band)
+        cfg["pin_at"] = datetime.now().isoformat(timespec="seconds")
         cfg["pin_fails"] = 0
         save_config(cfg)
     except (OSError, TypeError, ValueError):
@@ -3315,17 +3409,38 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       keep      记忆有值，但当前这条刚量出来不比它差多少 → 留在当前，不切
       memo      记忆里的最优明显更快且信号不差 → 切过去（值得断那几秒）
       quick     没有可信记忆，但当前快测够用 → 先锁当前，下次来再全比
-      pinned    用户用 --lock-band 亲手指定过 → 照办，不过信号闸门
+      pinned    用户用 --lock-band 亲手指定过 → 照办；
+                但「这条此刻就驻留在上面、刚测出来又不行」时不再照办，
+                让实测说话（换备选或跑体检）。pin 本身的时效由 device_pin() 把关。
       memo_bad     记忆里的最优就是当前这条，可它刚被实测判为不够用 → 跑体检
       memo_bad_alt 同上，但记忆里还有一条能换 → 换过去，别锁这条
     返回 (None, None) 表示信息不够，该老老实实跑一次完整体检。
     """
+    # 「当前这条够用吗」。快测说够用还不够，得看**此刻**的链路：
+    # 2026-10-31 17:34:21 实机，BAND 40 明明在丢 100% 的包，快测那个数字是
+    # 几分钟前量的，于是照样判「当前够用」→ 17:45 锁回了这条烂频段。
+    # 正在大量丢包的链路不能算够用，哪怕它刚才测出来挺快。
+    #
+    # 这两个值要放在「用户亲手钉的」之前算：pin 也得过这道闸门，见下面。
+    dropped = cur_loss is not None and cur_loss >= GUARD_BAD_LOSS
+    cur_ok = bool(quick and quick.get("ok") and serving
+                  and quick.get("band") == serving and not dropped)
+    cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
     # ⓪ 用户亲手钉的优先。放在所有启发式之前：那些规则是「程序猜」，而
     #    --lock-band 是「人已经测过、比过了、不想再被劝」。
+    #
+    #    但「人说的」也有失效的时候 —— 一种例外：
+    #    这条 pin 此刻就驻留在上面，而且刚测出来它不行。这时的矛盾不是「程序
+    #    猜 vs 人说的」，而是「你 10-31 在住处说的」vs「你现在坐的这条链路的
+    #    实测」。实测赢：让它落到下面的正常逻辑（换备选或跑体检）。
+    #    实机 2026-11-02 办公区：程序算出来该锁 BAND 40，被这条 pin 改成 BAND 3，
+    #    而当时 BAND 3 是 -99dBm、快测 2 Mbps。
+    #    （pin 本身的时效由 device_pin() 把关，超过 GUARD_PIN_TTL_DAYS 就返回 None，
+    #      根本到不了这里。）
     if pinned_band:
-        if str(serving) != str(pinned_band):
-            return int(pinned_band), "pinned"
-        return int(serving), "pinned"
+        same_as_pin = str(serving) == str(pinned_band)
+        if not (same_as_pin and not cur_ok):
+            return int(serving if same_as_pin else pinned_band), "pinned"
     # ⓪c 当前驻留这条在记忆里「会周期性掉包」→ 信号再强也不留。
     #     2026-10-31 21:14 实机：BAND 40 是 -77dBm、比记忆里的 BAND 3 强 21dB，
     #     信号闸门（差超过 10dB 就留在当前）当场放行，锁定 BAND 40；
@@ -3333,14 +3448,6 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     #     独立的事，而后者只有历史样本看得出来 —— RSRP 再漂亮也证明不了。
     if (memo is not None and cur_flap and str(serving) != str(memo)):
         return int(memo), "flap_avoid"
-    # 「当前这条够用吗」。快测说够用还不够，得看**此刻**的链路：
-    # 2026-10-31 17:34:21 实机，BAND 40 明明在丢 100% 的包，快测那个数字是
-    # 几分钟前量的，于是照样判「当前够用」→ 17:45 锁回了这条烂频段。
-    # 正在大量丢包的链路不能算够用，哪怕它刚才测出来挺快。
-    dropped = cur_loss is not None and cur_loss >= GUARD_BAD_LOSS
-    cur_ok = bool(quick and quick.get("ok") and serving
-                  and quick.get("band") == serving and not dropped)
-    cur_mbps = float(quick.get("mbps") or 0) if cur_ok else 0.0
     # ⓪b 记忆里的「最优」正好就是当前驻留的这条，而刚才的实测判它不够用。
     #     这是被「基站拥塞」咬得最准的一种情况：信号指标漂亮，速度塌了。
     #     2026-10-31 20:13 实机就长这样 —— BAND 40 是 -78dBm / SINR 21dB（比
@@ -3350,7 +3457,10 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     #     量出来的数字」。眼前这个数字必须赢，否则一整晚都卡在这条上。
     if (memo is not None and str(serving) == str(memo)
             and quick and quick.get("band") == serving
-            and _quick_grade(quick) == "poor"):
+            and (_quick_grade(quick) == "poor" or dropped)):
+        # dropped 也算：快测那个数字是几分钟前量的，此刻这条已经在丢一半以上的
+        # 包了。上面「正在大量丢包的链路不能算够用」这句话，在这里同样成立 ——
+        # 否则 pin 让路之后，这一条又会把它锁回去，等于白让。
         if alt_band:
             return int(alt_band), "memo_bad_alt"
         return None, "memo_bad"
@@ -3976,7 +4086,8 @@ def _release_wakelock():
         pass
 
 
-def guard_still_reset(*, pci_changed, moving, band_changed=False):
+def guard_still_reset(*, pci_changed, moving, band_changed=False,
+                      strong_moving=None):
     """这一拍要不要把「静止计时」清零。
 
     只在**位置信息真的变了**时清：人在动、且 PCI 确实换了。**不能写 if moving** ——
@@ -3991,14 +4102,27 @@ def guard_still_reset(*, pci_changed, moving, band_changed=False):
     锁着 BAND 40，40 丢包 100%，第一拍就把已经攒够的静止时间清零回 0/10，
     人还坐在原处没动。链路垮是链路的事，它该走「换备选 / 解锁自救」那条路；
     顺手把「我在这儿坐够了」这个已经成立的结论作废，只是让人白等。
+
+    **strong_moving：清零要用的证据比解锁更硬**。
+    实测中 把取舍说得很清楚：「不想它识别不出我在移动，但也不想它
+    一直判我在动、坐不到十分钟一直不锁」。这两件事的代价完全不对称：
+
+      · 误判「在动」→ 只是解锁一次，设备自己换频段，几十秒就回来了；
+      · 误判「位置变了」→ 把已经攒了九分钟的静止时间清零，人就得从头再坐。
+
+    所以解锁用宽的判据（锁定期间 2 次小区就算），清零只认窄的那套 ——
+    `moving_strict` 就是没放宽的那个结论。人在走时它同样成立，所以不会漏；
+    坐着被误判时它不成立，于是计时照常往前走，坐满十分钟照样能锁。
     """
     if band_changed:
         return False
+    if strong_moving is None:
+        strong_moving = moving
     # 「PCI 变了」本身也不清。设备会在两个扇区之间自己重选，人还坐在原处：
     # 2026-10-31 实机静止 144 分钟（早够 10 分钟了），15:59 设备换了个小区，
     # 计时直接归零、回到「未锁 0/10」，等于白等。真正人在动时 pci_changed 与
     # moving 必然同时成立，所以这一条就够了。
-    return bool(pci_changed and moving)
+    return bool(pci_changed and moving and strong_moving)
 
 
 def run_guard(args, cfg):
@@ -4016,6 +4140,11 @@ def run_guard(args, cfg):
     print(f"  每 {interval}s 起一轮采样（PCI + 延迟/丢包），平时不测速")
     print(f"  在动：{GUARD_MOVE_WINDOW}s 内 PCI 变 {GUARD_MOVE_CHURN_ONLY} 次，"
           f"或变了且链路垮了 → 解锁（设备自己换频段不算，那只是它重启射频）")
+    print(f"        锁着的时候门槛降到 {GUARD_MOVE_CHURN_LOCKED} 次 —— 锁住之后设备"
+          f"换不了频段，同频段还换小区基本就是人在挪；"
+          f"信号一路走低 {GUARD_MOVE_RSRP_DROP}dB 也算")
+    print(f"        但「坐够了」的计时不会因为放宽而清零：清零只认严格那套，"
+          f"免得一直被误判、坐不满 {int(settle)}s")
     print(f"  停下 {int(quick_sec)}s：先快测当前这条（约 20 秒，只测不锁）—— 很可能只是路过")
     print(f"  坐满 {int(settle)}s：才锁 —— 先拿记忆里的最优跟当前的信号/速度比，都不合适才跑体检")
     print(f"  认得的点（这地方同一条频段守过 {GUARD_CONFIRM_LOCKS} 次、现在正驻留在它上面）"
@@ -4031,6 +4160,12 @@ def run_guard(args, cfg):
     print(f"  Ctrl+C 停止（按不出来就在另一个窗口跑 mifi --stop）"
           f"{'  ｜ 演练模式：只报告，不改设备' if dry else ''}")
     print("=" * 62, flush=True)
+    # 把「你亲手钉的那条」是什么时候设的说出来。实测中 在办公区眼看着
+    # 程序要锁 BAND 40、结果被改成 BAND 3，屏幕上完全没有线索说明为什么 ——
+    # 不说清楚，下次还是同一个疑问。
+    _pin = pin_note()
+    if _pin:
+        print(f"  你亲手指定的频段：{_pin}", flush=True)
 
     _install_stop_signals()
 
@@ -4039,6 +4174,8 @@ def run_guard(args, cfg):
 
     dev = None
     last_pci, last_rsrp, stable_since, pci_log = None, None, time.time(), deque()
+    # 最近几拍的 RSRP，只用来判「信号是不是一路走低」（见 rsrp_is_falling）。
+    move_rsrp_hist = deque(maxlen=GUARD_MOVE_RSRP_WIN)
     last_serving = None
     last_key = ""
     bad_streak, next_allowed = 0, 0.0
@@ -4229,6 +4366,7 @@ def run_guard(args, cfg):
                 last_pci = pci
             if rsrp is not None:
                 last_rsrp = rsrp
+                move_rsrp_hist.append(rsrp)
             while pci_log and now - pci_log[0] > GUARD_MOVE_WINDOW:
                 pci_log.popleft()
 
@@ -4241,9 +4379,19 @@ def run_guard(args, cfg):
                 last_serving = serving
 
             churn = len(pci_log) >= GUARD_MOVE_HITS
+            rsrp_falling = rsrp_is_falling(move_rsrp_hist)
+            # 两套判据，用途不同 —— 这是「既不漏判、又不永远坐不满」的关键：
+            #   moving        要不要解锁。锁定时放宽（GUARD_MOVE_CHURN_LOCKED）。
+            #   moving_strict 要不要把「我在这儿坐够了」作废。永远用严格那套。
+            # 放宽只会带来「多解锁一次」，代价几十秒；而清零会让人从头再坐十分钟。
+            moving_strict = guard_is_moving(churn=churn, pci_changed=pci_changed,
+                                            bad_now=bad_now,
+                                            band_changed=band_changed,
+                                            churn_n=len(pci_log))
             moving = guard_is_moving(churn=churn, pci_changed=pci_changed,
                                      bad_now=bad_now, band_changed=band_changed,
-                                     churn_n=len(pci_log))
+                                     churn_n=len(pci_log), locked=locked,
+                                     rsrp_falling=rsrp_falling)
             if pci_changed and not moving:
                 # 人没动、设备自己换的小区 → 记进同一处，这地方以后认得它
                 note_cell_change(last_key, _site_key(st))
@@ -4256,7 +4404,8 @@ def run_guard(args, cfg):
             # 丢包/延迟也不清了：2026-10-31 17:39 锁着 BAND 40、40 丢包 100%，
             # 第一拍就把坐够的时间作废，人还在原地。
             if guard_still_reset(pci_changed=pci_changed, moving=moving,
-                                 band_changed=band_changed):
+                                 band_changed=band_changed,
+                                 strong_moving=moving_strict):
                 stable_since = now
             still = now - stable_since
             outage_after_unlock = (unlocked_at is not None
@@ -4320,7 +4469,17 @@ def run_guard(args, cfg):
             if place:
                 who += f"·{place}"
             if moving:
-                tag = "移动中"
+                # 把「凭什么判的移动」说出来。实测中 在路上看到一整屏
+                # 「监控中」，既不知道有没有在判、也不知道差多少才够 —— 判据
+                # 藏在代码里，等于没法验证。
+                why = []
+                if locked and len(pci_log) >= GUARD_MOVE_CHURN_LOCKED:
+                    why.append(f"锁定期间换了 {len(pci_log)} 个小区")
+                if rsrp_falling:
+                    first = next((v for v in move_rsrp_hist if v is not None), None)
+                    if first is not None and rsrp is not None:
+                        why.append(f"信号一路走低 {int(first)}→{int(rsrp)}dBm")
+                tag = "移动中" + (f"（{'，'.join(why)}）" if why else "")
             elif locked:
                 # 锁着的时候这个倒计时不驱动任何事（锁定的分支里根本不读记忆、
                 # 也不会再锁一次），印「静止 0/10 分钟」只会让人以为「再过十分钟
