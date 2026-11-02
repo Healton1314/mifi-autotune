@@ -6,9 +6,11 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
@@ -261,17 +263,18 @@ class MainActivity : Activity() {
         verdictBox.addView(tvVerdict)
         verdictBox.addView(tvVerdictSub)
 
-        // 两个按钮并排，一样大：应用 / 不用。
-        // 建议就是建议，不是命令 —— 拒绝的入口不能藏成一行小字，那样等于没有。
-        // 结论出现时主按钮藏起来，界面上永远只有一组动作，不会让人对着
-        // 「应用结论」和「应用建议」两个键发愣。
+        // 两个按钮并排，但**不是**一样大：应用占两份宽、不用了占一份。
+        // 实测中 的原话是「应用建议的按钮不好看，换一个」—— 原来两个
+        // 键各占一半、都是实心色块，看着像两个同等分量的选项；可「应用」和
+        // 「不用了」从来不等价，一个是执行结论，一个是让它过去。
+        // 拒绝的入口仍然是一个正经按钮，不缩成一行小字（那样等于没有）。
         val acts = row()
-        btnApply = actionButton("应用建议", true)
+        btnApply = verdictButton("应用建议", true)
         btnApply.setOnClickListener { applyNow() }
-        btnDecline = actionButton("不用了", false)
+        btnDecline = verdictButton("不用了", false)
         btnDecline.setOnClickListener { declineVerdict() }
         acts.addView(btnApply, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f).apply { topMargin = dp(14) })
         acts.addView(spacerW(10))
         acts.addView(btnDecline, LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
@@ -311,10 +314,8 @@ class MainActivity : Activity() {
 
         swGuard = Switch(this).apply {
             isChecked = false
-            // 整个开关交给下面那行来点：MIUI 上这个控件对合成的触摸事件经常
-            // 不响应（真机 + adb input tap 实测：点标题、点开关本体都没反应，
-            // 而同一屏的 TextView 按钮一点就开）。用户多半也是点「守护模式」
-            // 这四个字，而不是那个小滑块，所以整行可点本来就更该有。
+            // 整行都可点：用户要开守护，多半是去点「守护模式」那四个字，而不是
+            // 右下角那个小滑块。只让 Switch 响应的话，点文字等于没反应。
             isClickable = false
             isFocusable = false
             setOnCheckedChangeListener { _: CompoundButton, on: Boolean -> toggleGuard(on) }
@@ -1182,6 +1183,45 @@ class MainActivity : Activity() {
         col.addView(v)
         parent.addView(col)
         return v
+    }
+
+    /**
+     * 体检结论下面那两个键。
+     *
+     * 和主按钮（[actionButton]）分开写，因为这两个是「对一句话表态」，
+     * 需要一眼看出主次：
+     *   · 主键：渐变蓝 + 轻微上浮 + 按下去有水波纹，占两份宽；
+     *   · 次键：白底细描边，占一份宽 —— 看得见、点得到，但不抢注意力。
+     */
+    private fun verdictButton(text: String, primary: Boolean) = TextView(this).apply {
+        this.text = text
+        gravity = Gravity.CENTER
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, if (primary) 16f else 14f)
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(if (primary) Color.WHITE else INK)
+        val shape = GradientDrawable().apply {
+            cornerRadius = dp(16).toFloat()
+            if (primary) {
+                // 斜向渐变比纯色更有「按一下会发生事情」的感觉，也不至于太花。
+                orientation = GradientDrawable.Orientation.TL_BR
+                colors = intArrayOf(Color.parseColor("#4C8DFF"),
+                                    Color.parseColor("#1657E0"))
+            } else {
+                setColor(Color.WHITE)
+                setStroke(dp(1), Color.parseColor("#DFE2E8"))
+            }
+        }
+        background = RippleDrawable(
+            ColorStateList.valueOf(
+                if (primary) Color.parseColor("#40FFFFFF")
+                else Color.parseColor("#14000000")), shape, null)
+        if (primary) elevation = dp(6).toFloat()
+        setPadding(dp(16), dp(15), dp(16), dp(15))
+        isClickable = true
+        isFocusable = true
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
     }
 
     private fun actionButton(text: String, primary: Boolean) = TextView(this).apply {
