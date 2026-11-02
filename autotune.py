@@ -2818,7 +2818,7 @@ def watch(args, cfg):
                     hist.clear()
                     jit_hist.clear()
                 next_allowed = time.time() + cooldown
-            time.sleep(interval)
+            time.sleep(interval)     # watch 模式不认 _GUARD_STOP，别拿它当等待
     except KeyboardInterrupt:
         print("\n[守护模式] 已停止")
         return 0
@@ -4256,7 +4256,7 @@ def run_guard(args, cfg):
                     # 「WiFi 还没连上」还是「设备在重启」。
                     print(f"{_now_hm()}  连不上设备：{e or type(e).__name__}"
                           f"，5 秒后重试", flush=True)
-                    time.sleep(5)
+                    _GUARD_STOP.wait(5)
                     continue
             try:
                 st = dev.get_state()
@@ -4264,7 +4264,7 @@ def run_guard(args, cfg):
                 print(f"{_now_hm()}  设备暂时无响应（{type(e).__name__}），稍后重连",
                       flush=True)
                 dev = None
-                time.sleep(interval)
+                _GUARD_STOP.wait(interval)
                 continue
 
             ping = probe.ping_stats(10, host)
@@ -4823,7 +4823,10 @@ def run_guard(args, cfg):
                     quick, quick_done = None, False
 
                 next_allowed = time.time() + GUARD_COOLDOWN
-            time.sleep(interval)
+            # 用 Event.wait 而不是 time.sleep：关掉守护时线程要能立刻醒来退出。
+            # 原来最坏要等满一个采样间隔（30 秒）—— 用户点了开关，界面上写着
+            # 「正在停…」，那半分钟里进程已经不是前台了，正是最容易被杀的时候。
+            _GUARD_STOP.wait(interval)
     except KeyboardInterrupt:
         _release_wakelock()
         print("\n[守护] 已停止（设备保持当前配置）")
