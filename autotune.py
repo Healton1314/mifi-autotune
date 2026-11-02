@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.17"
+__version__ = "0.9.18"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -69,6 +69,13 @@ OBSERVE_SEC = 90                    # 应用后盯多久，确认「能一直通
 PLAN = HERE / "plan.json"           # 体检结论，供「一键应用」复用
 CHANNEL_ADVICE = HERE / "channel_advice.json"   # 「扫描信道」的建议，单独存
 SITES = HERE / "sites.json"         # 位置记忆：每个 PCI 下哪些频段有覆盖、哪个最好
+# 「为什么锁这条」的账本，**故意不和 sites.json 放一起**。
+#
+# 2026-11-02 实机踩到：守护线程和界面/状态查询线程各自「读文件 → 改 → 写回」，
+# 后写的一方拿的是自己读到的旧快照，于是刚记下的账目被整段覆盖掉 —— 界面里
+# 就是「明明锁过，账本还是空的」。两个线程写同一个 JSON 就会这样。
+# 账本是只追加的，给它一个自己的文件，就不会被别人的读改写连累。
+DECISIONS = HERE / "decisions.json"
 
 # 守护模式（--watch）的劣化判定阈值。
 # 三段式：min(上限, max(基线×倍数, 下限))
@@ -1148,6 +1155,29 @@ def save_sites(data):
         SITES.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     except OSError:
         pass
+
+
+_DEC_LOCK = threading.RLock()       # 同一进程里只有一条守护线程，但界面线程也会读
+
+
+def load_decisions():
+    """读账本：{位置键: [账目, ...]}。读不到就是空账本。"""
+    with _DEC_LOCK:
+        try:
+            data = json.loads(DECISIONS.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+def save_decisions(data):
+    with _DEC_LOCK:
+        try:
+            DECISIONS.write_text(
+                json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            return True
+        except OSError:
+            return False
 
 
 def _parse_ts(s):
@@ -3877,27 +3907,32 @@ def note_decision(key, entry, only_if_empty=False):
       · 日志是散文，回答不了「这条频段我锁过几次、哪几次是白锁的」。要攒出
         这个结论，得先有结构化的账本。
 
-    存在 sites.json 的位置记录里（跟着位置走，不是跟着设备走），只留最近
-    DECISIONS_KEEP 条：这是个账本，不是档案，旧的不该无限长。
+    存在独立的 decisions.json 里（按位置键分组），每处只留最近 DECISIONS_KEEP
+    条：这是个账本，不是档案，旧的不该无限长。为什么不塞进 sites.json ——
+    两个线程读改写同一个文件会互相覆盖，见 DECISIONS 那里的注释。
+
+    返回：写成功 → 那条账目；没写 → 一句原因（调用方可以原样打给人看）。
     """
     if not key or not entry:
-        return None
-    try:
-        data = load_sites()
-        rec = data.get(find_site(data, key))
-        if not rec:
-            # 连这个位置都没有记录：不为了一条账本凭空造一条位置记忆
-            # （那会让选带时以为「这地方来过」，见 _band_slot 的注释）。
-            return None
-        rows = rec.setdefault("decisions", [])
+        return "没有位置键"
+    with _DEC_LOCK:
+        data = load_decisions()
+        rows = data.setdefault(key, [])
         if only_if_empty and rows:
-            return None
+            return f"已有 {len(rows)} 条账目"
         rows.append(entry)
         del rows[:-DECISIONS_KEEP]
-        save_sites(data)
+        if not save_decisions(data):
+            return "写不进去（磁盘）"
         return entry
-    except (OSError, TypeError, ValueError):
-        return None
+
+
+def _save_decisions_with_rows(key, rows):
+    """把某处改过的账目写回去。rows 是刚就地改过的那一份。"""
+    with _DEC_LOCK:
+        data = load_decisions()
+        data[key] = rows
+        return save_decisions(data)
 
 
 def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
@@ -3919,8 +3954,12 @@ def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
     第四个返回值（有没有换频段）很要紧：锁的如果本来就是当前驻留那条，
     前后带宽没变过，这十分钟里的差别只是环境自己在动 —— 把它记成「锁对了」
     或「锁错了」都是栽赃。只有真换过频段的那次才算数。
+
+    为什么按频段找、不按位置键找：换频段必然换 PCI，于是「记的时候在某处、
+    评的时候在另一处」。按 key 查会查不到，账就永远评不上（实机 2026-11-02
+    就这么空转了一次）。这里扫全部位置，取最近一条同频段、还没评过、有基线的。
     """
-    if not key or band is None:
+    if band is None:
         return "unknown", None, None, False
     post = {}
     for name, v in (("loss", loss), ("avg", avg), ("rsrp", rsrp)):
@@ -3928,32 +3967,26 @@ def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
         if num is not None:
             post[name] = int(round(num))
     try:
-        data = load_sites()
-        rec = data.get(find_site(data, key))
-        if not rec:
+        book = load_decisions()
+        owner, hit = None, None
+        for k, rows in book.items():
+            for e in rows or []:
+                if not isinstance(e, dict) or str(e.get("band")) != str(int(band)):
+                    continue
+                if str(e.get("kind") or "").startswith("unlock"):
+                    continue    # 解锁也记账，但它不是「锁到这条上」，不能拿来评
+                if e.get("out"):
+                    continue    # 评过了
+                if not isinstance(e.get("pre"), dict) or not e.get("pre"):
+                    # 没有锁前基线（接手记录 / 老版本账本）：评不了，跳过。
+                    continue
+                if hit is None or str(e.get("t") or "") > str(hit.get("t") or ""):
+                    owner, hit = k, e
+        if hit is None or owner is None:
             return "unknown", None, None, False
-        rows = rec.get("decisions") or []
-        hit = None
-        for e in reversed(rows):
-            if not isinstance(e, dict) or str(e.get("band")) != str(int(band)):
-                continue
-            if str(e.get("kind") or "").startswith("unlock"):
-                continue        # 解锁也记账，但它不是「锁到这条上」，不能拿来评
-            if e.get("out"):
-                continue        # 评过了，找更早那条还没评的
-            if not isinstance(e.get("pre"), dict) or not e.get("pre"):
-                # 没有锁前基线（接手记录 / 老版本账本）：评不了，跳过。
-                # 不跳过的话它会一直排在队首，把它后面那条真能评的挡住。
-                continue
-            hit = e
-            break
-        if hit is None:
-            return "unknown", None, None, False
-        pre = hit.get("pre")
-        if not isinstance(pre, dict) or not pre:
-            # 老版本留下的账本没有锁前基线：不猜，也不写一个假结论进去
-            # （写进去就再也没机会补评了）。
-            return "unknown", None, None, False
+        rows = book[owner]
+        key = owner if not key else key     # 结论落到「记它的那处」的频段槽里
+        pre = hit["pre"]
         verdict = lock_verdict(pre, post)
         stamp = (now or datetime.now()).isoformat(timespec="seconds")
         before = _num(hit.get("serving"))
@@ -3962,9 +3995,12 @@ def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
         if not switched:
             # 锁的就是当前这条，前后没换过频段 —— 结论照记，但不计入
             # 「这条锁得好/不好」的账，否则纯粹是在给噪声记账。
-            save_sites(data)
+            _save_decisions_with_rows(owner, rows)
             return verdict, pre, post, False
-        # 结论落到频段槽里，选带时能用到（site_band_regret）。
+        _save_decisions_with_rows(owner, rows)
+        # 结论落到频段槽里，选带时能用到（site_band_regret）。这一步写的是
+        # sites.json，和账本分开：账本丢了不影响选带，选带那份丢了也不影响复盘。
+        data = load_sites()
         v = _band_slot(data, key, band)
         if isinstance(v, dict):
             rv = v.setdefault("review", {"good": 0, "bad": 0})
@@ -4049,17 +4085,18 @@ def decisions_report(n=5, site=None):
     只能靠结构化的账本回答。
     """
     lines = []
-    try:
-        data = load_sites()
-    except (OSError, ValueError):
-        return ["读不到位置记忆（sites.json）。"]
+    data = load_decisions()
     if not data:
         return ["还没有账目：守护下一次锁定开始记。"]
+    try:
+        sites = load_sites()
+    except (OSError, ValueError):  # 名字读不到不影响看账
+        sites = {}
     keys = [site] if site else list(data.keys())
     shown = 0
     for key in keys:
-        rec = data.get(key) or {}
-        rows = [e for e in (rec.get("decisions") or []) if isinstance(e, dict)]
+        rec = sites.get(find_site(sites, key) if sites else key) or {}
+        rows = [e for e in (data.get(key) or []) if isinstance(e, dict)]
         if not rows:
             continue
         shown += 1
@@ -4069,7 +4106,7 @@ def decisions_report(n=5, site=None):
             lines.append("  " + decision_line(e))
         # 回评账：哪条锁过之后变好、哪条变差
         rv = []
-        for band, v in (rec.get("bands") or {}).items():
+        for band, v in (rec.get("bands") or {}).items():  # 回评累计还在 sites.json
             if not isinstance(v, dict):
                 continue
             bad, good = band_regret(v)
@@ -4632,6 +4669,7 @@ def run_guard(args, cfg):
     lock_confirmed = False               # 这一轮锁定已经记过账了（一次锁定只记一次）
     lock_reviewed = False                # 这一轮回评过了（锁前 vs 锁后）
     adopted = False                      # 启动时那条「本来就锁着」记过账没有
+    first_tick = True                    # 这是不是本次守护的第一拍
     last_beat = 0.0                      # 上一拍的开始时刻（用来发现被系统挂起）
     hangs = 0                            # 被系统挂起过几次
     next_audit = 0.0                     # 下次「锁定复核」的时刻
@@ -4735,7 +4773,10 @@ def run_guard(args, cfg):
                 locked_since = 0.0
                 lock_confirmed = False
                 lock_reviewed = False
-            if locked and not adopted:
+            if first_tick and locked and not adopted:
+                # 只在**第一拍**认「本来就锁着」。不这么限的话，守护自己刚锁完
+                # 的那一拍就会被当成「启动时设备已锁」，账本里多出一条没人做过的
+                # 决策（2026-11-02 模拟里就是这么冒出来的）。
                 adopted = True
                 # 启动时设备本来就锁着一条 —— 这不是这次的决定，但账本第一次
                 # 见到这个位置时值得记一笔：否则用户点开「锁频段的依据」只有
@@ -4747,9 +4788,11 @@ def run_guard(args, cfg):
                     "kind": "adopt", "band": int(locked_band),
                     "serving": locked_band,
                 }, only_if_empty=True)
-                print(f"      · 记下现状：启动时设备已经锁在 BAND {locked_band}"
-                      f"（位置 {_k or '未知'}，{'已记账' if _r else '账本里已有记录'}）"
-                      f"［账本 {SITES}］", flush=True)
+                print(f"      · 启动时设备已经锁在 BAND {locked_band}"
+                      f"（位置 {_k or '未知'}）："
+                      f"{'已记进账本' if not isinstance(_r, str) else _r}",
+                      flush=True)
+            first_tick = False
             lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
             lock_weak_hits = (lock_weak_hits + 1
                               if lock_signal_collapsed(lock_ref, rsrp) else 0)

@@ -6,8 +6,8 @@
   「锁完回评效果」—— 现在只记了「锁住了没垮」，没记「锁对了没」。
   「决策留痕」—— 每次选哪条、凭什么，存成一条可回看的记录。
 
-这两件事是一体的：回评要拿「锁之前」当基线，而锁之前那一拍的丢包/延迟
-只有记账时才留下来。所以账本（decisions）既是对外的说法，也是回评的原料。
+账本单独一个文件（decisions.json），不塞进 sites.json —— 2026-11-02 真机上
+就是因为两个线程读改写同一个文件，刚记下的账目被整段覆盖，界面里一直是空的。
 """
 
 import json
@@ -23,8 +23,10 @@ class _Sites(unittest.TestCase):
     def setUp(self):
         d = Path(tempfile.mkdtemp())
         self.SITES, self.CONFIG = d / "sites.json", d / "config.json"
+        self.DEC = d / "decisions.json"
         self._ps = [mock.patch.object(A, "SITES", self.SITES),
-                    mock.patch.object(A, "CONFIG", self.CONFIG)]
+                    mock.patch.object(A, "CONFIG", self.CONFIG),
+                    mock.patch.object(A, "DECISIONS", self.DEC)]
         for p in self._ps:
             p.start()
 
@@ -38,13 +40,19 @@ class _Sites(unittest.TestCase):
     def read_sites(self):
         return json.loads(self.SITES.read_text(encoding="utf-8"))
 
+    def write_decisions(self, data):
+        self.DEC.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def read_decisions(self):
+        return json.loads(self.DEC.read_text(encoding="utf-8"))
+
     @staticmethod
     def st(pci=236, op="CMCC"):
         return {"band": 40, "signal": {"pci": str(pci), "operator": op}}
 
-    def site(self, decisions=None, bands=None, **extra):
+    def site(self, bands=None, **extra):
         rec = {"seen": 3, "last": "2026-11-02T10:00:00", "best": 3,
-               "bands": bands or {}, "decisions": decisions or []}
+               "bands": bands or {}}
         rec.update(extra)
         return {"236-CMCC": rec}
 
@@ -82,51 +90,56 @@ class LockVerdict(unittest.TestCase):
 
 
 class ReviewLastLock(_Sites):
-    def _decision(self, band=3, pre=None, kind="quick", out=None):
+    def _decision(self, band=3, pre=None, kind="quick", out=None, serving=40):
         return {"t": "2026-11-02T11:00:00", "band": band, "kind": kind,
-                "serving": 40, "pre": pre if pre is not None else
-                {"loss": 25, "avg": 120}, "out": out}
+                "serving": serving, "out": out,
+                "pre": pre if pre is not None else {"loss": 25, "avg": 120}}
 
     def test_fills_outcome_and_counts_a_win(self):
-        self.write_sites(self.site(decisions=[self._decision()]))
+        self.write_sites(self.site())
+        self.write_decisions({"236-CMCC": [self._decision()]})
         verdict, pre, post, switched = A.review_last_lock(
             "236-CMCC", 3, loss=0, avg=72, rsrp=-96)
-        self.assertTrue(switched)
         self.assertEqual(verdict, "better")
+        self.assertTrue(switched)
         self.assertEqual(pre["loss"], 25)
         self.assertEqual(post["loss"], 0)
+        self.assertEqual(self.read_decisions()["236-CMCC"][0]["out"]["verdict"],
+                         "better")
         rec = self.read_sites()["236-CMCC"]
-        self.assertEqual(rec["decisions"][0]["out"]["verdict"], "better")
         self.assertEqual(rec["bands"]["3"]["review"]["good"], 1)
         self.assertEqual(rec["bands"]["3"]["review"]["bad"], 0)
 
     def test_counts_a_regret(self):
         # 锁之前丢 0%，锁之后丢 40% —— 这次锁上去就是错的
-        self.write_sites(self.site(
-            decisions=[self._decision(pre={"loss": 0, "avg": 70})]))
+        self.write_sites(self.site())
+        self.write_decisions({"236-CMCC": [
+            self._decision(pre={"loss": 0, "avg": 70})]})
         verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=40, avg=70)
         self.assertEqual(verdict, "worse")
-        self.assertEqual(self.read_sites()["236-CMCC"]["bands"]["3"]["review"]["bad"], 1)
+        self.assertEqual(
+            self.read_sites()["236-CMCC"]["bands"]["3"]["review"]["bad"], 1)
 
     def test_does_not_review_twice(self):
-        self.write_sites(self.site(
-            decisions=[self._decision(out={"verdict": "better", "loss": 0})]))
+        self.write_decisions({"236-CMCC": [
+            self._decision(out={"verdict": "better", "loss": 0})]})
         verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=40, avg=70)
         self.assertEqual(verdict, "unknown")
 
     def test_ignores_unlock_entries(self):
         """解锁也记账，但「解开」不是「锁到这条上」，不能拿来评锁得好不好。"""
-        self.write_sites(self.site(decisions=[self._decision(
-            kind="unlock_bad", pre={"loss": 0, "avg": 70})]))
+        self.write_decisions({"236-CMCC": [
+            self._decision(kind="unlock_bad", pre={"loss": 0, "avg": 70})]})
         verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=40, avg=70)
         self.assertEqual(verdict, "unknown")
 
     def test_picks_the_matching_band_only(self):
-        self.write_sites(self.site(decisions=[self._decision(band=40),
-                                              self._decision(band=3)]))
-        verdict, pre, _, _ = A.review_last_lock("236-CMCC", 3, loss=0, avg=72)
+        self.write_sites(self.site())
+        self.write_decisions({"236-CMCC": [self._decision(band=40),
+                                           self._decision(band=3)]})
+        verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=0, avg=72)
         self.assertEqual(verdict, "better")
-        self.assertEqual(self.read_sites()["236-CMCC"]["decisions"][0].get("out"), None)
+        self.assertIsNone(self.read_decisions()["236-CMCC"][0].get("out"))
 
     def test_no_band_switch_is_not_counted(self):
         """锁的就是本来驻留的那条 → 前后带宽没变，这十分钟的差别跟锁无关。
@@ -134,9 +147,9 @@ class ReviewLastLock(_Sites):
         给它记「锁对了」或「锁错了」都是栽赃：这类锁定占的还不少
         （keep / quick 两条路都是锁当前这条）。结论照记，但不进评分。
         """
-        d = self._decision(band=40, pre={"loss": 0, "avg": 70})
-        d["serving"] = 40
-        self.write_sites(self.site(decisions=[d]))
+        self.write_sites(self.site())
+        self.write_decisions({"236-CMCC": [
+            self._decision(band=40, pre={"loss": 0, "avg": 70}, serving=40)]})
         verdict, _, _, switched = A.review_last_lock("236-CMCC", 40, loss=60, avg=70)
         self.assertEqual(verdict, "worse")
         self.assertFalse(switched)
@@ -151,17 +164,20 @@ class ReviewLastLock(_Sites):
         """
         adopt = self._decision(kind="adopt")
         adopt["pre"] = None                     # 接手记录没有锁前基线
-        self.write_sites(self.site(decisions=[
-            adopt,
-            self._decision(band=3, pre={"loss": 0, "avg": 70}),
-        ]))
+        self.write_sites(self.site())
+        self.write_decisions({"236-CMCC": [
+            adopt, self._decision(band=3, pre={"loss": 0, "avg": 70})]})
         verdict, pre, _, _ = A.review_last_lock("236-CMCC", 3, loss=50, avg=70)
         self.assertEqual(verdict, "worse")
         self.assertEqual(pre["loss"], 0)
 
     def test_without_baseline_says_unknown(self):
         # 老版本留下的账本没有 pre：不猜，也不写一个假结论
-        self.write_sites(self.site(decisions=[{"t": "x", "band": 3, "kind": "memo"}]))
+        self.write_decisions({"236-CMCC": [{"t": "x", "band": 3, "kind": "memo"}]})
+        verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=0, avg=70)
+        self.assertEqual(verdict, "unknown")
+
+    def test_empty_ledger(self):
         verdict, _, _, _ = A.review_last_lock("236-CMCC", 3, loss=0, avg=70)
         self.assertEqual(verdict, "unknown")
 
@@ -217,40 +233,45 @@ class Ledger(_Sites):
                 "serving": 40, "pre": {"loss": 20, "avg": 100}}
 
     def test_appends_and_reads_back(self):
-        self.write_sites(self.site())
         A.note_decision("236-CMCC", self._e("2026-11-02T11:00:00", kind="flap_avoid"))
-        rec = self.read_sites()["236-CMCC"]
-        self.assertEqual(rec["decisions"][0]["kind"], "flap_avoid")
+        self.assertEqual(self.read_decisions()["236-CMCC"][0]["kind"], "flap_avoid")
 
     def test_keeps_a_bounded_window(self):
         """账本不是档案：留最近 DECISIONS_KEEP 条，文件不能一直涨。"""
-        self.write_sites(self.site())
         for i in range(A.DECISIONS_KEEP + 5):
             A.note_decision("236-CMCC", self._e(f"2026-11-02T11:{i:02d}:00"))
-        rec = self.read_sites()["236-CMCC"]
-        self.assertEqual(len(rec["decisions"]), A.DECISIONS_KEEP)
-        self.assertIn("11:0", json.dumps(rec["decisions"][0]["t"]) + "11:0")
+        rows = self.read_decisions()["236-CMCC"]
+        self.assertEqual(len(rows), A.DECISIONS_KEEP)
+        self.assertEqual(rows[-1]["t"],
+                         f"2026-11-02T11:{A.DECISIONS_KEEP + 4:02d}:00")
+
+    def test_does_not_need_a_site_record(self):
+        """账本是「当时做了什么」，不依赖这处有没有位置记忆 —— 也不为它造假记录。"""
+        r = A.note_decision("999-CMCC", self._e("2026-11-02T11:00:00"))
+        self.assertNotIsInstance(r, str)
+        self.assertIn("999-CMCC", self.read_decisions())
+        self.assertFalse(self.SITES.exists())
 
     def test_only_if_empty(self):
         """「启动时本来锁着」那条只在账本为空时记一次，别每次重启都塞。"""
-        self.write_sites(self.site())
         A.note_decision("236-CMCC", self._e("2026-11-02T11:00:00"), only_if_empty=True)
         A.note_decision("236-CMCC", self._e("2026-11-02T11:05:00"), only_if_empty=True)
-        self.assertEqual(len(self.read_sites()["236-CMCC"]["decisions"]), 1)
-        # 账本里已经有真决策了，再调一次也不会加
+        self.assertEqual(len(self.read_decisions()["236-CMCC"]), 1)
         A.note_decision("236-CMCC", self._e("2026-11-02T11:10:00"), only_if_empty=True)
-        self.assertEqual(len(self.read_sites()["236-CMCC"]["decisions"]), 1)
+        self.assertEqual(len(self.read_decisions()["236-CMCC"]), 1)
 
-    def test_unknown_site_does_not_create_one(self):
-        # 不为了记一笔账就凭空造一条位置记忆（选带时会以为「这儿来过」）
-        self.write_sites({})
-        A.note_decision("999-CMCC", self._e("2026-11-02T11:00:00"))
-        self.assertEqual(self.read_sites(), {})
+    def test_reports_why_it_did_not_write(self):
+        # 写不进去要能说出来（界面上那句「启动时设备已经锁在…」直接用它）
+        A.note_decision("236-CMCC", self._e("2026-11-02T11:00:00"), only_if_empty=True)
+        r = A.note_decision("236-CMCC", self._e("2026-11-02T11:05:00"),
+                            only_if_empty=True)
+        self.assertIsInstance(r, str)
+        self.assertIn("已有 1 条", r)
 
     def test_report_is_readable(self):
         self.write_sites(self.site(
-            decisions=[self._e("2026-11-02T11:00:00", kind="flap_avoid")],
             bands={"3": {"ok": 1, "review": {"good": 2, "bad": 0}}}))
+        A.note_decision("236-CMCC", self._e("2026-11-02T11:00:00", kind="flap_avoid"))
         text = "\n".join(A.decisions_report(5))
         self.assertIn("236-CMCC", text)
         self.assertIn("BAND 3", text)
@@ -258,7 +279,6 @@ class Ledger(_Sites):
         self.assertIn("好2/差0", text)
 
     def test_report_when_empty(self):
-        self.write_sites({})
         self.assertTrue(any("还没有账目" in x for x in A.decisions_report(5)))
 
 
@@ -271,29 +291,26 @@ class LockBandWritesLedger(_Sites):
         return dev
 
     def test_writes_on_success(self):
-        self.write_sites(self.site())
         with mock.patch.object(A, "wait_device_back", return_value=True):
             ok = A._guard_lock_band(self._dev(), 3, trace={
                 "_key": "236-CMCC", "t": "2026-11-02T11:00:00",
                 "kind": "quick", "pre": {"loss": 20, "avg": 100}})
         self.assertTrue(ok)
-        rec = self.read_sites()["236-CMCC"]
-        self.assertEqual(rec["decisions"][0]["band"], 3)
-        self.assertNotIn("_key", rec["decisions"][0])   # 内部字段不落盘
+        row = self.read_decisions()["236-CMCC"][0]
+        self.assertEqual(row["band"], 3)
+        self.assertNotIn("_key", row)           # 内部字段不落盘
 
     def test_skips_when_lock_fails(self):
-        self.write_sites(self.site())
         with mock.patch.object(A, "wait_device_back", return_value=False):
             ok = A._guard_lock_band(self._dev(), 3, trace={
                 "_key": "236-CMCC", "t": "2026-11-02T11:00:00", "kind": "quick"})
         self.assertFalse(ok)
-        self.assertEqual(self.read_sites()["236-CMCC"]["decisions"], [])
+        self.assertFalse(self.DEC.exists())
 
     def test_no_trace_no_ledger(self):
-        self.write_sites(self.site())
         with mock.patch.object(A, "wait_device_back", return_value=True):
             A._guard_lock_band(self._dev(), 3)
-        self.assertEqual(self.read_sites()["236-CMCC"]["decisions"], [])
+        self.assertFalse(self.DEC.exists())
 
 
 if __name__ == "__main__":

@@ -164,6 +164,7 @@ if MODE == "share":
     FakeDev.get_state = get_state
 
 A.SITES = SITES
+A.DECISIONS = TMP / "decisions.json"        # 账本也是独立的，别写进仓库目录
 A.PLAN = PLAN
 A.CONFIG = TMP / "config.json"       # 别把 pin 写进仓库里的 config.json
 A.detect = lambda *a, **k: DEV
@@ -226,10 +227,16 @@ if MODE == "share":
           else "[失败] 守护的采样没落账，或把观测记录当成「测过」了")
 elif MODE == "review":
     # 锁到 BAND 3 那条已经换过频段（驻留 40 → 锁 3），回评该记一功
-    dec = (sites.get("350-CMCC") or {}).get("decisions") or []
+    decf = TMP / "decisions.json"
+    book = json.loads(decf.read_text(encoding="utf-8")) if decf.exists() else {}
+    # 账目记在「做决定那一刻」的位置键上：锁之前驻留 BAND 40 是 PCI 236，
+    # 换到 BAND 3 之后才是 350。所以这里把各处的账目合起来看。
+    dec = [e for rows in book.values() for e in rows]
     lock_rows = [d for d in dec if not str(d.get("kind") or "").startswith("unlock")]
     out = (lock_rows[-1].get("out") if lock_rows else None) or {}
-    rv = ((sites.get("350-CMCC") or {}).get("bands") or {}).get("3", {}).get("review") or {}
+    rv = {}
+    for rec in sites.values():
+        rv = rv or ((rec.get("bands") or {}).get("3") or {}).get("review") or {}
     print("账本:", json.dumps(dec, ensure_ascii=False)[:500])
     ok = (rc == 0 and DEV.band == 3 and bool(lock_rows)
           and out.get("verdict") == "better" and out.get("switched") is True
