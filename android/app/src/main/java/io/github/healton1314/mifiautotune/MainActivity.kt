@@ -311,9 +311,17 @@ class MainActivity : Activity() {
 
         swGuard = Switch(this).apply {
             isChecked = false
+            // 整个开关交给下面那行来点：MIUI 上这个控件对合成的触摸事件经常
+            // 不响应（真机 + adb input tap 实测：点标题、点开关本体都没反应，
+            // 而同一屏的 TextView 按钮一点就开）。用户多半也是点「守护模式」
+            // 这四个字，而不是那个小滑块，所以整行可点本来就更该有。
+            isClickable = false
+            isFocusable = false
             setOnCheckedChangeListener { _: CompoundButton, on: Boolean -> toggleGuard(on) }
         }
         head.addView(swGuard)
+        head.isClickable = true
+        head.setOnClickListener { swGuard.isChecked = !swGuard.isChecked }
         box.addView(head)
 
         tvGuardHint = TextView(this).apply {
