@@ -125,8 +125,13 @@ def job():
     with server.JOB_LOCK:
         snap = dict(server.JOB)
         snap["lines"] = list(server.JOB["lines"])
-        snap["elapsed"] = (round(time.time() - server.JOB["started"])
-                           if server.JOB["started"] and server.JOB["running"] else None)
+    if not snap["lines"]:
+        # 内存里空 = 进程是新的（App 重开/被回收）。别让人以为日志丢了 ——
+        # 磁盘上那份还在，接着显示它。
+        snap["lines"] = server.saved_log()
+        snap["from_disk"] = bool(snap["lines"])
+    snap["elapsed"] = (round(time.time() - server.JOB["started"])
+                       if server.JOB["started"] and server.JOB["running"] else None)
     return _dumps(snap)
 
 

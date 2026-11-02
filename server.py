@@ -24,6 +24,7 @@ import signal
 import socket
 import subprocess
 import sys
+from collections import deque
 import threading
 import time
 import traceback
@@ -143,11 +144,46 @@ def _env():
     return e
 
 
+# 运行日志只存在内存里 —— App 进程一被系统回收，历史就没了。实测中
+# 下午跑完守护再回来问「日志还在吗」，只能答「没了」，而那时正好在排查问题。
+# 这里同时落一份到磁盘（滚动保留最近 AUDIT_KEEP 行），重开 App 还能翻到上一次。
+AUDIT_LOG = HERE / "run-log.txt"
+AUDIT_KEEP = 600
+_TAIL = None
+_TAIL_LOCK = threading.Lock()
+
+
+def _tail():
+    """磁盘上那份日志的尾巴。第一次用时把已有的读回来，跨进程接着写。"""
+    global _TAIL
+    if _TAIL is None:
+        _TAIL = deque(maxlen=AUDIT_KEEP)
+        try:
+            for row in AUDIT_LOG.read_text(encoding="utf-8").splitlines()[-AUDIT_KEEP:]:
+                _TAIL.append(row)
+        except (OSError, ValueError):
+            pass
+    return _TAIL
+
+
 def log(line):
     with JOB_LOCK:
         JOB["lines"].append(line)
         if len(JOB["lines"]) > 400:
             JOB["lines"] = JOB["lines"][-400:]
+    with _TAIL_LOCK:
+        tail = _tail()
+        tail.append(line)
+        try:
+            AUDIT_LOG.write_text("\n".join(tail) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def saved_log():
+    """内存里没有就退回磁盘那份（App 重开之后走这条）。"""
+    with _TAIL_LOCK:
+        return list(_tail())
 
 
 # ---------------- 能不能起子进程 ----------------

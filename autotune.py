@@ -23,6 +23,7 @@ import threading
 import statistics
 import subprocess
 import sys
+import traceback
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -40,7 +41,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.18"
+__version__ = "0.9.19"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -2877,8 +2878,54 @@ def judge_degradation(stats, base_avg=None, base_jitter=None):
     return reasons
 
 
+def _can_fork_python():
+    """这台机器上能不能真的起一个 python 子进程。
+
+    APK 里不能：Chaquopy 把解释器嵌在进程内，sys.executable 指向的东西并不
+    存在。守护一旦走「体检」那条路就会在这里炸 —— 实测中 下午报的
+    「守护模式跑全局体检会报错」就是这个。判据用 sys.getandroidapilevel()，
+    它只有 Chaquopy 才有，比猜路径可靠。
+    """
+    if hasattr(sys, "getandroidapilevel"):
+        return False
+    exe = sys.executable or ""
+    return bool(exe) and Path(exe).exists()
+
+
+def _run_cycle_inprocess(args):
+    """同一个解释器里跑一次「体检 + 应用」。
+
+    用的还是 main() 那一套（临时换 sys.argv）：参数定义只此一份，不会漏。
+    调用方（守护）已经把设备连接放掉了，所以这里重新登录不会互相顶。
+    """
+    argv = []
+    if getattr(args, "wifi_only", False):
+        argv.append("--wifi-only")
+    if getattr(args, "lte_only", False):
+        argv.append("--lte-only")
+    if getattr(args, "bands", "default") != "default":
+        argv += ["--bands", args.bands]
+    if getattr(args, "ssid", None):
+        argv += ["--ssid", args.ssid]
+    argv.append("--apply")
+    old = sys.argv
+    sys.argv = [str(Path(__file__).resolve())] + argv
+    try:
+        main()
+        return 0
+    except SystemExit as e:          # argparse 出错 / --help
+        return int(e.code or 0)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 1
+    finally:
+        sys.argv = old
+
+
 def run_cycle(args):
-    """跑一次完整的体检 + 应用，返回子进程退出码。"""
+    """跑一次完整的体检 + 应用，返回退出码。"""
+    if not _can_fork_python():
+        return _run_cycle_inprocess(args)
     cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
     if args.wifi_only:
         cmd.append("--wifi-only")
@@ -3587,6 +3634,8 @@ _KIND_TEXT = {
     "regret_no_alt": "当前这条以前锁过、锁完反倒更差，又没备选可换",
     "measure": "体检量出来的结论",
     "adopt": "启动时设备本来就锁在这条，不是这次决定的",
+    "verify": "记忆里那条没记过信号，切过去实测确认",
+    "rescue_alt": "锁的这条实在不行了，换记忆里的备选",
     "unlock_bad": "锁着这条实在不行了，解开自救",
     "unlock_move": "人在走动，松开让它自己选",
     "unlock_signal": "锁的这条信号塌了，交还给设备",
@@ -4448,7 +4497,7 @@ def _guard_plan_band(prefer=None):
     return band or prefer
 
 
-def _guard_verify_memo(dev, memo, serving, key, speed_url, host):
+def _guard_verify_memo(dev, memo, serving, key, speed_url, host, trace=None):
     """切到记忆里那条最优，实地验一次；不够用就切回原频段。
 
     实测中：「在一个熟悉的地方要优先锁历史记录里面最优的，最近这几次
@@ -4462,7 +4511,12 @@ def _guard_verify_memo(dev, memo, serving, key, speed_url, host):
     """
     print(f"      → 记忆里的最优是 BAND {memo}，但从来没记过信号 —— 与其猜，"
           f"切过去实测一次（两次切换，约 2~3 分钟断网）", flush=True)
-    if not _guard_lock_band(dev, memo):
+    # 这一步也是一次真锁定，得进账本 —— 实测中 报「中午锁过 BAND 39
+    # 但账本里没有」，走的就是这条路（记忆里那条没记过信号，切过去实测）。
+    _t = dict(trace) if trace else None
+    if _t is not None:
+        _t["kind"] = "verify"
+    if not _guard_lock_band(dev, memo, trace=_t):
         print(f"      [!] BAND {memo} 切不过去，这次还是按原逻辑处理", flush=True)
         return None, False
     try:
@@ -5166,7 +5220,16 @@ def run_guard(args, cfg):
                     alt = guard_alt_band(st, skip=locked_band)
                     if alt:
                         print(f"      换到记忆里的备选 BAND {alt}（不交还给设备）…", flush=True)
-                        _guard_lock_band(dev, alt)
+                        _guard_lock_band(dev, alt, trace={
+                            "_key": _site_key(st),
+                            "t": datetime.now().isoformat(timespec="seconds"),
+                            "kind": "rescue_alt",
+                            "serving": locked_band,
+                            "rsrp": int(rsrp) if rsrp is not None else None,
+                            "hour": datetime.now().hour,
+                            "pre": {"loss": ping.get("loss"),
+                                    "avg": ping.get("avg")},
+                        })
                         unlocked_at = None
                     else:
                         _guard_unlock(dev, locked_band)
@@ -5254,7 +5317,8 @@ def run_guard(args, cfg):
                         if (kind in ("blind_keep", "blind") and memo is not None
                                 and site_verify_due(key_now)):
                             landed, memo_ok = _guard_verify_memo(
-                                dev, int(memo), serving, key_now, speed_url, host)
+                                dev, int(memo), serving, key_now, speed_url,
+                                host, trace=trace)
                             if memo_ok:
                                 band = landed
                                 serving = locked_band = landed
