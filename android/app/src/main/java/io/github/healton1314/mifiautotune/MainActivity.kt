@@ -229,11 +229,21 @@ class MainActivity : Activity() {
         box.addView(spacer(10))
         box.addView(manual)
 
-        // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿弹出来
+        // 日志平时不摆出来（守护的刷屏尤其吵），想看的时候从这儿弹出来。
+        // 「锁频段的依据」是另一回事：它回答的是「刚才为什么锁这条／为什么没锁
+        // 那条」，是账本不是流水，所以单独一个入口，跟日志并排放。
+        val logRow = row()
         val logBtn = actionButton("查看运行日志", false)
         logBtn.setOnClickListener { showLogDialog() }
+        val whyBtn = actionButton("锁频段的依据", false)
+        whyBtn.setOnClickListener { showDecisionsDialog() }
+        logRow.addView(logBtn, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        logRow.addView(spacerW(10))
+        logRow.addView(whyBtn, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         box.addView(spacer(10))
-        box.addView(logBtn)
+        box.addView(logRow)
         return box
     }
 
@@ -1109,6 +1119,69 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, logHeight(logLines.size)
             ).apply { topMargin = dp(10) }
             sv.post { sv.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun showDecisionsDialog() {
+        val tv = TextView(this).apply {
+            text = "读取中…"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setTextColor(LOG_INK)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        val sv = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#14161A"))
+            addView(tv, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            isVerticalScrollBarEnabled = true
+            minimumHeight = dp(96)
+        }
+        val dlg = Dialog(this)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+        }
+        root.addView(TextView(this).apply {
+            text = "锁频段的依据"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(INK)
+        })
+        root.addView(TextView(this).apply {
+            text = "最近几次为什么锁这条；锁上十来分钟后再跟锁之前比一次，变差的会记下来。"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(MUTED)
+            setPadding(0, dp(4), 0, 0)
+        })
+        root.addView(sv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.heightPixels * 0.48f).toInt()).apply {
+            topMargin = dp(10)
+        })
+        val close = actionButton("关闭", false)
+        close.setOnClickListener { dlg.dismiss() }
+        root.addView(close, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
+        dlg.setContentView(root)
+        dlg.window?.setLayout(
+            (resources.displayMetrics.widthPixels * 0.92f).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.show()
+
+        // 只读本机记忆，走 fast 通道：守护正在采样的那几秒也不会把它堵住。
+        Py.callFast(this, "decisions") { txt ->
+            if (!dlg.isShowing) return@callFast   // 用户已经关掉了，白改
+            val arr = json(txt)?.optJSONArray("lines")
+            tv.text = if (arr == null || arr.length() == 0) {
+                "还没有记录。\n守护下次锁定频段时开始记；锁上十来分钟后会补一条回评。"
+            } else {
+                (0 until arr.length()).joinToString("\n") { arr.optString(it) }.trimEnd()
+            }
         }
     }
 

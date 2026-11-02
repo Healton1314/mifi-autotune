@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.14"
+__version__ = "0.9.15"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -119,6 +119,18 @@ SITE_FLAP_MIN_BAD = 2               # 坏样本至少这么多条才定罪：单
 # 平均下来只是「这条偶尔掉」，于是白天的好时段被连坐、晚上的坏时段又不够刺眼。
 GUARD_FLAP_HOUR_WINDOW = 2          # 当前钟点前后几小时算「这个时段」
 GUARD_FLAP_HOUR_MIN = 2             # 这个时段至少几条样本才敢用它下结论
+
+# 「锁完回评」的判据。
+#
+# 实测中：「现在只记了『锁住了没垮』，没记『锁对了没』」。锁上十分钟
+# 链路干净，可能本来就这么干净 —— 不跟锁之前比，这个记录说明不了任何事。
+# 所以锁的那一刻存一份锁前基线，十分钟后再量一次，两个数放在一起看。
+REVIEW_LOSS_GAIN = 5                # 丢包相差这么多个百分点才算「变了」
+REVIEW_LAT_GAIN = 0.25              # 延迟变化超过 25% 才算「变了」
+DECISIONS_KEEP = 20                 # 每个位置留最近多少条「为什么锁这条」
+# 「锁过但没好处」攒到这个数、且一次好处都没见着，就不再锁它。
+# 和 SITE_FLAP_MIN_BAD 一样要 2 次：一次可能是那会儿基站正好挤。
+REVIEW_BAD_MIN = 2
 # 比全天那条（30%）严得多：时段窗口窄、样本少，用 30% 的话「2 条里 1 条坏」
 # 就能给整条频段定罪 —— 而一次偶发（隔壁开微波炉）不该让晚上不能用它。
 GUARD_FLAP_HOUR_RATIO = 0.6
@@ -430,7 +442,16 @@ SIG_SINR_OK = 10         # 高于等于这个：信号干净
 
 
 def _num(v):
-    m = re.search(r"-?\d+(?:\.\d+)?", str(v or ""))
+    """从设备/日志里的字符串抠出数字。抓不到返回 None。
+
+    注意 0 是合法数字：丢包 0%、延迟 0 都要能读出来。老写法是
+    `str(v or "")`，把 0 变成了空串 → 返回 None ——「0% 丢包」这条最健康的
+    读数会被当成「没读到」。2026-11-02 做锁后回评时就踩在这上面：
+    锁前 20% 丢包、锁后 0%，因为后一个 0 变成了 None，结论是「跟锁之前差不多」。
+    """
+    if v is None:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(v))
     return float(m.group()) if m else None
 
 
@@ -1316,6 +1337,41 @@ def site_band_flap(st, band, hour=None):
     except (TypeError, ValueError):
         h = None
     return band_flap(v, hour=h)[0]
+
+
+def band_regret(v):
+    """这条频段在本地「锁上去反而更差」的记录。返回 (坏次数, 好次数)。
+
+    和 band_flap 是两件事，别混：
+      flap   说的是「这条链路本身会周期性掉包」—— 信号可能很漂亮；
+      regret 说的是「锁到这条上，比锁之前还差」—— 链路本身没准是好的，
+             只是当时那条（或者这个时辰的那条）比它更合适。
+    两者都指向「别锁它」，但原因不同。混成一句会让人以为是信号问题，
+    实际是选错了。
+    """
+    rv = (v or {}).get("review")
+    if not isinstance(rv, dict):
+        return 0, 0
+    return int(rv.get("bad") or 0), int(rv.get("good") or 0)
+
+
+def site_band_regret(st, band):
+    """这个位置、这条频段是不是「锁过几次都没好处」。"""
+    if not band:
+        return False
+    key = _site_key(st)
+    if not key:
+        return False
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key)) or {}
+    except (OSError, ValueError):
+        return False
+    v = (rec.get("bands") or {}).get(str(int(band)))
+    if not isinstance(v, dict):
+        return False
+    bad, good = band_regret(v)
+    return bad >= REVIEW_BAD_MIN and good == 0
 
 
 def prefer_stable_over_flap(usable, hist, fastest):
@@ -3496,6 +3552,13 @@ _KIND_TEXT = {
     "memo_bad_alt": "记忆里的最优刚测出不够用，换次优",
     "memo_bad": "记忆里的最优刚测出不够用",
     "flap_avoid": "当前这条在记忆里会周期性掉包，别被信号强度骗了",
+    "flap_no_alt": "当前这条在记忆里会周期性掉包，而记忆里没有能换的备选",
+    "regret_avoid": "当前这条以前锁过、锁完反倒更差，换备选",
+    "regret_no_alt": "当前这条以前锁过、锁完反倒更差，又没备选可换",
+    "measure": "体检量出来的结论",
+    "unlock_bad": "锁着这条实在不行了，解开自救",
+    "unlock_move": "人在走动，松开让它自己选",
+    "unlock_signal": "锁的这条信号塌了，交还给设备",
     "weak": "记忆里那条信号差太多、当前也不够用",
     "blind": "记忆里没记信号、当前也不够用",
 }
@@ -3508,7 +3571,8 @@ def _kind_text(kind):
 
 def guard_pick_lock(memo, memo_mbps, serving, quick,
                     memo_rsrp=None, cur_rsrp=None, pinned_band=None,
-                    cur_loss=None, alt_band=None, cur_flap=False):
+                    cur_loss=None, alt_band=None, cur_flap=False,
+                    cur_regret=False):
     """久坐时到底锁哪一条。返回 (频段 or None, 依据)；
     依据 ∈ {memo, keep, quick, weak_keep, weak, blind_keep, blind,
             memo_bad, memo_bad_alt, flap_avoid}。
@@ -3522,6 +3586,7 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
       cur_loss  当前驻留频段此刻的丢包%；≥GUARD_BAD_LOSS 时「留在当前」
                 这个选项直接作废 —— 正在大量丢包的链路不能算「够用」
       cur_flap  当前驻留这条在记忆里被判「会周期性掉包」
+      cur_regret 当前驻留这条以前锁过、锁完反而更差（回评攒出来的结论）
       alt_band  记忆里的次优频段（当前这条被证伪时用它；没有就是 None）
 
     依据的含义：
@@ -3582,6 +3647,15 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
         if alt_band and str(alt_band) != str(serving):
             return int(alt_band), "flap_avoid"
         return None, "flap_no_alt"
+    # ⓪e 当前这条「以前锁过、锁完反倒更差」（回评攒出来的结论）→ 同样别锁它。
+    #     和上面的 flap 是两条不同的证据，所以分开记、分开说：
+    #     flap 是「这条链路自己会掉包」，regret 是「锁到这条上并不比锁之前好」。
+    #     后者只有跟锁前基线比才看得出来 —— 锁完 0% 丢包并不等于锁对了，
+    #     那可能本来就不丢（见 review_last_lock）。
+    if cur_regret:
+        if alt_band and str(alt_band) != str(serving):
+            return int(alt_band), "regret_avoid"
+        return None, "regret_no_alt"
     # ⓪b 记忆里的「最优」正好就是当前驻留的这条，而刚才的实测判它不够用。
     #     这是被「基站拥塞」咬得最准的一种情况：信号指标漂亮，速度塌了。
     #     2026-10-31 20:13 实机就长这样 —— BAND 40 是 -78dBm / SINR 21dB（比
@@ -3645,7 +3719,8 @@ def guard_plan_lock(st, memo, serving, quick, cur_rsrp, cur_loss, pinned,
         memo, memo_best, serving, quick,
         memo_rsrp=memo_rsrp, cur_rsrp=cur_rsrp,
         pinned_band=pinned, cur_loss=cur_loss, alt_band=alt,
-        cur_flap=site_band_flap(st, serving))
+        cur_flap=site_band_flap(st, serving),
+        cur_regret=site_band_regret(st, serving))
     return key, band, kind, memo_best
 
 
@@ -3789,6 +3864,216 @@ def note_guard_confirm(key, band, loss=None, avg=None, rsrp=None):
         return n, True, ""
     except (TypeError, ValueError):
         return 0, False, ""
+
+
+def note_decision(key, entry):
+    """记一笔「这次锁哪条、凭什么、锁前什么样」，留给十分钟后回评。
+
+    为什么要单独存一份，而不是只在运行日志里打一行：
+
+      · 手机上 `log_keep` 是 1，历史只留最后一轮 —— 用户想知道「刚才为什么
+        没锁 BAND 40」，翻日志是翻不到的（2026-11-02 就是这么问起来的）。
+      · 日志是散文，回答不了「这条频段我锁过几次、哪几次是白锁的」。要攒出
+        这个结论，得先有结构化的账本。
+
+    存在 sites.json 的位置记录里（跟着位置走，不是跟着设备走），只留最近
+    DECISIONS_KEEP 条：这是个账本，不是档案，旧的不该无限长。
+    """
+    if not key or not entry:
+        return None
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key))
+        if not rec:
+            # 连这个位置都没有记录：不为了一条账本凭空造一条位置记忆
+            # （那会让选带时以为「这地方来过」，见 _band_slot 的注释）。
+            return None
+        rows = rec.setdefault("decisions", [])
+        rows.append(entry)
+        del rows[:-DECISIONS_KEEP]
+        save_sites(data)
+        return entry
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
+    """锁上十来分钟之后回一句：这次锁对了没。
+
+    返回 (结论, 锁前, 锁后, 有没有真的换了频段)。
+    结论 ∈ {better, same, worse, unknown}。
+
+    为什么非得跟锁前比：锁完看到 0% 丢包、70ms 延迟，那可能本来就这样。
+    实测中 要的就是这一步 ——「现在只记了锁住了没垮，没记锁对了没」。
+
+    比什么、怎么算：
+      · 先看丢包（差 REVIEW_LOSS_GAIN 个百分点以上才算变了）；
+      · 丢包分不出高下再看延迟（差 25% 以上才算）；
+      · 两个都差不多就是 same —— 「没变差」也是一条有用的结论，不该被
+        硬说成「变好了」。
+    没有锁前基线（老版本留下的账本）就返回 unknown，不猜。
+
+    第四个返回值（有没有换频段）很要紧：锁的如果本来就是当前驻留那条，
+    前后带宽没变过，这十分钟里的差别只是环境自己在动 —— 把它记成「锁对了」
+    或「锁错了」都是栽赃。只有真换过频段的那次才算数。
+    """
+    if not key or band is None:
+        return "unknown", None, None, False
+    post = {}
+    for name, v in (("loss", loss), ("avg", avg), ("rsrp", rsrp)):
+        num = _num(v)
+        if num is not None:
+            post[name] = int(round(num))
+    try:
+        data = load_sites()
+        rec = data.get(find_site(data, key))
+        if not rec:
+            return "unknown", None, None, False
+        rows = rec.get("decisions") or []
+        hit = None
+        for e in reversed(rows):
+            if not isinstance(e, dict) or str(e.get("band")) != str(int(band)):
+                continue
+            if str(e.get("kind") or "").startswith("unlock"):
+                continue        # 解锁也记账，但它不是「锁到这条上」，不能拿来评
+            if e.get("out"):
+                continue        # 评过了，找更早那条还没评的
+            hit = e
+            break
+        if hit is None:
+            return "unknown", None, None, False
+        pre = hit.get("pre")
+        if not isinstance(pre, dict) or not pre:
+            # 老版本留下的账本没有锁前基线：不猜，也不写一个假结论进去
+            # （写进去就再也没机会补评了）。
+            return "unknown", None, None, False
+        verdict = lock_verdict(pre, post)
+        stamp = (now or datetime.now()).isoformat(timespec="seconds")
+        before = _num(hit.get("serving"))
+        switched = before is not None and str(int(before)) != str(int(band))
+        hit["out"] = dict(post, verdict=verdict, t=stamp, switched=switched)
+        if not switched:
+            # 锁的就是当前这条，前后没换过频段 —— 结论照记，但不计入
+            # 「这条锁得好/不好」的账，否则纯粹是在给噪声记账。
+            save_sites(data)
+            return verdict, pre, post, False
+        # 结论落到频段槽里，选带时能用到（site_band_regret）。
+        v = _band_slot(data, key, band)
+        if isinstance(v, dict):
+            rv = v.setdefault("review", {"good": 0, "bad": 0})
+            if verdict == "better":
+                rv["good"] = int(rv.get("good") or 0) + 1
+            elif verdict == "worse":
+                rv["bad"] = int(rv.get("bad") or 0) + 1
+            rv["last"] = stamp
+            rv["last_verdict"] = verdict
+        save_sites(data)
+        return verdict, pre, post, True
+    except (OSError, TypeError, ValueError):
+        return "unknown", None, None, False
+
+
+def lock_verdict(pre, post):
+    """锁前 vs 锁后 → better / same / worse。纯函数，方便单测。"""
+    pl, ql = _num((pre or {}).get("loss")), _num((post or {}).get("loss"))
+    if pl is not None and ql is not None:
+        if ql <= pl - REVIEW_LOSS_GAIN:
+            return "better"
+        if ql >= pl + REVIEW_LOSS_GAIN:
+            return "worse"
+    pa, qa = _num((pre or {}).get("avg")), _num((post or {}).get("avg"))
+    if pa and qa:
+        ratio = (qa - pa) / float(pa)
+        if ratio <= -REVIEW_LAT_GAIN:
+            return "better"
+        if ratio >= REVIEW_LAT_GAIN:
+            return "worse"
+    return "same"
+
+
+def review_line(verdict, pre, post):
+    """把回评结论说成人话，一行。"""
+    def _fmt(d, key, unit):
+        v = (d or {}).get(key)
+        return "—" if v is None else f"{v}{unit}"
+
+    before = f"丢包 {_fmt(pre, 'loss', '%')} 延迟 {_fmt(pre, 'avg', 'ms')}"
+    after = f"丢包 {_fmt(post, 'loss', '%')} 延迟 {_fmt(post, 'avg', 'ms')}"
+    word = {"better": "比锁之前好", "worse": "比锁之前差",
+            "same": "跟锁之前差不多", "unknown": "说不清"}[verdict]
+    if verdict == "unknown":
+        return f"锁后回评：{word}（没有锁前基线，不猜）"
+    return f"锁后回评：{word}（{before} → {after}）"
+
+
+def decision_line(e):
+    """一笔账目压成一行，给人看（命令行和日志共用）。"""
+    if not isinstance(e, dict):
+        return ""
+    t = str(e.get("t") or "")[11:16]
+    band = e.get("band")
+    head = (f"{t}  BAND {band}  ← {e.get('kind')}"
+            f"（{_kind_text(e.get('kind'))}）") if band is not None else \
+           f"{t}  {e.get('kind')}"
+    bits = []
+    pre = e.get("pre") or {}
+    if pre:
+        bits.append(f"锁前 丢包 {pre.get('loss', '—')}% 延迟 {pre.get('avg', '—')}ms")
+    if e.get("serving") is not None:
+        bits.append(f"当时驻留 {e.get('serving')}")
+    q = e.get("quick") or {}
+    if q.get("mbps") is not None:
+        bits.append(f"快测 {float(q['mbps']):.0f}Mbps/{q.get('loss')}%")
+    out = e.get("out") or {}
+    if out:
+        word = {"better": "比锁前好", "worse": "比锁前差",
+                "same": "跟锁前差不多"}.get(out.get("verdict"), out.get("verdict"))
+        if out.get("switched") is False:
+            word += "·没换频段"
+        bits.append(f"回评 {word}（丢包 {out.get('loss', '—')}%）")
+    return head + ("｜" + "、".join(bits) if bits else "")
+
+
+def decisions_report(n=5, site=None):
+    """把「最近为什么锁这条」排成人能读的几行。返回行列表（方便单测）。
+
+    这份账是给用户复盘用的：手机上运行日志只留最后一轮（log_keep），而
+    「刚才为什么没锁 BAND 40」「这条锁过几次、哪几次白锁了」这类问题，
+    只能靠结构化的账本回答。
+    """
+    lines = []
+    try:
+        data = load_sites()
+    except (OSError, ValueError):
+        return ["读不到位置记忆（sites.json）。"]
+    if not data:
+        return ["还没有账目：守护下一次锁定开始记。"]
+    keys = [site] if site else list(data.keys())
+    shown = 0
+    for key in keys:
+        rec = data.get(key) or {}
+        rows = [e for e in (rec.get("decisions") or []) if isinstance(e, dict)]
+        if not rows:
+            continue
+        shown += 1
+        lines.append(f"{key}")
+        for e in sorted(rows, key=lambda x: str(x.get("t") or ""),
+                        reverse=True)[:n]:
+            lines.append("  " + decision_line(e))
+        # 回评账：哪条锁过之后变好、哪条变差
+        rv = []
+        for band, v in (rec.get("bands") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            bad, good = band_regret(v)
+            if good or bad:
+                rv.append(f"BAND {band} 好{good}/差{bad}")
+        if rv:
+            lines.append("  回评累计：" + "；".join(sorted(rv)))
+    if not shown:
+        lines.append("这个位置还没有账目：守护下一次锁定开始记。" if site
+                     else "还没有账目：守护下一次锁定开始记。")
+    return lines
 
 
 def guard_known_settle(st, serving, base):
@@ -4057,7 +4342,7 @@ def guard_memory_band(st):
     return band, f"{where}{how}，最优 BAND {band}"
 
 
-def _guard_lock_band(dev, band):
+def _guard_lock_band(dev, band, trace=None):
     print(f"      锁到 BAND {band}（不重新测，几乎不断网）…", flush=True)
     try:
         dev.set_band(band)
@@ -4070,6 +4355,13 @@ def _guard_lock_band(dev, band):
     ok = wait_device_back(dev, timeout=60)
     print(f"      已锁定 BAND {band}" if ok
           else "      [!] 后台没回来，稍后自动重试", flush=True)
+    if ok and trace is not None:
+        # 只在真锁上了才记账：「决定了但没锁成」不算一次决策，记下来会让
+        # 回评去比一条根本没生效的锁。
+        e = dict(trace)
+        e["band"] = int(band)
+        e.setdefault("t", datetime.now().isoformat(timespec="seconds"))
+        note_decision(e.pop("_key", ""), e)
     return ok
 
 
@@ -4285,6 +4577,8 @@ def run_guard(args, cfg):
           f"不用等满：站够 {int(GUARD_KNOWN_SETTLE)}s 就锁")
     print(f"  锁住 {int(GUARD_CONFIRM_SEC / 60)} 分钟还正常 → 记一次「这儿这条守得住」，"
           f"攒够 {GUARD_CONFIRM_LOCKS} 次就升成正式记忆")
+    print(f"  同一时刻还做一次回评：跟锁之前那一拍比丢包/延迟 —— "
+          f"锁完更差的记一笔，同一条攒够 {REVIEW_BAD_MIN} 次就不再优先锁它")
     print("  记忆里的「最优」要是刚测出不够用 → 换记忆里的次优"
           "（信号好看不代表快：基站拥塞时 -78dBm 也可能只有 3 Mbps）")
     print(f"  锁定后连续 {GUARD_BAD_HITS} 次不通、丢包≥{GUARD_BAD_LOSS}% 或延迟≥{GUARD_LAG_MS}ms"
@@ -4326,6 +4620,7 @@ def run_guard(args, cfg):
     lock_weak_hits = 0                   # 连续几拍发现「锁的这条信号塌了」
     locked_since = 0.0                   # 这一轮锁定是从哪一刻开始的
     lock_confirmed = False               # 这一轮锁定已经记过账了（一次锁定只记一次）
+    lock_reviewed = False                # 这一轮回评过了（锁前 vs 锁后）
     last_beat = 0.0                      # 上一拍的开始时刻（用来发现被系统挂起）
     hangs = 0                            # 被系统挂起过几次
     next_audit = 0.0                     # 下次「锁定复核」的时刻
@@ -4418,6 +4713,7 @@ def run_guard(args, cfg):
                     # 「这一轮记过账没有」也清零。
                     locked_since = now
                     lock_confirmed = False
+                    lock_reviewed = False
                 lock_ref_band = locked_band
                 if rsrp is not None:
                     lock_rsrp_hist.append(rsrp)
@@ -4427,6 +4723,7 @@ def run_guard(args, cfg):
                 lock_weak_hits = 0
                 locked_since = 0.0
                 lock_confirmed = False
+                lock_reviewed = False
             lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
             lock_weak_hits = (lock_weak_hits + 1
                               if lock_signal_collapsed(lock_ref, rsrp) else 0)
@@ -4449,7 +4746,18 @@ def run_guard(args, cfg):
                     # 位置键在锁之前取：锁完 PCI 会变（换频段必换小区），
                     # 拿新 PCI 去算 key 会把信号写到「另一个地方」的账上。
                     key_now = _site_key(st)
-                    if _guard_lock_band(dev, want):
+                    # 体检结论也记账：它同样是「一次锁定的决定」，只是依据来自
+                    # 那 3~6 分钟的完整实测，而不是这一拍的状态。
+                    if _guard_lock_band(dev, want, trace={
+                            "_key": key_now,
+                            "t": datetime.now().isoformat(timespec="seconds"),
+                            "kind": "measure",
+                            "serving": serving,
+                            "rsrp": int(rsrp) if rsrp is not None else None,
+                            "hour": datetime.now().hour,
+                            "pre": {"loss": ping.get("loss"),
+                                    "avg": ping.get("avg")},
+                    }):
                         serving = locked_band = want
                         locked, bad_streak = True, 0
                         stable_since = now
@@ -4692,6 +5000,32 @@ def run_guard(args, cfg):
                         print(f"      · 第 {n}/{GUARD_CONFIRM_LOCKS} 次，"
                               f"再来一次这地方就能当记性用", flush=True)
 
+            # 锁后回评：拿锁前那一拍当基线，看这次切换到底有没有用。
+            #
+            # 为什么不和上面那段合并：上面那句「守住了」要求链路干净（not bad_now），
+            # 而真正需要回评的恰恰是「锁完更差」—— 那种情况下 bad_now 为真，合并
+            # 进来就永远评不到最该评的那次。两件事，分开判。
+            if (locked and not dry and not lock_reviewed and locked_since
+                    and now - locked_since >= GUARD_CONFIRM_SEC
+                    and str(serving) == str(locked_band)):
+                lock_reviewed = True
+                verdict, pre, post, switched = review_last_lock(
+                    _site_key(st), locked_band, ping.get("loss"),
+                    ping.get("avg"), rsrp)
+                if verdict == "unknown":
+                    pass
+                elif not switched:
+                    # 锁的就是本来驻留的那条：这十分钟的差别跟「锁」无关，
+                    # 只能说明这条链路自己在变。照实说，不揽功也不背锅。
+                    print("      · " + review_line(verdict, pre, post)
+                          + "（锁的就是当前这条，没换频段）", flush=True)
+                else:
+                    print("      · " + review_line(verdict, pre, post), flush=True)
+                    if verdict == "worse":
+                        print("      · 这次锁上去比锁之前还差 —— 记一笔，"
+                              "同一条再锁坏一次，这个位置就不再优先锁它",
+                              flush=True)
+
             # 锁定复核：锁上之后按设计就不再看记忆、不测速了，免得反复断网 ——
             # 但「人换了个地方、这条变慢、还没慢到丢包/延迟阈值」就没了出口。
             # 2026-11-01 中午在餐厅就是这样：一顿饭卡在住处锁的 BAND 3 上，屏幕
@@ -4767,6 +5101,13 @@ def run_guard(args, cfg):
                         unlocked_at = None
                     else:
                         _guard_unlock(dev, locked_band)
+                        note_decision(_site_key(st), {
+                            "t": datetime.now().isoformat(timespec="seconds"),
+                            "kind": "unlock_bad", "band": int(locked_band),
+                            "serving": serving,
+                            "pre": {"loss": ping.get("loss"),
+                                    "avg": ping.get("avg")},
+                        })
                         unlocked_at = time.time()
                         pci_log.clear()
                     bad_streak = 0
@@ -4793,6 +5134,14 @@ def run_guard(args, cfg):
                         # 锁回来」，解锁等于没解（2026-11-01 中午在餐厅就是这样）。
                         note_pin_failure(locked_band)
                     _guard_unlock(dev, locked_band)
+                    note_decision(_site_key(st), {
+                        "t": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "unlock_move" if moving else "unlock_signal",
+                        "band": int(locked_band),
+                        "serving": serving,
+                        "pre": {"loss": ping.get("loss"),
+                                "avg": ping.get("avg")},
+                    })
                     unlocked_at = time.time()
                     pci_log.clear()
                     bad_streak = 0
@@ -4805,6 +5154,27 @@ def run_guard(args, cfg):
                         _guard_lock_current(dev, serving)
                     else:
                         key_now, band, kind, memo_best = plan
+                        # 这一次「为什么锁它」的账目。锁前那一拍刚好就是最好的
+                        # 基线：它就是「不锁的状态下链路什么样」，十分钟后拿它比
+                        # 才知道这次切换到底救了什么（review_last_lock）。
+                        # 键要在锁之前取：换频段必换小区，锁完再算就是另一个地方了。
+                        trace = {
+                            "_key": key_now,
+                            "t": datetime.now().isoformat(timespec="seconds"),
+                            "kind": kind,
+                            "serving": serving,
+                            "rsrp": int(rsrp) if rsrp is not None else None,
+                            "memo": memo,
+                            "memo_mbps": memo_best,
+                            "pin": pinned,
+                            "hour": datetime.now().hour,
+                            "quick": ({"band": quick.get("band"),
+                                       "mbps": quick.get("mbps"),
+                                       "loss": quick.get("loss")}
+                                      if isinstance(quick, dict) else None),
+                            "pre": {"loss": ping.get("loss"),
+                                    "avg": ping.get("avg")},
+                        }
                         # 记忆里的最优「没记过信号」时，不能永远绕过去。
                         # 实测中：「在一个熟悉的地方要优先锁历史记录里
                         # 最优的，最近这几次锁定看起来没有验证记忆」。
@@ -4831,14 +5201,14 @@ def run_guard(args, cfg):
                                   f"（差 {abs(rsrp - memo_rsrp):.0f}dB，超过 "
                                   f"{GUARD_LOCK_RSRP_DROP}dB 就不锁它了），锁当前这条",
                                   flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                             mark_site_provisional(key_now, band, force_best=True)
                         elif kind == "blind_keep":
                             print(f"      → 记忆里 BAND {memo} 是 {memo_best:.0f} Mbps，"
                                   f"但当时没记信号，说不准它现在还能不能用；"
                                   f"当前这条够用，先不赌，锁当前 BAND {serving}", flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                             # 这里原来带 force_best=True，等于用「刚才 20 秒快测
                             # 当前这条不错」把「这个位置的最优」改写成当前频段。
@@ -4854,7 +5224,7 @@ def run_guard(args, cfg):
                                   f"但刚才实测当前 BAND {serving} 有 "
                                   f"{float(quick.get('mbps') or 0):.0f} Mbps"
                                   f"（差不到 {gap}%），锁当前这条，不切换", flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "pinned":
                             # 人已经替它做过决定了。这里不再比速度、不再看
@@ -4863,7 +5233,7 @@ def run_guard(args, cfg):
                                    else "你上次用 --lock-band 定的")
                             print(f"      → {src} BAND {band}，照它锁，不再比",
                                   flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             # 位置级命中时也补上设备级，并记下是「这个地方」说的
                             set_device_pin(band, st)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
@@ -4874,21 +5244,21 @@ def run_guard(args, cfg):
                                   f"{float(quick.get('mbps') or 0):.0f} Mbps / "
                                   f"{quick['avg']}ms，不够用 —— "
                                   f"换到记忆里的 BAND {band}", flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             # 这里既不写 RSRP 也不写「测过」：RSRP 是当前那条
                             # （BAND 40）的，记到 BAND 3 名下就是造假；而这次
                             # 换过去本来就没测过 BAND 3，别把 last 刷新成「刚测过」。
                             # 换错了自有「连续 3 次不通 → 换备选/解锁」兜底。
                         elif kind == "memo":
                             print(f"      → {memo_why}，直接锁定（不重测）", flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "flap_avoid":
                             # 当前这条信号更强，但记忆里它会周期性掉包。
                             # 强信号 + 周期性掉包 = 用起来一直在卡，不如稳的那条。
                             print(f"      → 当前 BAND {serving} 信号更强，可它在记忆里"
                                   f"会周期性掉包 —— 锁稳的 BAND {band}", flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "quick":
                             # 「测不准」不能写成「够用」。同一组数字（9 Mbps，两次
@@ -4907,7 +5277,7 @@ def run_guard(args, cfg):
                                       f"（{float(quick.get('mbps') or 0):.0f} Mbps / "
                                       f"{quick['avg']}ms），直接锁它；其余频段下次来再比",
                                       flush=True)
-                            _guard_lock_band(dev, band)
+                            _guard_lock_band(dev, band, trace=trace)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                             mark_site_provisional(key_now, band)
                         else:
@@ -4918,6 +5288,12 @@ def run_guard(args, cfg):
                                    "记忆里这条标着最优，但刚才实测不够用，"
                                    "而记忆里也没有能换的备选"
                                    if kind == "memo_bad" else
+                                   "当前这条在记忆里会周期性掉包，"
+                                   "而记忆里也没有能换的备选"
+                                   if kind == "flap_no_alt" else
+                                   "当前这条以前锁过、锁完反倒更差，"
+                                   "而记忆里也没有能换的备选"
+                                   if kind == "regret_no_alt" else
                                    (memo_why or "没有可信依据"))
                             print(f"      → {why}，跑一次完整体检再锁", flush=True)
                             dev = None
@@ -5244,6 +5620,9 @@ def main():
     ap.add_argument("--export-memory", nargs="?", const="", metavar="文件",
                     help="把位置记忆导出成一个 JSON（默认 mifi-memory.json）；"
                          "含真实 PCI/速度，只能在本机之间搬，别上传")
+    ap.add_argument("--decisions", nargs="?", const="5", metavar="条数",
+                    help="看最近几次「为什么锁这条频段」，以及锁完的回评结果"
+                         "（默认 5 条；本机记忆，不连设备）")
     ap.add_argument("--import-memory", metavar="文件或网址",
                     help="把别处导出的记忆并进来（只补空缺，不覆盖本机实测）")
     ap.add_argument("--memory-origin", metavar="名字",
@@ -5423,6 +5802,14 @@ def main():
             print("  这份文件含真实 PCI / 实测速度 / 到访时间，和 sites.json 同级，"
                   "别提交、别上传。")
             print(f"  搬到另一台机器上用：mifi --import-memory <文件或网址>")
+        return 0
+
+    if args.decisions is not None:
+        try:
+            cnt = max(1, int(args.decisions))
+        except (TypeError, ValueError):
+            cnt = 5
+        print("\n".join(decisions_report(cnt)))
         return 0
 
     if args.import_memory:

@@ -200,6 +200,18 @@ def _last_tip():
     return ""
 
 
+def decisions(n=5):
+    """最近几次「为什么锁这条频段」，以及锁完回评的结果。
+
+    纯读本机记忆（sites.json），不连设备 —— 所以可以走 fast 通道，
+    不会被正在跑的状态查询或体检堵住。
+    """
+    try:
+        return _dumps({"lines": autotune.decisions_report(int(n))})
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
 def guard_state():
     """守护跑没跑，以及它现在在干什么。
 
