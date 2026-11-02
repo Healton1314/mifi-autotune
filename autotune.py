@@ -3212,7 +3212,14 @@ def site_pinned(st):
         return None
     try:
         p = rec.get("pinned")
-        return int(p) if p else None
+        if not p:
+            return None
+        # 这条**不设时效**。位置级 pin 表达的是「这个地方这条更稳」，那是位置的
+        # 长期属性 —— 实测中 的原话：住处的 BAND 40 信号和速度有时比 3
+        # 好，程序就锁 40，可 40 会周期性丢包、用起来一会一卡，所以他要在这儿
+        # 优先 3。给它加个七天过期，等于让他每星期被坑一次。
+        # 跨位置误伤由 device_pin_here() 负责（设备级那条记了来源位置）。
+        return int(p)
     except (TypeError, ValueError):
         return None
 
@@ -3270,21 +3277,24 @@ def device_pin():
         return None
 
 
-def _pin_age_days(cfg):
-    """这条 pin 是几天前设的。没有时间戳（老版本写的）一律当作「已经过期」。
+def _days_since(iso_text):
+    """某个 ISO 时间戳离现在几天。缺失或写坏了 → 当作很久以前。
 
-    老数据说不清是什么时候钉的，而它恰恰是最可能过时的那一批 —— 2026-10-31 设的
-    BAND 3，到 11-02 还在推翻「办公区该锁 BAND 40」的结论。宁可让它失效一次，
-    让实测重新说话。
+    老数据说不清是什么时候写的，而它恰恰是最可能过时的那一批 —— 2026-10-31
+    钉的 BAND 3，到 11-02 还在推翻「办公区该锁 BAND 40」的结论。
     """
-    at = cfg.get("pin_at")
-    if not at:
+    if not iso_text:
         return 1e9
     try:
-        t = datetime.fromisoformat(str(at))
+        t = datetime.fromisoformat(str(iso_text))
     except (TypeError, ValueError):
         return 1e9
     return (datetime.now() - t).total_seconds() / 86400.0
+
+
+def _pin_age_days(cfg):
+    """设备级 pin 是几天前设的。没有时间戳（老版本写的）一律当作「已经过期」。"""
+    return _days_since(cfg.get("pin_at"))
 
 
 def pin_note():
@@ -3303,8 +3313,15 @@ def pin_note():
     return f"BAND {b}（{int(age)} 天前设的）"
 
 
-def set_device_pin(band):
-    """记下「就要这条」，并把失败计数归零（重新给了一次机会）。"""
+def set_device_pin(band, st=None):
+    """记下「就要这条」，并把失败计数归零（重新给了一次机会）。
+
+    st 传进来时同时记下**是在哪个地方**下的这条命令。为什么要记：`--lock-band 3`
+    说的从来不是「这台设备永远要 3」，而是「我在这个地方试过，3 比 40 稳」。
+    实测中 说得很清楚：住处的 BAND 40 信号和速度有时比 3 好，程序就
+    锁 40，可 40 会周期性丢包、用起来一会一卡，所以他在住处优先锁 3 —— 结果
+    到了办公区，程序算出来该锁 40，被这条住处的 pin 直接改成 3。
+    """
     if not band:
         return
     try:
@@ -3312,9 +3329,51 @@ def set_device_pin(band):
         cfg["pin_band"] = int(band)
         cfg["pin_at"] = datetime.now().isoformat(timespec="seconds")
         cfg["pin_fails"] = 0
+        if st is not None:
+            key = _site_key(st)
+            if key:
+                cfg["pin_site"] = key
+                # 把「这个地方见过的小区」一起记下来：位置键是当前驻留那个 PCI，
+                # 设备在同一间屋子里重选到别的小区就会换键，只认一个键太脆。
+                try:
+                    data = load_sites()
+                    rec = data.get(find_site(data, key)) or {}
+                    cells = [_pci_num(c.get("pci")) for c in (rec.get("cells") or [])]
+                    cfg["pin_cells"] = [c for c in cells if c is not None]
+                except (OSError, ValueError):
+                    cfg["pin_cells"] = []
         save_config(cfg)
     except (OSError, TypeError, ValueError):
         pass
+
+
+def device_pin_here(st=None):
+    """这条 pin 对**现在这个地方**算不算数。
+
+    规则：pin 记了来源位置（pin_site / pin_cells）时，当前小区必须在那组里 ——
+    否则就是「别处说的话」，不生效。没记来源（老数据）时退回原来的行为。
+
+    为什么要这一层：住处的偏好被当成设备级偏好用，就是办公区那次误伤的全部原因。
+    """
+    band = device_pin()
+    if band is None or st is None:
+        return band
+    try:
+        cfg = load_config()
+    except (OSError, ValueError):
+        return band
+    site = cfg.get("pin_site")
+    if not site:
+        return band                  # 老数据：没记来源，按原样生效（有时效兜着）
+    if _site_key(st) == site:
+        return band
+    try:
+        here = _pci_num((st.get("signal") or {}).get("pci"))
+    except (TypeError, ValueError):
+        here = None
+    if here is not None and here in (cfg.get("pin_cells") or []):
+        return band                  # 同一处的另一个小区
+    return None
 
 
 def _clear_device_pin():
@@ -3446,17 +3505,15 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     # ⓪ 用户亲手钉的优先。放在所有启发式之前：那些规则是「程序猜」，而
     #    --lock-band 是「人已经测过、比过了、不想再被劝」。
     #
-    #    但「人说的」也有失效的时候 —— 一种例外：
-    #    这条 pin 此刻就驻留在上面，而且刚测出来它不行。这时的矛盾不是「程序
-    #    猜 vs 人说的」，而是「你 10-31 在住处说的」vs「你现在坐的这条链路的
-    #    实测」。实测赢：让它落到下面的正常逻辑（换备选或跑体检）。
-    #    实机 2026-11-02 办公区：程序算出来该锁 BAND 40，被这条 pin 改成 BAND 3，
-    #    而当时 BAND 3 是 -99dBm、快测 2 Mbps。
-    #    （pin 本身的时效由 device_pin() 把关，超过 GUARD_PIN_TTL_DAYS 就返回 None，
-    #      根本到不了这里。）
+    #    只有一种例外：这条 pin 此刻就驻留在上面、而且**正在大量丢包**。
+    #    注意只看丢包，不看速度 —— 实测中 说得很清楚，他设 BAND 3
+    #    恰恰是因为它「慢一点但稳」，用速度去反驳等于把他的理由当没听见：
+    #    「住处的 BAND 40 网速和信号有时候检测会比 BAND 3 好，就会导致直接锁
+    #     BAND 40，但 BAND 40 丢包就会用起来一会一卡，就设置在住处优先锁 BAND 3」。
+    #    实机当时 BAND 3 只有 2 Mbps、延迟 72ms、丢包 0% —— 那是他要的。
     if pinned_band:
         same_as_pin = str(serving) == str(pinned_band)
-        if not (same_as_pin and not cur_ok):
+        if not (same_as_pin and dropped):
             return int(serving if same_as_pin else pinned_band), "pinned"
     # ⓪c 当前驻留这条在记忆里「会周期性掉包」→ 信号再强也不留。
     #     2026-10-31 21:14 实机：BAND 40 是 -77dBm、比记忆里的 BAND 3 强 21dB，
@@ -3465,6 +3522,19 @@ def guard_pick_lock(memo, memo_mbps, serving, quick,
     #     独立的事，而后者只有历史样本看得出来 —— RSRP 再漂亮也证明不了。
     if (memo is not None and cur_flap and str(serving) != str(memo)):
         return int(memo), "flap_avoid"
+
+    # ⓪d 当前这条「会周期性掉包」→ 不锁它，哪怕它此刻信号最好、速度最快。
+    #     这是用户反复被锁到 BAND 40 的根子：他住处的 BAND 40 是 -77dBm、
+    #     10.7 Mbps，比 BAND 3 好看，可丢包样本是 [0, 20, 100] —— 用起来一会一卡。
+    #     原来的判断只在「要换到别的频段」时生效（上面 ⓪c），于是程序一边知道
+    #     这条会掉包、一边照样把它锁死。
+    #     「别处可用性很高」这条也顾到了：cur_flap 是按**当前位置**的历史查的
+    #     （site_band_flap(st, serving)），不会因为住处的记录牵连别的办公区。
+    #     没有备选就不锁，老老实实跑体检去找一条不掉的。
+    if cur_flap:
+        if alt_band and str(alt_band) != str(serving):
+            return int(alt_band), "flap_avoid"
+        return None, "flap_no_alt"
     # ⓪b 记忆里的「最优」正好就是当前驻留的这条，而刚才的实测判它不够用。
     #     这是被「基站拥塞」咬得最准的一种情况：信号指标漂亮，速度塌了。
     #     2026-10-31 20:13 实机就长这样 —— BAND 40 是 -78dBm / SINR 21dB（比
@@ -4459,7 +4529,9 @@ def run_guard(args, cfg):
             # 两种来源都算「人说的」：位置级（这个 PCI 记录上钉的）和设备级
             # （config 里的 pin_band，--restore 后设备换频段也还在）。
             pinned_site = None if locked else site_pinned(st)
-            pinned = pinned_site or (None if locked else device_pin())
+            # 设备级那条只在「当初设它的那个地方」算数：住处说的「优先 3」不能
+            # 跟到办公区去（实测中 办公区里就是这么被改掉的）。
+            pinned = pinned_site or (None if locked else device_pin_here(st))
             # 记忆里的最优现在信号是不是已经不行了（比当前驻留差一截）。
             # 这一刻就要算出来：既决定「要不要先快测当前」，也决定「准不准锁它」。
             memo_rsrp = (guard_memo_rsrp(_site_key(st), memo)
@@ -4741,7 +4813,8 @@ def run_guard(args, cfg):
                             print(f"      → {src} BAND {band}，照它锁，不再比",
                                   flush=True)
                             _guard_lock_band(dev, band)
-                            set_device_pin(band)      # 位置级命中时也补上设备级
+                            # 位置级命中时也补上设备级，并记下是「这个地方」说的
+                            set_device_pin(band, st)
                             note_band_rsrp_at(key_now, band, serving, rsrp)
                         elif kind == "memo_bad_alt":
                             # 记忆说这条最优，可它刚刚被量到 3 Mbps。别锁它，
@@ -4934,6 +5007,8 @@ def pin_site_best(key, band):
         rec["best"] = int(band)
         rec["verified_at"] = datetime.now().isoformat(timespec="seconds")
         rec["pinned"] = int(band)
+        # 记下「哪天钉的」：没有这个时间戳，这条 pin 会永远压在所有判断之上
+        rec["pinned_at"] = datetime.now().isoformat(timespec="seconds")
         save_sites(data)
     except (TypeError, ValueError):
         return
@@ -5050,7 +5125,8 @@ def run_lock_band(dev, args, st0=None):
         pass
     # 位置级的 pinned 只在「当前 PCI」那条记录上有效，设备换频段就失联；
     # 再存一份设备级的，断电/还原后守护才认得出「他说过要这条」。
-    set_device_pin(band)
+    # 带上 st：这条设备级记录要记住它是**在哪儿**说的，别跟着人到处跑。
+    set_device_pin(band, st)
     if cur and str(cur) != str(band):
         print(f"[!] 读回来是 BAND {cur}，不是 {band} —— 这台设备可能不支持这条")
         return 1

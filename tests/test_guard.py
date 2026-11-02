@@ -477,24 +477,30 @@ class MemoIsTheServingBand(unittest.TestCase):
             memo_rsrp=-78, cur_rsrp=-78, alt_band=3, pinned_band=40)
         self.assertEqual((band, kind), (40, "pinned"))
 
-    def test_pin_yields_when_that_band_measures_bad(self):
-        """pin 的那条**此刻就在用**、却刚测出 3 Mbps → 不再盲从。
+    def test_pin_holds_even_when_that_band_is_slow(self):
+        """pin 那条只有 3 Mbps，但链路干净 → 照样听人的。
 
-        实机 2026-11-02：办公区里程序算出来该锁 BAND 40，被 10-31 设的
-        `--lock-band 3` 直接改成 BAND 3，而 BAND 3 当时 -99dBm、快测 2 Mbps。
-        这时的矛盾不是「程序猜 vs 人说的」，而是「上一次说的」vs「此刻的实测」。
+        这一条是实测中 亲口纠正的。他设 BAND 3 的原因就是这个：
+        「住处的 BAND 40 网速和信号有时候检测会比 BAND 3 好，就会导致直接锁
+        BAND 40，但 BAND 40 丢包就会用起来一会一卡，就设置在住处优先锁 BAND 3」。
+
+        速度慢是他**明知且接受**的代价。拿「不够快」去推翻这条 pin，等于把他
+        做这个决定的理由当没听见。
         """
         band, kind = A.guard_pick_lock(
             memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
             memo_rsrp=-78, cur_rsrp=-78, pinned_band=40)
-        self.assertEqual(kind, "memo_bad")
-        self.assertIsNone(band)
+        self.assertEqual((band, kind), (40, "pinned"))
 
-    def test_pin_yields_to_alt_when_that_band_measures_bad(self):
-        # 同上，但记忆里还有一条能换 → 先换过去，别锁这条烂的
+    def test_pin_yields_when_link_is_dropping_packets(self):
+        """但「正在丢一半以上的包」不算 —— 那是它自己也做不到「稳」。
+
+        用户要的是「慢一点但稳」，不是「又慢又掉」。
+        """
         band, kind = A.guard_pick_lock(
-            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
-            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=40)
+            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 30.0, "good"),
+            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=40,
+            cur_loss=80)
         self.assertEqual((band, kind), (8, "memo_bad_alt"))
 
     def test_pin_is_kept_when_we_are_not_on_it(self):
@@ -506,14 +512,6 @@ class MemoIsTheServingBand(unittest.TestCase):
             memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 3.0),
             memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=3)
         self.assertEqual((band, kind), (3, "pinned"))
-
-    def test_pin_yields_when_link_is_dropping_packets(self):
-        """pin 那条正在丢一半以上的包，就别等快测了 —— 现在就不行。"""
-        band, kind = A.guard_pick_lock(
-            memo=40, memo_mbps=40.7, serving=40, quick=self._q(40, 30.0, "good"),
-            memo_rsrp=-78, cur_rsrp=-78, alt_band=8, pinned_band=40,
-            cur_loss=80)
-        self.assertEqual((band, kind), (8, "memo_bad_alt"))
 
 
 class PlanLockReadsAltFromMemory(unittest.TestCase):
@@ -1067,7 +1065,9 @@ class DevicePin(unittest.TestCase):
         位置级没清，而守护优先读位置级（pinned_site or device_pin）。
         """
         self._sites(**{"350-CMCC": {"seen": 2, "last": "2026-10-31T20:00:00",
-                                    "best": 3, "pinned": 3},
+                                    "best": 3, "pinned": 3,
+                                    "pinned_at": A.datetime.now().isoformat(
+                                        timespec="seconds")},
                        "236-CMCC": {"seen": 2, "last": "2026-10-31T20:10:00",
                                     "best": 40}})
         self.assertEqual(A.site_pinned({"signal": {"pci": 350, "operator": "CMCC"}}), 3)
@@ -1076,6 +1076,33 @@ class DevicePin(unittest.TestCase):
         self.assertIsNone(A.site_pinned({"signal": {"pci": 350, "operator": "CMCC"}}))
         # 别的地方的「来过」记录不许被顺手删掉
         self.assertEqual(sorted(A.load_sites()), ["236-CMCC", "350-CMCC"])
+
+    def test_site_pin_does_not_expire(self):
+        """位置级 pin 不设时效 —— 它说的是「这个地方」，那是长期属性。
+
+        实测中 解释了他设 BAND 3 的原因：住处的 BAND 40 信号和速度
+        有时候比 3 好，程序就锁 40，可 40 会周期性丢包、用起来一会一卡。
+        这种「这个地方这条更稳」的结论，不会因为过了一个星期就变假。
+        跨位置的误伤由 device_pin_here() 挡（设备级那条记了来源位置）。
+        """
+        old = (A.datetime.now() - A.timedelta(days=200)).isoformat(timespec="seconds")
+        self._sites(**{"236-CMCC": {"seen": 3, "best": 3, "pinned": 3,
+                                    "pinned_at": old}})
+        self.assertEqual(A.site_pinned({"signal": {"pci": 236, "operator": "CMCC"}}), 3)
+
+    def test_old_site_pin_without_timestamp_still_works(self):
+        # 老记录没有 pinned_at：位置级照样认，别让升级把用户设过的东西弄丢
+        self._sites(**{"236-CMCC": {"seen": 3, "best": 3, "pinned": 3}})
+        self.assertEqual(A.site_pinned({"signal": {"pci": 236, "operator": "CMCC"}}), 3)
+
+    def test_site_pin_written_with_timestamp(self):
+        # 写进去的时候必须带时间戳，否则下一次读就变成「说不清哪天的」直接失效
+        self._sites(**{"236-CMCC": {"seen": 1, "best": 40}})
+        A.pin_site_best("236-CMCC", 3)
+        rec = A.load_sites()["236-CMCC"]
+        self.assertIn("pinned_at", rec)
+        self.assertEqual(A.site_pinned({"signal": {"pci": 236,
+                                                   "operator": "CMCC"}}), 3)
 
     def test_clear_site_pins_is_a_noop_when_nothing_is_pinned(self):
         self._sites(**{"236-CMCC": {"seen": 1, "last": "2026-10-31T20:10:00",
@@ -1166,12 +1193,35 @@ class FlapAvoid(unittest.TestCase):
             memo_rsrp=-98, cur_rsrp=-77, cur_flap=False)
         self.assertEqual((band, kind), (40, "weak_keep"))
 
-    def test_flap_does_not_touch_the_band_already_locked(self):
-        # 已经在记忆最优上时不需要「避免」什么
+    def test_flapping_band_is_never_locked_even_if_it_is_the_best(self):
+        """当前这条自己会周期性掉包 → 就算它是记忆最优，也不锁死。
+
+        用户在住处的原话：「BAND 40 网速和信号有时候检测会比 BAND 3 好，就会导致
+        直接锁 BAND 40，但 BAND 40 丢包就会用起来一会一卡」。所以这不是「要不要
+        换过去」的问题，是「这条根本不该被锁」的问题 —— 原来的判断只在
+        「要从别处换过来」时才生效，等于放过了它本来就是当前这条的情形。
+        """
         band, kind = A.guard_pick_lock(
             memo=3, memo_mbps=22.0, serving=3, quick={"band": 3, "ok": True,
                                                       "mbps": 20.0, "avg": 60, "loss": 0},
             memo_rsrp=-98, cur_rsrp=-98, cur_flap=True)
+        self.assertEqual(kind, "flap_no_alt")
+        self.assertIsNone(band)          # 没有备选 → 去体检找一条不掉包的
+
+    def test_flapping_current_switches_to_alt(self):
+        # 有备选就先换过去，不必跑体检
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=22.0, serving=3, quick={"band": 3, "ok": True,
+                                                      "mbps": 20.0, "avg": 60, "loss": 0},
+            memo_rsrp=-98, cur_rsrp=-98, cur_flap=True, alt_band=8)
+        self.assertEqual((band, kind), (8, "flap_avoid"))
+
+    def test_clean_current_is_kept(self):
+        # 没有掉包前科就照旧：这条不该被新逻辑牵连
+        band, kind = A.guard_pick_lock(
+            memo=3, memo_mbps=22.0, serving=3, quick={"band": 3, "ok": True,
+                                                      "mbps": 20.0, "avg": 60, "loss": 0},
+            memo_rsrp=-98, cur_rsrp=-98, cur_flap=False)
         self.assertEqual(band, 3)
 
     def test_site_band_flap_reads_history(self):
@@ -1373,3 +1423,48 @@ class QuickLineFormat(unittest.TestCase):
              "avg": None, "loss": 100}
         line = A.quick_line(q)
         self.assertIn("延迟 不通", line)
+
+
+class DevicePinScope(unittest.TestCase):
+    """设备级 pin 只在「当初设它的那个地方」算数。
+
+    实测中 办公区里遇到的就是这个：住处里设的「优先 BAND 3」，到了办公区
+    被当成「这台设备永远要 3」，程序本来算好该锁 BAND 40，被它直接改掉。
+    pin 说的是「这个地方 3 比 40 稳」，不是「这台设备永远要 3」。
+    """
+
+    def setUp(self):
+        self.cfg = {
+            "pin_band": 3,
+            "pin_at": A.datetime.now().isoformat(timespec="seconds"),
+            "pin_site": "236-CMCC",
+            "pin_cells": [236, 350],
+        }
+
+    def _here(self, st):
+        with mock.patch.object(A, "load_config", return_value=self.cfg):
+            return A.device_pin_here(st)
+
+    def test_same_site_still_applies(self):
+        self.assertEqual(
+            self._here({"signal": {"pci": "236", "operator": "CMCC"}}), 3)
+
+    def test_other_cell_of_the_same_place_still_applies(self):
+        # 同一间屋子，设备自己换了个小区（PCI 236 → 350），还是「这个地方」
+        self.assertEqual(
+            self._here({"signal": {"pci": "350", "operator": "CMCC"}}), 3)
+
+    def test_another_place_does_not_apply(self):
+        # 办公区：PCI 441 不在这组里 → 住处说的那条不跟过来
+        self.assertIsNone(
+            self._here({"signal": {"pci": "441", "operator": "CMCC"}}))
+
+    def test_without_recorded_site_falls_back(self):
+        # 老数据没记来源 → 按原样生效（时效由 device_pin 把关）
+        self.cfg.pop("pin_site")
+        self.assertEqual(
+            self._here({"signal": {"pci": "441", "operator": "CMCC"}}), 3)
+
+    def test_no_state_returns_pin(self):
+        with mock.patch.object(A, "load_config", return_value=self.cfg):
+            self.assertEqual(A.device_pin_here(None), 3)
