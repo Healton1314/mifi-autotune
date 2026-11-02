@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.16"
+__version__ = "0.9.17"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -4741,11 +4741,15 @@ def run_guard(args, cfg):
                 # 见到这个位置时值得记一笔：否则用户点开「锁频段的依据」只有
                 # 一片空白，会以为功能没生效。only_if_empty 保证每处只记这一次，
                 # 不会每次重启守护都塞一条。
-                note_decision(_site_key(st), {
+                _k = _site_key(st)
+                _r = note_decision(_k, {
                     "t": datetime.now().isoformat(timespec="seconds"),
                     "kind": "adopt", "band": int(locked_band),
                     "serving": locked_band,
                 }, only_if_empty=True)
+                print(f"      · 记下现状：启动时设备已经锁在 BAND {locked_band}"
+                      f"（位置 {_k or '未知'}，{'已记账' if _r else '账本里已有记录'}）"
+                      f"［账本 {SITES}］", flush=True)
             lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
             lock_weak_hits = (lock_weak_hits + 1
                               if lock_signal_collapsed(lock_ref, rsrp) else 0)
