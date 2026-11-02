@@ -9,8 +9,6 @@ name: apk
 #   （仓库本身不放任何 .apk/.aab，.gitignore 已经挡住了。）
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 jobs:
   build:
