@@ -12,6 +12,7 @@ config.json
 plan.json
 sites.json
 decisions.json
+guard_outage.json
 autotune-log.jsonl
 *.log
 

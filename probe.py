@@ -54,12 +54,21 @@ def sh(cmd, timeout=60):
     return p.stdout.decode("utf-8", "ignore")
 
 
-def _ping_cmd(n, host):
+def _ping_cmd(n, host, wait_ms=1000):
+    """单包等待时间压到 1 秒。
+
+    原来 Windows 是 2000ms、Android 是 -W 2：整条链路断了的时候，10 个包
+    每个都要等满超时，一次采集光 ping 就 20 秒。实机 2026-11-02 18:44~18:47
+    守护的采样时间戳是 47~49 秒一次（interval 只有 30 秒），多出来的正是这 20 秒
+    —— 用户说的「检测到没网跳出太慢」就是它。局域网/RF 链路里 1 秒还没回显，
+    基本就是没有回显了。
+    """
     if IS_WIN:
-        return ["ping", "-n", str(n), "-w", "2000", host]
+        return ["ping", "-n", str(n), "-w", str(wait_ms), host]
     if IS_MAC:
-        return ["ping", "-c", str(n), host]
-    return ["ping", "-c", str(n), "-W", "2", host]
+        # macOS 的 -W 单位是毫秒
+        return ["ping", "-c", str(n), "-W", str(wait_ms), host]
+    return ["ping", "-c", str(n), "-W", "1", host]
 
 
 # ---- 路径 MTU 探测（电脑端专用）------------------------------------------
@@ -169,9 +178,9 @@ def _tcp_latency(n, host, port=None, timeout=1.5):
     return rtts
 
 
-def ping_stats(n=10, host=DEFAULT_PING_HOST):
-    """返回 {avg, min, max, jitter, loss, sent, recv}；全部无回显时 avg=None。"""
-    out = sh(_ping_cmd(n, host), timeout=60 + n * 2)
+def _icmp_rtts(n, host):
+    """发 n 个 ICMP 包，返回收到的那些 RTT（ms）。平台差异都收在这里。"""
+    out = sh(_ping_cmd(n, host), timeout=10 + n * 2)
     rtts = []
     for line in out.splitlines():
         if "ttl" not in line.lower():
@@ -182,18 +191,43 @@ def ping_stats(n=10, host=DEFAULT_PING_HOST):
                 rtts.append(float(m.group(1).replace(",", ".")))
             except ValueError:
                 pass
+    return rtts
 
+
+def ping_stats(n=10, host=DEFAULT_PING_HOST, probe_n=3):
+    """返回 {avg, min, max, jitter, loss, sent, recv, down}；全部无回显时 avg=None。
+
+    **断网要在几秒内就认输。** 原来一次固定发 n 个包、每个等满超时：全丢就是
+    20 秒，而守护一拍本来只有 30 秒 —— 于是一没网，采样周期就变成 50 秒，
+    「连续 3 次不通」要两分半才攒够，用户看到的就是「检测到没网跳出太慢」
+    （实机 2026-11-02 18:44:25→18:45:24→18:46:12，间隔 47~49 秒）。
+
+    所以分两段：先发 probe_n 个。一个都不回，就已经能判「这条链路此刻不通」
+    —— 100% 丢包不需要凑够 10 个样本。再用一次 TCP 握手分辨是「真断网」还是
+    「这里 ICMP 被禁」，不通就直接返回 down=True。有回显才补齐剩下的包，
+    正常链路一个包都不少，丢包率精度不变。
+    """
+    probe_n = max(1, min(probe_n, n))
+    rtts = _icmp_rtts(probe_n, host)
     method = "icmp"
+    sent = probe_n
+
     if not rtts:
-        # ICMP 用不了（Android/权限受限/没装 ping）→ 退回 TCP 握手测延迟
-        rtts = _tcp_latency(n, host, port=53)
+        # 一个都没回来。两种可能：整条链路断了，或者这个位置不允许 ICMP。
+        # 后者很常见（Android 普通应用、公共 WiFi），不能当成断网 ——
+        # 用 TCP 握手分一下，最多两次失败（约 3 秒）。
+        rtts = _tcp_latency(probe_n, host, port=_TCP_PORTS[0])
         method = "tcp"
+        if not rtts:
+            return {"avg": None, "min": None, "max": None, "jitter": None,
+                    "loss": 100, "sent": sent, "recv": 0, "method": method,
+                    "down": True}
+    elif n > probe_n:
+        rtts += _icmp_rtts(n - probe_n, host)
+        sent = n
 
     recv = len(rtts)
-    loss = round(100.0 * (n - recv) / n) if n else 100
-    if not rtts:
-        return {"avg": None, "min": None, "max": None, "jitter": None,
-                "loss": 100, "sent": n, "recv": 0, "method": method}
+    loss = round(100.0 * (sent - recv) / sent) if sent else 100
     mean = sum(rtts) / len(rtts)
     var = sum((x - mean) ** 2 for x in rtts) / len(rtts)
     return {
@@ -202,9 +236,12 @@ def ping_stats(n=10, host=DEFAULT_PING_HOST):
         "max": int(round(max(rtts))),
         "jitter": round(var ** 0.5, 1),
         "loss": loss,
-        "sent": n,
+        "sent": sent,
         "recv": recv,
         "method": method,
+        # 只有「ICMP 一个都没回」和「TCP 也握不上手」同时成立才置 True。
+        # 单独一个 ICMP 不通不算 —— 那更可能是权限问题，而不是没网。
+        "down": False,
     }
 
 

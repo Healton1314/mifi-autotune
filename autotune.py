@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.20"
+__version__ = "0.9.21"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -86,6 +86,11 @@ SITES = DATA_DIR / "sites.json"     # 位置记忆：每个 PCI 下哪些频段�
 # 就是「明明锁过，账本还是空的」。两个线程写同一个 JSON 就会这样。
 # 账本是只追加的，给它一个自己的文件，就不会被别人的读改写连累。
 DECISIONS = DATA_DIR / "decisions.json"
+# 「这地方这会儿没网」的记录。和 decisions 分开是同一类理由（两拨线程写同一个
+# 文件必然互相覆盖），但它还有个独立用途：**冷却窗口**。
+# 实测中 的设计要求原话是「在一个地方重复检测到没网，后续就不测，
+# 等一段时间没来才能进行全量测试」—— 需要一个跨重启、跨线程都能读到的时间戳。
+OUTAGE = DATA_DIR / "guard_outage.json"
 
 # 守护模式（--watch）的劣化判定阈值。
 # 三段式：min(上限, max(基线×倍数, 下限))
@@ -247,6 +252,21 @@ GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
 # 挂上，窗口就已经关了，后面那条「解锁仍不通 → 跑体检」永远走不到。
 GUARD_RESCUE_WINDOW = 900
+
+# 没网的时候「测」是纯浪费。实测中 18:44~18:55 的实机日志：
+#   18:45:24  延迟 不通  丢包 100%
+#   18:47:46  跑一次完整体检再锁（会断网几次，约 5 分钟）
+#   18:55:55  体检结束…结论「保持现状」→ 锁回 BAND 41
+#   18:56:41  延迟 不通  丢包 100%      ← 八分钟过去，原地踏步
+# 体检的每一个频段都要靠下载测速，而整条链路断着的时候，六个频段量出来全是 0，
+# 结论必然是「保持现状」。它唯一确定产生的东西是：5 分钟断网 + 4 次射频重启。
+# 所以：**链路整条不通时，不跑体检**。
+#
+# 然后是用户当初的设计要求（原话）：「在一个地方重复检测到没网，后续就不测，
+# 等一段时间没来才能进行全量测试」。所以还要一个冷却窗口：同一个地方断过一次，
+# 这半小时内不再试图全量测；网络恢复、并且时间过够，才允许重新测。
+GUARD_OUTAGE_COOLDOWN = 1800        # 断网后多久内不再试全量测试（30 分钟）
+GUARD_OUTAGE_FAST_SEC = 10          # 没网时采样间隔压到这么短，网络恢复要尽快发现
 
 # 新地方（从没测过）第一次久坐时怎么处理：不现场跑 5 分钟体检，先把「当前
 # 驻留的那条」锁住（设备本来就在上面，几秒、几乎不断网），并给这个位置打个
@@ -1170,6 +1190,7 @@ def set_data_dir(root):
     返回真正生效的目录。
     """
     global DATA_DIR, STATE, LOG, CONFIG, PLAN, CHANNEL_ADVICE, SITES, DECISIONS
+    global OUTAGE
     root = Path(root)
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -1184,10 +1205,11 @@ def set_data_dir(root):
     CHANNEL_ADVICE = root / "channel_advice.json"
     SITES = root / "sites.json"
     DECISIONS = root / "decisions.json"
+    OUTAGE = root / "guard_outage.json"
     if old_root != root:
         for name in ("state.json", "autotune-log.jsonl", "config.json",
                      "plan.json", "channel_advice.json", "sites.json",
-                     "decisions.json"):
+                     "decisions.json", "guard_outage.json"):
             src, dst = old_root / name, root / name
             try:
                 if src.exists() and not dst.exists():
@@ -2938,7 +2960,7 @@ def _can_fork_python():
     return bool(exe) and Path(exe).exists()
 
 
-def _run_cycle_inprocess(args):
+def _run_cycle_inprocess(args, lte_only=False):
     """同一个解释器里跑一次「体检 + 应用」。
 
     用的还是 main() 那一套（临时换 sys.argv）：参数定义只此一份，不会漏。
@@ -2947,7 +2969,7 @@ def _run_cycle_inprocess(args):
     argv = []
     if getattr(args, "wifi_only", False):
         argv.append("--wifi-only")
-    if getattr(args, "lte_only", False):
+    if lte_only or getattr(args, "lte_only", False):
         argv.append("--lte-only")
     if getattr(args, "bands", "default") != "default":
         argv += ["--bands", args.bands]
@@ -2968,14 +2990,20 @@ def _run_cycle_inprocess(args):
         sys.argv = old
 
 
-def run_cycle(args):
-    """跑一次完整的体检 + 应用，返回退出码。"""
+def run_cycle(args, lte_only=False):
+    """跑一次完整的体检 + 应用，返回退出码。
+
+    lte_only=True 时跳过 2.4G 信道扫描。守护要用这个模式：它管的是「锁哪条
+    频段」，信道是另一件事，而扫一遍要 5 轮 AP 扫描（一分钟上下）。实机
+    2026-11-02 18:47 那轮扫完的结论是「当前信道 0 评分 None，保持现状」——
+    守护拿它一个字都用不上。
+    """
     if not _can_fork_python():
-        return _run_cycle_inprocess(args)
+        return _run_cycle_inprocess(args, lte_only=lte_only)
     cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
     if args.wifi_only:
         cmd.append("--wifi-only")
-    if args.lte_only:
+    if lte_only or args.lte_only:
         cmd.append("--lte-only")
     if args.bands != "default":
         cmd += ["--bands", args.bands]
@@ -3221,7 +3249,8 @@ def quick_is_stale(q, now, max_age=GUARD_QUICK_MAX_AGE):
 
 
 def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
-                 cooldown_left, outage_after_unlock, signal_collapsed=False):
+                 cooldown_left, outage_after_unlock, signal_collapsed=False,
+                 net_ok=True):
     """守护状态机：只回答「现在该做什么」，完全不碰设备（为了能单测）。
 
     规则（实测中 定的）：
@@ -3238,6 +3267,9 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
         实测：切到 BAND 40 后 3~5 分钟断一次，就是靠这条抓出来的。
 
     返回 (action, 原因)，action ∈ {None, "unlock", "lock", "measure"}。
+
+    net_ok=False 表示「此刻整条链路不通」。这种时候 measure 是不许走的：
+    体检逐段下载测速，断网时六段全 0，结论必然「保持现状」，只会白断 5 分钟网。
     """
     bad = bad_streak >= GUARD_BAD_HITS
     # 自救优先于冷却。冷却本来只管「别反复切频段」，但它要是把自救也挡住，
@@ -3252,6 +3284,12 @@ def guard_decide(*, moving, still_sec, settle_sec, locked, bad_streak,
     if bad and locked:
         return "unlock", f"锁定后连续 {bad_streak} 次不通，先解锁自救"
     if bad and not locked and outage_after_unlock:
+        if not net_ok:
+            # 解锁了还是不通、而且这会儿整条链路是断的：体检给不出任何信息。
+            # 实机 2026-11-02 18:47 就是在这种状态下被拉去跑了 8 分钟，
+            # 六段频段三个是 0、一个「无信号」，回来锁回原频段照样 100% 丢包。
+            return None, ("解锁后仍然不通，而且整条链路此刻是断的 —— 体检只会测出 0，"
+                          "先等网络恢复（不反复折腾设备）")
         return "measure", f"解锁后仍然 {bad_streak} 次不通 —— 不是频段问题，换一个试试"
     if cooldown_left > 0:
         return None, f"冷却中（{int(cooldown_left)}s）"
@@ -3399,6 +3437,75 @@ def guard_memo_speed(key, band):
         return float(v.get("best") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+_OUTAGE_LOCK = threading.RLock()
+
+
+def _outage_key(st=None):
+    """断网这件事记在哪个键上。
+
+    PCI 读不到时（设备没注册上，而这正是断网时的常态）记在 "*" 上 ——
+    记的是「这台设备刚断过」，不是「某个我叫不出名字的地方断过」。
+    宁可粗一点，也别因为记不下来就每一拍重新折腾一遍。
+    """
+    return _site_key(st) or "*"
+
+
+def load_outage():
+    with _OUTAGE_LOCK:
+        try:
+            data = json.loads(OUTAGE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+def note_outage(st=None, *, loss=None, band=None):
+    """记一笔「这儿这会儿没网」，返回这次记下的内容。"""
+    key = _outage_key(st)
+    now = datetime.now()
+    with _OUTAGE_LOCK:
+        data = load_outage()
+        rec = data.get(key) or {}
+        rec["t"] = now.isoformat(timespec="seconds")
+        rec["loss"] = int(loss) if loss is not None else None
+        rec["band"] = int(band) if band else None
+        rec["n"] = int(rec.get("n") or 0) + 1      # 同一处断了几次
+        data[key] = rec
+        if len(data) > 12:
+            # 只留最近 12 处。这是个短命的时间戳文件，不是账本 ——
+            # 攒着它没有任何好处，而文件长大会让每拍的读取变慢。
+            data = dict(sorted(data.items(),
+                               key=lambda kv: kv[1].get("t") or "")[-12:])
+        try:
+            OUTAGE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                              encoding="utf-8")
+        except OSError:
+            pass
+        return rec
+
+
+def outage_left(st=None, now=None, window=GUARD_OUTAGE_COOLDOWN):
+    """这地方离「允许再全量测一次」还剩多少秒。0 = 可以测。
+
+    实测中 的原话就是这个功能的需求：「在一个地方重复检测到没网，
+    后续就不测，等一段时间没来才能进行全量测试」。
+    """
+    data = load_outage()
+    keys = [k for k in (_site_key(st), "*") if k]
+    now = now or datetime.now()
+    left = 0.0
+    for k in keys:
+        ts = (data.get(k) or {}).get("t")
+        if not ts:
+            continue
+        try:
+            t = datetime.fromisoformat(str(ts))
+        except (TypeError, ValueError):
+            continue
+        left = max(left, window - (now - t).total_seconds())
+    return max(0.0, left)
 
 
 def guard_memo_rsrp(key, band):
@@ -3598,7 +3705,14 @@ def device_pin_here(st=None):
     except (TypeError, ValueError):
         here = None
     if here is not None and here in (cfg.get("pin_cells") or []):
-        return band                  # 同一处的另一个小区
+        # 还要看频段。PCI 只有 0~503，**每个频段各有一套编号** —— 住处 BAND 3
+        # 读到 350，不代表别处 BAND 40 上的 350 是同一个小区。pin_cells 里存的
+        # 是「设 pin 时那条频段见过的扇区」，所以只在同一条频段上才认。
+        # 实测中 说 pin 权限太高（在餐厅不敢锁别的），这条是可能的
+        # 误伤路径之一，顺手堵上。
+        cur = st.get("band") or _serving_band(st)
+        if not cur or str(cur) == str(band):
+            return band                  # 同一处的另一个小区
     return None
 
 
@@ -3682,6 +3796,7 @@ _KIND_TEXT = {
     "adopt": "启动时设备本来就锁在这条，不是这次决定的",
     "verify": "记忆里那条没记过信号，切过去实测确认",
     "rescue_alt": "锁的这条实在不行了，换记忆里的备选",
+    "outage_try": "整条链路不通，换一条有依据的试试",
     "unlock_bad": "锁着这条实在不行了，解开自救",
     "unlock_move": "人在走动，松开让它自己选",
     "unlock_signal": "锁的这条信号塌了，交还给设备",
@@ -3850,6 +3965,100 @@ def guard_plan_lock(st, memo, serving, quick, cur_rsrp, cur_loss, pinned,
     return key, band, kind, memo_best
 
 
+def guard_good_bands(exclude=None, days=30):
+    """从**别的**位置的记忆里借几条「测出过能用」的频段，按新鲜度排好。
+
+    为什么允许跨位置借：人到了从没来过的地方，当前位置又读不到 PCI（没注册上），
+    本位置一条记录都没有 —— 这时候「等」是最差的选项。实测中 就在
+    一条无覆盖的频段上等了八分钟，最后自己手动换的。
+    借的依据只有一条：这条频段最近在**任何**地方真测出过数据，而不是靠信号好看。
+
+    返回列表而不是单条：第一条试了不通，还得有下一条可试 —— 只给一条的话，
+    「换一条」变成「换过一次就没了」，又回到干等。
+    """
+    try:
+        data = load_sites()
+    except (OSError, ValueError):
+        return []
+    cutoff = datetime.now() - timedelta(days=days)
+    best = {}
+    for rec in data.values():
+        if not isinstance(rec, dict):
+            continue
+        for b, v in (rec.get("bands") or {}).items():
+            if not isinstance(v, dict) or not v.get("last_ok"):
+                continue
+            if exclude is not None and str(b) == str(exclude):
+                continue
+            if (v.get("dead") or 0) >= DEAD_SKIP_MIN and not (v.get("ok") or 0):
+                continue
+            if band_flap(v)[0]:
+                continue
+            try:
+                t = datetime.fromisoformat(str(v.get("last_ok")))
+            except (TypeError, ValueError):
+                continue
+            if t < cutoff:
+                continue
+            # 同一条频段可能出现在多个位置，取最近那次。
+            if str(b) not in best or t > best[str(b)][0]:
+                best[str(b)] = (t, float(v.get("best") or 0))
+    rows = sorted(best.items(), key=lambda kv: (kv[1][0], kv[1][1]), reverse=True)
+    out = []
+    for b, _ in rows:
+        try:
+            out.append(int(b))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def guard_any_good_band(exclude=None, days=30):
+    """第一条能借的（`guard_good_bands` 的简写）。借不到返回 None。"""
+    rows = guard_good_bands(exclude=exclude, days=days)
+    return rows[0] if rows else None
+
+
+def guard_outage_choice(st, *, serving=None, pinned=None, tried=None):
+    """**整条链路不通**的时候，要不要试着换一条频段。返回 (band, 理由)。
+
+    这是「没信号还等很久」那条路的出口。原来的状态机只在两种情况下会动：
+    锁着且连续不通（解锁）、或者解锁后仍不通（体检）。而「设备没锁、驻留在
+    一条无覆盖的频段上」既不满足前者也不满足后者 —— 于是什么都不做，一直等，
+    等到用户自己动手（实机 2026-11-02 18:56~19:04）。
+
+    判断原则：只做有依据的切换，不猜。
+      1. 有人指定过这条（位置对得上）→ 试它，人的判断比程序硬。
+      2. 本位置的记忆里有另一条测出过能用的 → 试它。
+      3. 哪儿都没有 → 从「任何地方测出过能用」的里面借一条（见 guard_any_good_band）。
+      4. 连借都借不到 → 不动，如实说「没有依据，先等着」。
+    tried：这一轮断网里已经试过的频段，避免在两条之间来回跳。
+    """
+    tried = {str(x) for x in (tried or ()) if x}
+
+    def _now(band, why):
+        if str(band) in tried:
+            return None, f"BAND {band} 这一轮已经试过了（{why}），不来回折腾"
+        return int(band), why
+
+    if pinned and str(pinned) not in tried:
+        return _now(pinned, "你指定过这条")
+    alt = guard_alt_band(st, skip=serving)
+    if alt:
+        band, why = _now(alt, "这处的记忆里还有一条能用的")
+        if band:
+            return band, why
+    # 借的时候要挑「这一轮还没试过的第一条」，不能永远返回同一条 ——
+    # 否则试过它就再没候选，「换一条」变成「换过一次就没了」（模拟里踩到）。
+    for borrowed in guard_good_bands(exclude=serving):
+        if str(borrowed) in tried:
+            continue
+        return int(borrowed), "别处最近测出过能用"
+    # 走到这儿说明要么真没依据，要么这一轮该试的都试过了 —— 两句话对用户
+    # 意义完全不同（「我不知道换啥」vs「我换过了，等它恢复」），不能都返回空。
+    return None, ("这一轮能试的都试过了" if tried else "")
+
+
 def mark_site_provisional(key, band, force_best=False):
     """记一笔「这个位置只是先锁住，没实测过」：下次来要补一次完整体检。
 
@@ -4008,6 +4217,13 @@ def note_decision(key, entry, only_if_empty=False):
 
     返回：写成功 → 那条账目；没写 → 一句原因（调用方可以原样打给人看）。
     """
+    if not key and entry:
+        # 读不到 PCI 时（断网/没注册上）也要记。原来这里直接返回「没有位置键」，
+        # 于是最需要留痕的那几分钟恰好一页空白 —— 实测中 点开
+        # 「锁频段的依据」想看那八分钟发生了什么，什么也看不到。
+        # 归到一个占位键下：账本是「这次为什么锁这条」，不是位置记忆，
+        # 混在一处不影响任何判断，只是条目按时间排在一起。
+        key = "?-" + str((entry or {}).get("op") or "未知")
     if not key or not entry:
         return "没有位置键"
     with _DEC_LOCK:
@@ -4526,21 +4742,42 @@ def _guard_plan_band(prefer=None):
     0.6.9 的教训是「拿不可信的数据切频段」，这里同理：宁可锁现在这条，
     也别照着过山车一样的数字跳。
 
+    **但「当前这条体检判了无信号」是硬结论，不受可信度影响。**
+    实机 2026-11-02 18:55：设备锁在 BAND 41，体检里 41 明确是
+    「无信号（当地没这个频段）」，可 BAND 3 那一轮单轮 [27.0, 23.4, 2.8]
+    波动太大被判 reliable=False，于是退回 prefer=41 —— 把设备锁回了一条
+    刚刚被自己判死的频段，18:56:41 又是丢包 100%。数据可不可信是一回事，
+    「这条有没有覆盖」是另一回事，后者只认 RSRP，不认速度。
+
     返回 None 表示连退路都没有，调用方应如实说「没锁上」。
     """
     try:
         plan = json.loads(PLAN.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return prefer
-    if plan.get("reliable") is False and prefer:
-        return prefer
-    usable = bands_worth_comparing(plan.get("lte") or [])
+    rows = plan.get("lte") or []
+    dead = {r.get("band") for r in rows
+            if not r.get("ok") and r.get("reason") == "no_signal"}
+    if plan.get("reliable") is False:
+        if prefer and str(prefer) not in {str(b) for b in dead}:
+            return prefer
+        # 当前这条没覆盖 → 从有信号的里面挑一条。这里不排序：数据不可信时
+        # 排序就是在噪声上做决定，而「有没有信号」不需要精度。
+        for r in rows:
+            if r.get("ok"):
+                return r.get("band")
+        return None if prefer else prefer
+    usable = bands_worth_comparing(rows)
     if usable:
         usable.sort(key=lambda r: (-(r.get("mbps") or 0), r.get("avg") or 999))
         return usable[0].get("band") or prefer
     # 一个都没测出来（全无覆盖）：退回落盘的目标频段；那也可能是 0（自动）。
     band = (plan.get("target") or {}).get("band")
-    return band or prefer
+    if band:
+        return band
+    if prefer and str(prefer) in {str(b) for b in dead}:
+        return None                     # 别把设备锁在没有覆盖的频段上
+    return prefer
 
 
 def _guard_verify_memo(dev, memo, serving, key, speed_url, host, trace=None):
@@ -4592,14 +4829,23 @@ def _guard_verify_memo(dev, memo, serving, key, speed_url, host, trace=None):
     return None, False
 
 
-def _guard_measure(args, prefer=None):
+def _guard_measure(args, prefer=None, *, net_down=False):
     """跑一次完整体检，返回它选出的最优频段（读不到就是 None）。
 
     另起子进程，会自己登录设备 —— 和守护进程的长连接互相顶掉（KICKOFF），
     所以调用方必须先把 dev 放掉，跑完重连。
+
+    net_down=True（此刻整条链路不通）时**直接拒绝**，一次都不跑。
+    体检的每一个频段都要靠下载测速，链路断着的时候六段全是 0，结论必然是
+    「保持现状」；唯一确定产出的是 5 分钟断网和四次射频重启。实机
+    2026-11-02 18:47:46 → 18:55:55 就是这么白跑的，回来还是丢包 100%。
     """
+    if net_down:
+        print("      [!] 现在整条链路不通，体检测出来会全是 0（唯一确定的结果是"
+              "再断网几分钟）—— 这次不测，等网络恢复", flush=True)
+        return None
     print("      跑完整体检选最优（会断网几次，约 5 分钟）…", flush=True)
-    code = run_cycle(args)
+    code = run_cycle(args, lte_only=True)
     band = _guard_plan_band(prefer) if code == 0 else prefer
     print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
     return band
@@ -4761,6 +5007,9 @@ def run_guard(args, cfg):
     pending_tries = 0                    # 落地失败的重试次数（3 次就认，别无限折腾设备）
     last_loss_note = 0.0                 # 上次把「高丢包」写进记忆的时刻
     last_rsrp_note = 0.0                 # 上次把「采样到的信号」写进记忆的时刻
+    last_outage_note = 0.0               # 上次把「这儿没网」写进 outage 的时刻
+    outage_tried = set()                 # 这一轮断网里已经试过的频段（别来回跳）
+    last_quiet_why = ""                  # 上次说过的「什么都不做」的理由（防刷屏）
     place, place_key = "", ""            # 这地方叫什么（`--here` 起的名字），按 PCI 缓存
     lock_rsrp_hist = deque(maxlen=GUARD_LOCK_SIGNAL_WIN)   # 锁住这条原本有多少信号
     lock_ref_band = 0                    # 参考值是给哪条频段记的（换条就重来）
@@ -4842,7 +5091,14 @@ def run_guard(args, cfg):
             # 读到 st["band"]=40，就认定「锁定 BAND 40」开始纯监控 —— 屏幕写着
             # 锁定，用户要的却是 3，pinned 连读都没读到。
             # 这里把「锁错」降级成「没锁」，让它走正常的选带流程（pin 优先）。
-            pin_goal = site_pinned(st) or device_pin()
+            #
+            # 必须用 device_pin_here 而不是 device_pin：后者是**全局**的，
+            # 把住处说的「优先 3」带到了所有地方。实机 2026-11-02 19:00 用户
+            # 的原话是「pin band3 的权限太高，我在餐厅的时候不敢锁」—— 餐厅里
+            # 设备锁着一条能用的，却因为不是 3 被判「没锁对」，状态回退成未锁，
+            # 重新决策时又读不到 PCI，最后跑了 5 分钟体检（18:47→18:55）。
+            # 位置对不上的地方，这条 pin 本来就不该开口。
+            pin_goal = site_pinned(st) or device_pin_here(st)
             if locked and pin_overrides_lock(locked_band, pin_goal):
                 print(f"{_now_hm()}  设备当前锁在 BAND {locked_band}，"
                       f"但你指定过 BAND {pin_goal} —— 按「没锁对」处理",
@@ -4958,10 +5214,24 @@ def run_guard(args, cfg):
 
             # 「这条链路现在还撑得住吗」。除了不通和丢包过半，延迟离谱也算：
             # 实机 17:24 延迟 4402ms、只丢 10%，原来会被当成完全正常。
+            # ping 现在带 down 标记：ICMP 全无回显**且** TCP 也握不上手才算
+            # 「整条链路不通」，光 ICMP 不通只说明这个位置禁 ICMP。
             avg_ms = ping["avg"]
-            bad_now = (avg_ms is None or (ping["loss"] or 0) >= GUARD_BAD_LOSS
+            net_down = bool(ping.get("down"))
+            bad_now = (net_down or avg_ms is None
+                       or (ping["loss"] or 0) >= GUARD_BAD_LOSS
                        or avg_ms >= GUARD_LAG_MS)
             bad_streak = bad_streak + 1 if bad_now else 0
+            if not bad_now:
+                outage_tried.clear()        # 网络回来了，下一轮断网可以重新试
+            elif serving:
+                # 当前这条已经证明不行了，记下来：这一轮别再往它身上试。
+                outage_tried.add(str(serving))
+            # 断网要留痕（也用来算冷却窗口）。节流到每 60 秒一次：
+            # 这是给「别反复测」用的时间戳，不是采样日志。
+            if not dry and bad_now and now - last_outage_note >= 60:
+                note_outage(st, loss=ping.get("loss"), band=serving)
+                last_outage_note = now
 
             # 高丢包必须留痕。以前只有体检才写样本，于是「这条会周期性掉包」
             # 这个判断永远拿不到证据：BAND 40 昨晚 80%、今天 12:21 又 40%，
@@ -5128,6 +5398,12 @@ def run_guard(args, cfg):
                 if settle_eff < settle:
                     # 分母变小了，得说清凭什么 —— 否则看的人以为是 bug。
                     tag += "（认得的点）"
+            if bad_now:
+                # 断网时把「现在到底在干嘛」写进同一行。实测中 在一条
+                # 无覆盖的频段上等了八分钟，屏幕上只有「延迟 不通 丢包 100%」，
+                # 看不出程序是在等、在测、还是会自己换 —— 最后是他手动换的。
+                tag += ("（锁着也救不回来，先换备选/解锁）" if locked
+                        else "（不通就换一条，不干等）")
             if band_changed and not moving:
                 # 换频段和换小区都会被当成「PCI 变了」，必须分开写清楚：
                 # 前者是设备自己换频段（WiFi 会重启，那几秒必然丢包），
@@ -5225,7 +5501,29 @@ def run_guard(args, cfg):
                 moving=moving, still_sec=still, settle_sec=settle_eff, locked=locked,
                 bad_streak=bad_streak, cooldown_left=max(0.0, next_allowed - now),
                 outage_after_unlock=outage_after_unlock,
-                signal_collapsed=signal_collapsed)
+                signal_collapsed=signal_collapsed, net_ok=not bad_now)
+
+            # 「设备没锁、驻留在一条不通的频段上」原来是个没有任何出口的状态：
+            # 解锁那条要求 locked，体检那条要求「刚解锁过」，两条都不满足就只等。
+            # 实机 2026-11-02：18:56 起一直「未锁（驻留 41）延迟不通 丢包 100%」，
+            # 八分钟没动静，最后是用户自己手动换的频段。
+            #
+            # 这里有个反直觉的地方：**断网时冷却必须让路**。冷却本来是为了
+            # 「别反复切频段」，可断网的时候切换是唯一的出路，一条不行就换下一条
+            # 才是用户要的。防止来回跳靠 outage_tried（同一轮里每条只试一次），
+            # 不靠时间。模拟里第一次就踩到了：换 39 → 仍不通 → 解锁 → 冷却 300 秒，
+            # 屏幕上又是一动不动（tests/manual/sim_outage.py）。
+            if (not action and not locked and not moving and bad_now
+                    and bad_streak >= GUARD_BAD_HITS):
+                cand, cwhy = guard_outage_choice(st, serving=serving,
+                                                 pinned=pinned, tried=outage_tried)
+                if cand:
+                    action, why = "lock", (
+                        f"当前 BAND {serving or '?'} 已经连续 {bad_streak} 次不通 —— "
+                        f"换 BAND {cand} 试试（{cwhy}）")
+                elif not why:
+                    why = ("没有可换的依据（这处没记录、也没指定过），先等网络恢复；"
+                           "恢复不了就把设备挪到窗边试试")
 
             # 演练模式原来只印一句「未改动设备」，锁哪一条、凭什么全都看不到 ——
             # 而这恰恰是演练唯一想看的。所以「锁哪条」的裁决在打印之前就算出来，
@@ -5250,8 +5548,14 @@ def run_guard(args, cfg):
                 plan = guard_plan_lock(st, memo, serving, quick, rsrp,
                                        ping["loss"], pinned, memo_rsrp)
 
+            if not action and why and why != last_quiet_why:
+                # 「什么都不做」也要说出来，但只在这个理由第一次出现时说 ——
+                # 断网时每 10 秒一拍，同一句话刷一屏等于没说。
+                print(f"      → {why}", flush=True)
+                last_quiet_why = why
             if action:
                 print(f"      → {why}", flush=True)
+                last_quiet_why = ""
                 if dry:
                     if plan:
                         aim = f"BAND {plan[1]}" if plan[1] else "（先体检再定）"
@@ -5294,7 +5598,10 @@ def run_guard(args, cfg):
                     # 解锁后的下一拍 still 早就 >= settle，不拦一下就会「解锁 →
                     # 立刻锁回刚被证伪的那条 → 又 100% 丢包」，白断一轮网。
                     # 冷却只挡「主动锁」，不挡自救（unlock/measure 都在它前面判）。
-                    next_allowed = time.time() + GUARD_COOLDOWN
+                    #
+                    # 但**断网时不挂冷却**：这条频段已经证伪，出路是换下一条，
+                    # 而 outage_tried 保证每条只试一次。挂上冷却等于回到「干等」。
+                    next_allowed = 0.0 if bad_now else time.time() + GUARD_COOLDOWN
                 elif action == "unlock":
                     if why == UNLOCK_SIGNAL_COLLAPSE:
                         # 「信号塌了」有两种完全不同的成因，不能都怪到「人走开了」头上：
@@ -5324,7 +5631,7 @@ def run_guard(args, cfg):
                     pci_log.clear()
                     bad_streak = 0
                     quick, quick_done = None, False
-                    next_allowed = time.time() + GUARD_COOLDOWN
+                    next_allowed = 0.0 if bad_now else time.time() + GUARD_COOLDOWN
                 elif action == "lock":
                     # 久坐才走到这里（路过不锁）。锁哪一条交给 guard_pick_lock：
                     # 它会把「记忆里的历史最优」和「刚才快测到的当前速度」放在一起比。
@@ -5474,38 +5781,102 @@ def run_guard(args, cfg):
                                    "而记忆里也没有能换的备选"
                                    if kind == "regret_no_alt" else
                                    (memo_why or "没有可信依据"))
-                            print(f"      → {why}，跑一次完整体检再锁", flush=True)
-                            dev = None
-                            pending_lock = _guard_measure(args, prefer=serving) or serving
-                            # 体检要跑 3~6 分钟，这段时间本来就不采样。不把基线推过来，
-                            # 下一拍会算出「隔了 300 多秒」，把自己刚跑的体检报成系统冻结。
-                            last_beat = time.time()
-                            if pending_lock:
-                                print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
-                                      f"（体检结论「保持现状」不等于「别锁」）", flush=True)
+                            # 两条「不许体检」的闸门，放在这里而不是 guard_decide 里：
+                            # 只有走到这个 else 才真的需要体检，别的分支压根不测。
+                            cold = outage_left(st)
+                            if bad_now:
+                                # ① 链路整条不通 —— 体检六段全 0，见 _guard_measure。
+                                band2, why2 = guard_outage_choice(
+                                    st, serving=serving, pinned=pinned,
+                                    tried=outage_tried)
+                                print(f"      → {why}，但此刻整条链路不通 "
+                                      f"（丢包 {ping.get('loss')}%）—— 体检只会测出 0，不跑",
+                                      flush=True)
+                                if band2:
+                                    print(f"      → 改试 BAND {band2}（{why2}）；"
+                                          f"不通就再换，不干等", flush=True)
+                                    outage_tried.add(str(band2))
+                                    _guard_lock_band(dev, band2, trace={
+                                        "_key": _site_key(st),
+                                        "t": datetime.now().isoformat(timespec="seconds"),
+                                        "kind": "outage_try",
+                                        "serving": serving,
+                                        "rsrp": int(rsrp) if rsrp is not None else None,
+                                        "hour": datetime.now().hour,
+                                        "pre": {"loss": ping.get("loss"),
+                                                "avg": ping.get("avg")},
+                                    })
+                                else:
+                                    print("      → 没有可换的依据（这处没记录、也没指定过），"
+                                          "先等网络自己恢复；这条真不通会再试别处用过的频段",
+                                          flush=True)
+                            elif cold > 0:
+                                # ② 冷却中 —— 用户定的规则：一个地方反复没网就先别测，
+                                # 隔一段时间「没再断」才允许重新全量测。
+                                print(f"      → {why}，但这处在 {int(cold / 60)} 分钟前"
+                                      f"刚断过网 —— 按你的设定先不测，"
+                                      f"再等 {int(cold / 60) + 1} 分钟", flush=True)
                             else:
-                                # 连当前驻留都读不到。不吭声地跳过正是这次要修的病。
-                                print("      [!] 体检没留下结论、也读不到当前驻留频段，"
-                                      "这次没锁上；下一轮重新判断", flush=True)
+                                print(f"      → {why}，跑一次完整体检再锁", flush=True)
+                                dev = None
+                                pending_lock = (_guard_measure(args, prefer=serving)
+                                                or serving)
+                                # 体检要跑 3~6 分钟，这段时间本来就不采样。不把基线推过来，
+                                # 下一拍会算出「隔了 300 多秒」，把自己刚跑的体检报成系统冻结。
+                                last_beat = time.time()
+                                if pending_lock:
+                                    print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
+                                          f"（体检结论「保持现状」不等于「别锁」）", flush=True)
+                                else:
+                                    # 连当前驻留都读不到。不吭声地跳过正是这次要修的病。
+                                    print("      [!] 体检没留下结论、也读不到当前驻留频段，"
+                                          "这次没锁上；下一轮重新判断", flush=True)
                     stable_since = time.time()
                     quick, quick_done = None, False
                 else:  # measure：解锁后仍然不通，说明不是「锁错了」
                     dev = None
                     # 这条路径不是「选最优」，是「救火」：体检完照样得锁回去，
                     # 否则下一轮又会因为「没有记忆」再跑一次体检，无限断网。
-                    pending_lock = _guard_measure(args, prefer=serving) or None
+                    # net_down 时它直接返回 None（体检在断网时毫无信息量）。
+                    pending_lock = _guard_measure(args, prefer=serving,
+                                                  net_down=bad_now) or None
                     last_beat = time.time()   # 同上：救护体检跑的几分钟不算被冻结
                     if not pending_lock:
-                        print("      [!] 救护体检也没能给出可锁的频段，先保持解锁状态",
-                              flush=True)
+                        # 断网时这里不该说「先保持解锁状态」—— 那会让人以为在等
+                        # 设备自救，实际上什么都没发生。挑一条有依据的试。
+                        band2, why2 = guard_outage_choice(
+                            st, serving=serving, pinned=pinned, tried=outage_tried)
+                        if band2:
+                            print(f"      [!] 体检没跑（断网），改试 BAND {band2}"
+                                  f"（{why2}）", flush=True)
+                            outage_tried.add(str(band2))
+                            _guard_lock_band(dev, band2, trace={
+                                "_key": _site_key(st),
+                                "t": datetime.now().isoformat(timespec="seconds"),
+                                "kind": "outage_try",
+                                "serving": serving,
+                                "rsrp": int(rsrp) if rsrp is not None else None,
+                                "hour": datetime.now().hour,
+                                "pre": {"loss": ping.get("loss"),
+                                        "avg": ping.get("avg")},
+                            })
+                        else:
+                            print("      [!] 没有可换的依据，先保持解锁状态等网络恢复",
+                                  flush=True)
                     stable_since = time.time()
                     quick, quick_done = None, False
 
-                next_allowed = time.time() + GUARD_COOLDOWN
+                # 同上：断网时不挂冷却。锁上一条没解决的频段，下一拍就该换下一条，
+                # 而不是原地等 5 分钟（outage_tried 保证不会来回跳）。
+                next_allowed = 0.0 if bad_now else time.time() + GUARD_COOLDOWN
             # 用 Event.wait 而不是 time.sleep：关掉守护时线程要能立刻醒来退出。
             # 原来最坏要等满一个采样间隔（30 秒）—— 用户点了开关，界面上写着
             # 「正在停…」，那半分钟里进程已经不是前台了，正是最容易被杀的时候。
-            _GUARD_STOP.wait(interval)
+            #
+            # 没网的时候把间隔压到 10 秒：链路恢复要尽快发现，别让人盯着
+            # 「延迟 不通」多看半分钟（用户原话「检测到没网跳出太慢」）。
+            # 探测本身已经从 20 秒压到 3 秒，一拍 10+3 秒，比原来 30+20 快得多。
+            _GUARD_STOP.wait(GUARD_OUTAGE_FAST_SEC if bad_now else interval)
     except KeyboardInterrupt:
         _release_wakelock()
         print("\n[守护] 已停止（设备保持当前配置）")
