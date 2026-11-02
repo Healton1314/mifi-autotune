@@ -11,6 +11,7 @@ config.json
 .panel-token
 plan.json
 sites.json
+decisions.json
 autotune-log.jsonl
 *.log
 
