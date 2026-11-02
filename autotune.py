@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.15"
+__version__ = "0.9.16"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -3556,6 +3556,7 @@ _KIND_TEXT = {
     "regret_avoid": "当前这条以前锁过、锁完反倒更差，换备选",
     "regret_no_alt": "当前这条以前锁过、锁完反倒更差，又没备选可换",
     "measure": "体检量出来的结论",
+    "adopt": "启动时设备本来就锁在这条，不是这次决定的",
     "unlock_bad": "锁着这条实在不行了，解开自救",
     "unlock_move": "人在走动，松开让它自己选",
     "unlock_signal": "锁的这条信号塌了，交还给设备",
@@ -3866,7 +3867,7 @@ def note_guard_confirm(key, band, loss=None, avg=None, rsrp=None):
         return 0, False, ""
 
 
-def note_decision(key, entry):
+def note_decision(key, entry, only_if_empty=False):
     """记一笔「这次锁哪条、凭什么、锁前什么样」，留给十分钟后回评。
 
     为什么要单独存一份，而不是只在运行日志里打一行：
@@ -3889,6 +3890,8 @@ def note_decision(key, entry):
             # （那会让选带时以为「这地方来过」，见 _band_slot 的注释）。
             return None
         rows = rec.setdefault("decisions", [])
+        if only_if_empty and rows:
+            return None
         rows.append(entry)
         del rows[:-DECISIONS_KEEP]
         save_sites(data)
@@ -3938,6 +3941,10 @@ def review_last_lock(key, band, loss=None, avg=None, rsrp=None, now=None):
                 continue        # 解锁也记账，但它不是「锁到这条上」，不能拿来评
             if e.get("out"):
                 continue        # 评过了，找更早那条还没评的
+            if not isinstance(e.get("pre"), dict) or not e.get("pre"):
+                # 没有锁前基线（接手记录 / 老版本账本）：评不了，跳过。
+                # 不跳过的话它会一直排在队首，把它后面那条真能评的挡住。
+                continue
             hit = e
             break
         if hit is None:
@@ -4621,6 +4628,7 @@ def run_guard(args, cfg):
     locked_since = 0.0                   # 这一轮锁定是从哪一刻开始的
     lock_confirmed = False               # 这一轮锁定已经记过账了（一次锁定只记一次）
     lock_reviewed = False                # 这一轮回评过了（锁前 vs 锁后）
+    adopted = False                      # 启动时那条「本来就锁着」记过账没有
     last_beat = 0.0                      # 上一拍的开始时刻（用来发现被系统挂起）
     hangs = 0                            # 被系统挂起过几次
     next_audit = 0.0                     # 下次「锁定复核」的时刻
@@ -4724,6 +4732,17 @@ def run_guard(args, cfg):
                 locked_since = 0.0
                 lock_confirmed = False
                 lock_reviewed = False
+            if locked and not adopted:
+                adopted = True
+                # 启动时设备本来就锁着一条 —— 这不是这次的决定，但账本第一次
+                # 见到这个位置时值得记一笔：否则用户点开「锁频段的依据」只有
+                # 一片空白，会以为功能没生效。only_if_empty 保证每处只记这一次，
+                # 不会每次重启守护都塞一条。
+                note_decision(_site_key(st), {
+                    "t": datetime.now().isoformat(timespec="seconds"),
+                    "kind": "adopt", "band": int(locked_band),
+                    "serving": locked_band,
+                }, only_if_empty=True)
             lock_ref = max(lock_rsrp_hist) if lock_rsrp_hist else None
             lock_weak_hits = (lock_weak_hits + 1
                               if lock_signal_collapsed(lock_ref, rsrp) else 0)

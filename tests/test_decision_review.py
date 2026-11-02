@@ -143,6 +143,22 @@ class ReviewLastLock(_Sites):
         rec = self.read_sites()["236-CMCC"]
         self.assertNotIn("review", rec["bands"].get("40") or {})
 
+    def test_baseline_less_entry_does_not_shadow_a_real_one(self):
+        """没有锁前基线的条目（接手记录 / 老账本）不能挡住它后面那条能评的。
+
+        实机 2026-11-02：守护启动时设备本来就锁着 BAND 3，会记一条「接手」。
+        要是它一直排在队首、每次扫描都先撞到它，后面真正能评的那条永远评不到。
+        """
+        adopt = self._decision(kind="adopt")
+        adopt["pre"] = None                     # 接手记录没有锁前基线
+        self.write_sites(self.site(decisions=[
+            adopt,
+            self._decision(band=3, pre={"loss": 0, "avg": 70}),
+        ]))
+        verdict, pre, _, _ = A.review_last_lock("236-CMCC", 3, loss=50, avg=70)
+        self.assertEqual(verdict, "worse")
+        self.assertEqual(pre["loss"], 0)
+
     def test_without_baseline_says_unknown(self):
         # 老版本留下的账本没有 pre：不猜，也不写一个假结论
         self.write_sites(self.site(decisions=[{"t": "x", "band": 3, "kind": "memo"}]))
@@ -214,6 +230,16 @@ class Ledger(_Sites):
         rec = self.read_sites()["236-CMCC"]
         self.assertEqual(len(rec["decisions"]), A.DECISIONS_KEEP)
         self.assertIn("11:0", json.dumps(rec["decisions"][0]["t"]) + "11:0")
+
+    def test_only_if_empty(self):
+        """「启动时本来锁着」那条只在账本为空时记一次，别每次重启都塞。"""
+        self.write_sites(self.site())
+        A.note_decision("236-CMCC", self._e("2026-11-02T11:00:00"), only_if_empty=True)
+        A.note_decision("236-CMCC", self._e("2026-11-02T11:05:00"), only_if_empty=True)
+        self.assertEqual(len(self.read_sites()["236-CMCC"]["decisions"]), 1)
+        # 账本里已经有真决策了，再调一次也不会加
+        A.note_decision("236-CMCC", self._e("2026-11-02T11:10:00"), only_if_empty=True)
+        self.assertEqual(len(self.read_sites()["236-CMCC"]["decisions"]), 1)
 
     def test_unknown_site_does_not_create_one(self):
         # 不为了记一笔账就凭空造一条位置记忆（选带时会以为「这儿来过」）
