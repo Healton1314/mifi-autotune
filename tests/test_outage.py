@@ -296,6 +296,11 @@ class PinNeedsTheSameBand(unittest.TestCase):
         st = {"band": 3, "signal": {"pci": "350", "operator": "CMCC"}}
         self.assertEqual(A.device_pin_here(st), 3)
 
+    def test_site_key_alone_is_not_enough_on_another_band(self):
+        """位置键是「PCI-运营商」，不带频段 —— 换条频段读到同样的数字不算老地方。"""
+        st = {"band": 40, "signal": {"pci": "350", "operator": "CMCC"}}
+        self.assertIsNone(A.device_pin_here(st))
+
     def test_second_cell_same_band_hits(self):
         st = {"band": 3, "signal": {"pci": "141", "operator": "CMCC"}}
         self.assertEqual(A.device_pin_here(st), 3)
@@ -308,6 +313,31 @@ class PinNeedsTheSameBand(unittest.TestCase):
     def test_other_site_misses(self):
         st = {"band": 3, "signal": {"pci": "88", "operator": "CMCC"}}
         self.assertIsNone(A.device_pin_here(st))
+
+
+class MeasureEta(unittest.TestCase):
+    """别再写死「约 5 分钟」—— 实机跑过 8 分 9 秒，等的人以为卡死了。"""
+
+    def setUp(self):
+        d = Path(tempfile.mkdtemp())
+        self.plan = d / "plan.json"
+        self._p = [mock.patch.object(A, "PLAN", self.plan)]
+        for p in self._p:
+            p.start()
+
+    def tearDown(self):
+        for p in self._p:
+            p.stop()
+
+    def test_counts_bands_from_last_plan(self):
+        self.plan.write_text(json.dumps({"lte": [{"band": b} for b in (3, 8, 39, 40, 41)]}),
+                             encoding="utf-8")
+        eta = A._measure_eta()
+        self.assertIn("5 个频段", eta)
+        self.assertIn("6 分钟", eta)     # 5 × 70s ≈ 5.8 分
+
+    def test_falls_back_without_plan(self):
+        self.assertEqual(A._measure_eta(), "约 5~8 分钟")
 
 
 if __name__ == "__main__":

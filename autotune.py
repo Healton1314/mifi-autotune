@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.21"
+__version__ = "0.9.22"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -3680,11 +3680,25 @@ def set_device_pin(band, st=None):
         pass
 
 
+def _pin_band_matches(st, band):
+    """当前驻留的频段是不是 pin 说的那条（读不到频段时无从否认，算命中）。
+
+    PCI 只有 0~503，**每个频段各有一套编号** —— 住处 BAND 3 读到 350，
+    不代表别处 BAND 40 上的 350 是同一个小区。所以「同一个 PCI」只有在
+    同一条频段上才等于「同一个地方」。实测中 说 pin 权限太高
+    （在餐厅不敢锁别的），这是误伤的路径之一：位置键只按 PCI-运营商 拼，
+    换个频段读到同样的数字就认成了老地方。
+    """
+    cur = st.get("band") or _serving_band(st)
+    return not cur or str(cur) == str(band)
+
+
 def device_pin_here(st=None):
     """这条 pin 对**现在这个地方**算不算数。
 
-    规则：pin 记了来源位置（pin_site / pin_cells）时，当前小区必须在那组里 ——
-    否则就是「别处说的话」，不生效。没记来源（老数据）时退回原来的行为。
+    规则：pin 记了来源位置（pin_site / pin_cells）时，当前小区必须在那组里、
+    而且要在同一条频段上 —— 否则就是「别处说的话」，不生效。没记来源
+    （老数据）时退回原来的行为。
 
     为什么要这一层：住处的偏好被当成设备级偏好用，就是办公区那次误伤的全部原因。
     """
@@ -3698,20 +3712,14 @@ def device_pin_here(st=None):
     site = cfg.get("pin_site")
     if not site:
         return band                  # 老数据：没记来源，按原样生效（有时效兜着）
-    if _site_key(st) == site:
+    if _site_key(st) == site and _pin_band_matches(st, band):
         return band
     try:
         here = _pci_num((st.get("signal") or {}).get("pci"))
     except (TypeError, ValueError):
         here = None
     if here is not None and here in (cfg.get("pin_cells") or []):
-        # 还要看频段。PCI 只有 0~503，**每个频段各有一套编号** —— 住处 BAND 3
-        # 读到 350，不代表别处 BAND 40 上的 350 是同一个小区。pin_cells 里存的
-        # 是「设 pin 时那条频段见过的扇区」，所以只在同一条频段上才认。
-        # 实测中 说 pin 权限太高（在餐厅不敢锁别的），这条是可能的
-        # 误伤路径之一，顺手堵上。
-        cur = st.get("band") or _serving_band(st)
-        if not cur or str(cur) == str(band):
+        if _pin_band_matches(st, band):
             return band                  # 同一处的另一个小区
     return None
 
@@ -4829,6 +4837,23 @@ def _guard_verify_memo(dev, memo, serving, key, speed_url, host, trace=None):
     return None, False
 
 
+def _measure_eta():
+    """估一下这次体检要多久，给等待的人一个准数。
+
+    原来写死「约 5 分钟」，实机 2026-11-02 18:47 那轮跑了 8 分 9 秒 ——
+    等的人看着「5 分钟」早就该好了，会以为卡死。按上次测过的频段数算，
+    每段 3 轮约 85 秒、没覆盖的会提前退出，所以取 70 秒/段。
+    """
+    try:
+        rows = json.loads(PLAN.read_text(encoding="utf-8")).get("lte") or []
+        n = len(rows)
+    except (OSError, ValueError, AttributeError):
+        n = 0
+    if not n:
+        return "约 5~8 分钟"
+    return f"约 {max(2, round(n * 70 / 60))} 分钟（{n} 个频段）"
+
+
 def _guard_measure(args, prefer=None, *, net_down=False):
     """跑一次完整体检，返回它选出的最优频段（读不到就是 None）。
 
@@ -4844,7 +4869,7 @@ def _guard_measure(args, prefer=None, *, net_down=False):
         print("      [!] 现在整条链路不通，体检测出来会全是 0（唯一确定的结果是"
               "再断网几分钟）—— 这次不测，等网络恢复", flush=True)
         return None
-    print("      跑完整体检选最优（会断网几次，约 5 分钟）…", flush=True)
+    print(f"      跑完整体检选最优（会断网几次，{_measure_eta()}）…", flush=True)
     code = run_cycle(args, lte_only=True)
     band = _guard_plan_band(prefer) if code == 0 else prefer
     print(f"      体检结束（exit={code}），重新接管设备…", flush=True)

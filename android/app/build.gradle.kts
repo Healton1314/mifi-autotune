@@ -49,10 +49,10 @@ android {
         applicationId = "io.github.mifiautotune.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 22
+        versionCode = 23
         // 跟 autotune.__version__ 对齐：手机上排查「装的到底是哪一版」时，
         // APK 版本和面板里显示的对不上会白折腾半天。
-        versionName = "0.9.21"
+        versionName = "0.9.22"
 
         // 只要真机 ABI，而且只留 64 位。
         //
