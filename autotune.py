@@ -40,7 +40,7 @@ CONFIG = HERE / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.13"
+__version__ = "0.9.14"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -112,6 +112,16 @@ SITE_SAMPLES = 8                    # 每个频段保留几个样本
 SITE_LOSS_BAD = 20                  # 单次丢包 ≥ 这个值算「这次掉包了」
 SITE_FLAP_RATIO = 0.3               # 历史样本里掉包占比 ≥ 30% → 判为「会周期性掉包」
 SITE_FLAP_MIN_BAD = 2               # 坏样本至少这么多条才定罪：单次偶发不算
+# 「按时段看丢包」的窗口和门槛。
+#
+# 实测中：「band40 在住处尤其是晚上丢包严重，但是在其他地方他的
+# 可用性还是很高的」。全天平均会把这个信息抹平 —— 晚上掉 100%、白天一次没掉，
+# 平均下来只是「这条偶尔掉」，于是白天的好时段被连坐、晚上的坏时段又不够刺眼。
+GUARD_FLAP_HOUR_WINDOW = 2          # 当前钟点前后几小时算「这个时段」
+GUARD_FLAP_HOUR_MIN = 2             # 这个时段至少几条样本才敢用它下结论
+# 比全天那条（30%）严得多：时段窗口窄、样本少，用 30% 的话「2 条里 1 条坏」
+# 就能给整条频段定罪 —— 而一次偶发（隔壁开微波炉）不该让晚上不能用它。
+GUARD_FLAP_HOUR_RATIO = 0.6
 FLAP_SWAP_RATIO = 0.85              # 稳的那个只要不慢过 15%，就优先它
 SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分钟内 → 算同一个地方
 # 一个位置「见过哪些小区」。为什么不能只靠上面那条时间窗：20 分钟一过，
@@ -1225,7 +1235,13 @@ def band_plan(rec, bands, serving=None, now=None):
     return keep, dead_list, slow, best
 
 
-def band_flap(v):
+def _hour_dist(a, b):
+    """两个钟点差几个小时（跨午夜，23 点和 1 点差 2 而不是 22）。"""
+    d = abs(int(a) - int(b)) % 24
+    return min(d, 24 - d)
+
+
+def band_flap(v, hour=None):
     """这个频段是不是「会周期性掉包」。返回 (是否掉包, 掉包占比, 样本数)。
 
     只看攒下来的历史样本：一次 54 秒的体检根本碰不到「每 3~5 分钟掉一次」
@@ -1236,11 +1252,36 @@ def band_flap(v):
     电梯里过一下，就能把一条好频段打成「会周期性掉包」。而洗掉这个污点很慢：
     守护链路正常时不写样本，只有体检每次给每个频段写 1 条，得攒够 8 次
     体检才把它挤出样本池。等于一次偶发 = 长期判死刑。
+
+    **hour 给了就先按时段看**（实测中 的原话：「band40 在住处尤其是
+    晚上丢包严重，但是在其他地方他的可用性还是很高的」）。只看当前钟点前后
+    GUARD_FLAP_HOUR_WINDOW 小时的样本：
+
+      · 那个时段样本够、而且坏得多 → 就是「这个点儿不行」，判掉包；
+      · 那个时段干干净净 → 明确不判，白天照常可以用它；
+      · 那个时段有坏样本但不够定罪 → 落回全天判定（宁可保守）。
+
+    为什么要额外一层：全天判定把「晚上掉 100%」和「白天一次没掉」平均成一个
+    百分比，结论只剩「这条偶尔掉」—— 于是白天的好时段被连坐，晚上的坏时段
+    反而不够刺眼。时段判定让「几点该用哪条」真的能学出来。
     """
     rows = [s for s in ((v or {}).get("samples") or [])
             if isinstance(s, (list, tuple)) and len(s) >= 4]
     if len(rows) < 2:
         return False, 0.0, len(rows)
+
+    if hour is not None:
+        near = [s for s in rows
+                if _hour_dist(_num(s[0]) or 0, hour) <= GUARD_FLAP_HOUR_WINDOW]
+        if len(near) >= GUARD_FLAP_HOUR_MIN:
+            nbad = sum(1 for s in near if (_num(s[2]) or 0) >= SITE_LOSS_BAD)
+            nratio = nbad / float(len(near))
+            if nbad and nratio >= GUARD_FLAP_HOUR_RATIO:
+                return True, nratio, len(near)
+            if nbad == 0:
+                return False, 0.0, len(near)
+            # 有几条坏的但不够定罪 —— 别放行，交给下面的全天判定
+
     bad = sum(1 for s in rows if (_num(s[2]) or 0) >= SITE_LOSS_BAD)
     ratio = bad / float(len(rows))
     if bad < SITE_FLAP_MIN_BAD:
@@ -1248,12 +1289,14 @@ def band_flap(v):
     return ratio >= SITE_FLAP_RATIO, ratio, len(rows)
 
 
-def site_band_flap(st, band):
+def site_band_flap(st, band, hour=None):
     """这个位置、这条频段在记忆里是不是「会周期性掉包」。
 
     信号强度和「会不会周期性掉包」是两件独立的事，而且后者只在历史样本里
     看得出来（见 band_flap 的注释：一次 54 秒的体检碰不到「每 3~5 分钟掉一次」
     那个窗口）。所以选带时必须单独查一次，不能拿 RSRP 代替。
+
+    hour 默认取当前钟点 —— 判定要按「现在这个点儿」看，而不是把一整天平均。
     """
     if not band:
         return False
@@ -1268,7 +1311,11 @@ def site_band_flap(st, band):
     v = (rec.get("bands") or {}).get(str(int(band)))
     if not isinstance(v, dict):
         return False
-    return band_flap(v)[0]
+    try:
+        h = datetime.now().hour if hour is None else int(hour)
+    except (TypeError, ValueError):
+        h = None
+    return band_flap(v, hour=h)[0]
 
 
 def prefer_stable_over_flap(usable, hist, fastest):
@@ -4613,6 +4660,10 @@ def run_guard(args, cfg):
                 # 让人看得懂「为什么 PCI 变了却还在计时」：是设备自己换的小区。
                 tag += ("（换小区·设备重选，信号掉了）" if dropped_rsrp
                         else "（换小区·设备重选）")
+            if serving and not moving and site_band_flap(st, serving):
+                # 把「它学到了什么」摆出来。按时段判了这条会掉包，可屏幕上只有
+                # 「监控中」，用户根本不知道这条已经被记为「这个点儿不行」。
+                tag += "（这个点儿这条会掉包）"
             print(f"{_now_hm()}  {who:<18} PCI {pci if pci is not None else '—':<4} "
                   f"{sig.get('rsrp') or '—':<8} 延迟 {lat:<7} 丢包 {ping['loss']}%  {tag}",
                   flush=True)

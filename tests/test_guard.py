@@ -1468,3 +1468,69 @@ class DevicePinScope(unittest.TestCase):
     def test_no_state_returns_pin(self):
         with mock.patch.object(A, "load_config", return_value=self.cfg):
             self.assertEqual(A.device_pin_here(None), 3)
+
+
+class BandFlapByHour(unittest.TestCase):
+    """「住处 BAND 40 尤其晚上丢包严重，别处可用性很高」—— 判定得分时段。
+
+    实测中 的原话：「band40 在住处尤其是晚上丢包严重，但是在其他地方
+    他的可用性还是很高的」。全天平均会把这个信息抹平：晚上掉 100%、白天一次
+    没掉，平均下来只剩「这条偶尔掉」，于是白天的好时段被连坐、晚上的坏时段
+    又不够刺眼。
+    """
+
+    @staticmethod
+    def _v(rows):
+        return {"samples": rows}
+
+    def test_evening_bad_is_caught(self):
+        rows = [[20, 16, 0, 60, -77], [21, 16, 80, 500, -78],
+                [22, 16, 100, 900, -79]]
+        self.assertTrue(A.band_flap(self._v(rows), hour=21)[0])
+
+    def test_daytime_clean_is_not_dragged_down_by_evening(self):
+        rows = [[20, 16, 0, 60, -77], [21, 16, 80, 500, -78],
+                [22, 16, 100, 900, -79],
+                [10, 16, 0, 55, -75], [11, 16, 0, 58, -76], [12, 16, 0, 61, -77]]
+        # 白天那三条干干净净 → 白天不该被晚上的记录连坐
+        self.assertFalse(A.band_flap(self._v(rows), hour=11)[0])
+        # 晚上那三条里两条坏 → 晚上要判
+        self.assertTrue(A.band_flap(self._v(rows), hour=21)[0])
+
+    def test_single_bad_inside_window_is_not_enough(self):
+        # 时段内只有 2 条、1 条坏（50% 没到 60%）→ 不定罪，落回全天也不够
+        rows = [[10, 16, 0, 60, -77], [11, 16, 100, 900, -79]]
+        self.assertFalse(A.band_flap(self._v(rows), hour=11)[0])
+
+    def test_cross_midnight_window(self):
+        # 23 点和 0 点只差 1 小时，别算成 23
+        rows = [[23, 16, 100, 900, -79], [0, 16, 90, 700, -80]]
+        self.assertTrue(A.band_flap(self._v(rows), hour=1)[0])
+
+    def test_falls_back_when_window_is_empty(self):
+        # 只有凌晨的样本，现在中午 —— 不知道中午怎样，保守按全天判
+        rows = [[3, 16, 100, 900, -79], [4, 16, 100, 900, -79]]
+        self.assertTrue(A.band_flap(self._v(rows), hour=12)[0])
+
+    def test_without_hour_keeps_old_behaviour(self):
+        # 不传 hour 就是原来的全天判定，别悄悄改掉别处的行为
+        rows = [[21, 16, 0, 60, -77], [22, 16, 80, 500, -78],
+                [23, 16, 100, 900, -79]]
+        self.assertTrue(A.band_flap(self._v(rows))[0])
+
+    def test_site_band_flap_uses_current_hour_by_default(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp()) / "sites.json"
+        now_h = A.datetime.now().hour
+        rows = [[now_h, 16, 80, 500, -78], [(now_h + 1) % 24, 16, 100, 900, -79]]
+        tmp.write_text(json.dumps({"236-CMCC": {
+            "seen": 2, "best": 40,
+            "bands": {"40": {"ok": 2, "best": 16, "dead": 0, "samples": rows}}}},
+            ensure_ascii=False), encoding="utf-8")
+        st = {"band": 40, "signal": {"pci": "236", "operator": "CMCC"}}
+        with mock.patch.object(A, "SITES", tmp):
+            self.assertTrue(A.site_band_flap(st, 40))
+            # 换个离现在很远的钟点：没有那个时段的样本 → 落回全天 → 仍然判
+            self.assertTrue(A.site_band_flap(st, 40, hour=(now_h + 12) % 24))
