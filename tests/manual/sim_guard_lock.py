@@ -4,6 +4,7 @@
     python tests/manual/sim_guard_lock.py blind     # 场景一：体检完必须真的锁上
     python tests/manual/sim_guard_lock.py verify    # 场景二：熟悉的地方要验证记忆
     python tests/manual/sim_guard_lock.py share     # 场景三：守护的采样写进同一本记忆
+    python tests/manual/sim_guard_lock.py review    # 场景四：锁完十分钟的回评（约 30 秒）
 
 不是 unittest —— 场景一/二要跑 80 秒左右（守护的 settle 有下限），场景三
 只要几拍就收工，手动执行。
@@ -69,11 +70,16 @@ class FakeDev:
         return True
 
 
-DEV = FakeDev(serving=40 if MODE == "verify" else 3)
+DEV = FakeDev(serving=40 if MODE in ("verify", "review") else 3)
 if MODE == "share":
     DEV.band = 3                     # 用户已经手动锁了 BAND 3 —— 设备就停在这条上
 
 CREATED = time.strftime("%Y-%m-%dT%H:%M:%S")
+if MODE == "review":
+    (TMP / "config.json").write_text(json.dumps({
+        "pin_band": 3,
+        "pin_at": CREATED,
+    }), encoding="utf-8")
 if MODE == "verify":
     # 今早实机：最优写的是 BAND 3，但只有速度、没有信号
     SITES.write_text(json.dumps({
@@ -138,8 +144,8 @@ def fake_quick(speed_url, host, **kw):
             "samples": [3.0, 3.0], "grade": "poor", "band": b}
 
 
-def spy_lock(dev, band):
-    ok = A.__dict__["_real_lock"](dev, band)
+def spy_lock(dev, band, trace=None):
+    ok = A.__dict__["_real_lock"](dev, band, trace=trace)
     if MODE == "verify" and int(band) == int(DEV.serving()):
         raise KeyboardInterrupt      # 场景二：切到目标频段、测完就收工
     return ok
@@ -167,9 +173,35 @@ A.probe.ping_stats = lambda n, host: {"avg": 55, "loss": 0, "jitter": 5.0}
 A.__dict__["_real_lock"] = A._guard_lock_band
 A._guard_lock_band = spy_lock
 
+if MODE == "review":
+    # 这一场要看的是「锁定 → 记账 → 十分钟后回评」，所以把节奏压到秒级：
+    # 坐 4 秒就算久坐、锁完 6 秒就回评。判据本身一个字没改。
+    A.GUARD_CONFIRM_SEC = 6
+    A.GUARD_COOLDOWN = 0
+    A.wait_device_back = lambda dev, timeout=60: True     # 不探真网
+    _t0 = time.time()
+
+    def _ping(n, host):
+        # 锁之前（含锁定那一拍）丢 20% 的包，锁上之后就干净了 —— 正是
+        # 「锁对了」该长成的样子。60s 是守护坐满才锁的时刻（interval 有 15s
+        # 下限，settle = interval*4），所以切点放在 62s。
+        loss = 20 if time.time() - _t0 < 62 else 0
+        return {"avg": 96 if loss else 55, "loss": loss, "jitter": 5.0}
+
+    A.probe.ping_stats = _ping
+
+    def _stop_later():
+        time.sleep(105)
+        A._GUARD_STOP.set()
+
+    import threading as _th
+    _th.Thread(target=_stop_later, daemon=True).start()
+
 args = types.SimpleNamespace(
     host="192.168.0.1", user="admin", password="admin", driver=None,
-    guard_interval=15, guard_settle=60, guard_dry_run=False, guard_fast=False,
+    guard_interval=15 if MODE != "review" else 1,
+    guard_settle=60 if MODE != "review" else 4,
+    guard_dry_run=False, guard_fast=False,
 )
 cfg = {"ping_host": "192.168.0.1", "speed_url": None}
 
@@ -192,6 +224,18 @@ if MODE == "share":
     print("[通过] 守护在陌生 PCI 350 采到的信号写进了同一本记忆"
           "（有 observed、没有 last，不算测过）" if ok
           else "[失败] 守护的采样没落账，或把观测记录当成「测过」了")
+elif MODE == "review":
+    # 锁到 BAND 3 那条已经换过频段（驻留 40 → 锁 3），回评该记一功
+    dec = (sites.get("350-CMCC") or {}).get("decisions") or []
+    lock_rows = [d for d in dec if not str(d.get("kind") or "").startswith("unlock")]
+    out = (lock_rows[-1].get("out") if lock_rows else None) or {}
+    rv = ((sites.get("350-CMCC") or {}).get("bands") or {}).get("3", {}).get("review") or {}
+    print("账本:", json.dumps(dec, ensure_ascii=False)[:500])
+    ok = (rc == 0 and DEV.band == 3 and bool(lock_rows)
+          and out.get("verdict") == "better" and out.get("switched") is True
+          and rv.get("good") == 1)
+    print("[通过] 锁定记了账，十分钟后回评判「比锁前好」并记了一功" if ok
+          else "[失败] 账本或回评没走通")
 elif MODE == "verify":
     ok = (bool(DEV.sets) and DEV.sets[0] == 3 and DEV.band == 3
           and best == 3 and rc == 0)
