@@ -280,17 +280,20 @@ class MainActivity : Activity() {
         // 看着就是个大色块），而且主键 16sp、副键 14sp，两键高度差 4px、顶上
         // 齐不了 —— 眼睛看到的是「一大一小还歪着」。
         // 现在：主键吃掉剩余宽度，副键按文字自适应（给个 minWidth 保证不挤），
-        // 两键统一 46dp 高、同一字号，只靠颜色和填充区分主次。
+        // 两键同一字号、同一套内边距，靠颜色和描边分主次。
+        // 高度**不用**写死：实测写 dp(46) 会被这层的测量裁到 39dp，底边直接
+        // 变成平切（圆角没了）—— 用对称内边距撑出来的高度才是可靠的。
         val acts = row()
         btnApply = verdictButton("应用建议", true)
         btnApply.setOnClickListener { applyNow() }
         btnDecline = verdictButton("不用了", false)
         btnDecline.setOnClickListener { declineVerdict() }
         acts.addView(btnApply, LinearLayout.LayoutParams(
-            0, dp(BTN_H), 1f).apply { topMargin = dp(14) })
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
         acts.addView(spacerW(10))
         acts.addView(btnDecline, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(BTN_H)).apply { topMargin = dp(14) })
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(14) })
         verdictBox.addView(acts)
 
         box.addView(verdictBox)
@@ -1270,9 +1273,10 @@ class MainActivity : Activity() {
      *   · 次键：白底细描边、按文字自适应（minWidth 兜底），看得见点得到，
      *     但不抢注意力。
      *
-     * 两键**同高同字号**，只有底色和描边不同。11-03 真机量出来上一版主键
-     * 16sp、次键 14sp，两个键高度差 4px，顶上齐不了 —— 这种一像素级别的不齐
-     * 在大色块旁边特别扎眼。
+     * 两键**同字号同内边距**，高度自然就一样，只有底色和描边不同。
+     * 11-03 真机量出来上一版主键 16sp、次键 14sp，两个键高度差 4px，顶上
+     * 齐不了。反过来的坑也踩了：写死高度 dp(46) 会被这一层测量裁到 39dp，
+     * 底边变成平切 —— 所以高度交给内边距撑，不写死。
      */
     private fun verdictButton(text: String, primary: Boolean) = TextView(this).apply {
         this.text = text
@@ -1298,14 +1302,14 @@ class MainActivity : Activity() {
             ColorStateList.valueOf(
                 if (primary) Color.parseColor("#40FFFFFF")
                 else Color.parseColor("#14000000")), shape, null)
-        setPadding(dp(18), 0, dp(18), 0)
+        setPadding(dp(18), dp(13), dp(18), dp(13))
         // 副键按文字宽度走，但要有个下限：否则「不用了」贴上左右内边距就是
         // 一个窄条，缩成一行小字等于没有拒绝的入口。
         minWidth = dp(84)
         isClickable = true
         isFocusable = true
         layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(BTN_H)
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         )
     }
 
@@ -1377,10 +1381,6 @@ class MainActivity : Activity() {
 
         // 任务种类。目前只有体检需要冻住读数（它要挨个切频段，数字会乱跳）。
         private const val KIND_PREVIEW = "preview"
-
-        // 结论卡片那两个键的高度（dp）。写死而不是靠 padding 撑：主次两键
-        // 字号一旦不同，wrap_content 就会差几个像素，顶上齐不了。
-        private const val BTN_H = 46
 
         private val BG = Color.parseColor("#F7F7F5")
         private val INK = Color.parseColor("#16181D")
