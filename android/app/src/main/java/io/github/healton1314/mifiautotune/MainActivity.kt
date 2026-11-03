@@ -279,19 +279,22 @@ class MainActivity : Activity() {
         // 齐不了 —— 眼睛看到的是「一大一小还歪着」。
         // 现在：主键吃掉剩余宽度，副键按文字自适应（给个 minWidth 保证不挤），
         // 两键同一字号、同一套内边距，靠颜色和描边分主次。
-        // 高度**不用**写死：实测写 dp(46) 会被这层的测量裁到 39dp，底边直接
-        // 变成平切（圆角没了）—— 用对称内边距撑出来的高度才是可靠的。
+        // 间距用**行的 padding**，不要用子 view 的 topMargin。
+        // 这一行（row()）设了 gravity=CENTER_VERTICAL，LinearLayout 在居中时
+        // 会把 topMargin 重复算一遍：子 view 实际下移 margin + 居中偏移，
+        // 底部就溢出父容器，被裁掉 21px —— 表现是按钮下半截连圆角一起没了
+        // （11-03 实机量到的就是这个：视图 1746~1884，父容器只到 1863）。
         val acts = row()
+        acts.setPadding(0, dp(14), 0, 0)
         btnApply = verdictButton("应用建议", true)
         btnApply.setOnClickListener { applyNow() }
         btnDecline = verdictButton("不用了", false)
         btnDecline.setOnClickListener { declineVerdict() }
         acts.addView(btnApply, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         acts.addView(spacerW(10))
         acts.addView(btnDecline, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(14) })
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         verdictBox.addView(acts)
 
         box.addView(verdictBox)
@@ -1274,11 +1277,11 @@ class MainActivity : Activity() {
      * 两键**同字号同内边距**，高度自然就一样，只有底色和描边不同。
      * 11-03 真机量出来上一版主键 16sp、次键 14sp，两个键高度差 4px，顶上
      * 齐不了。反过来的坑也踩了：
-     *   · 写死高度 dp(46) → 被这一层测量压到 39dp，底边平切；
-     *   · 用 RippleDrawable 包一层背景 → 背景跟着整体下移 21px，可见区里
-     *     只剩上面 117px，底部圆角连着被切掉（用户原话「显示不全」）。
-     * 所以这里退回和 [actionButton] 完全同一套做法：纯 GradientDrawable，
-     * 高度交给对称内边距撑。主次只靠颜色和描边区分，不再玩包装层。
+     *   · 写死高度 dp(46) 会被裁，因为行里有 gravity=CENTER_VERTICAL 加
+     *     子 view 的 topMargin，居中时 margin 被重复计算，底部溢出被切；
+     *   · 表现就是底部圆角没了、看着「下半截没画出来」（用户原话「显示不全」）。
+     * 所以：高度交给对称内边距撑，间距放在行的 padding 里，不要碰 topMargin。
+     * 背景就用 [actionButton] 同一套纯 GradientDrawable。
      */
     private fun verdictButton(text: String, primary: Boolean) = TextView(this).apply {
         this.text = text
