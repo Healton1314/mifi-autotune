@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.23"
+__version__ = "0.9.24"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -634,6 +634,23 @@ def restore_band(dev, band, tries=3, poll=45, step=5):
     return False, None
 
 
+class CycleCancelled(Exception):
+    """体检被「人手动改频段」打断。
+
+    为什么需要这个：体检一次要切 6 个频段、跑 5~8 分钟，而人随时可能
+    自己锁一条。实机 2026-11-03 08:49：守护起了一轮体检，用户等不了，
+    连点三次 `--lock-band 3` —— 每次都被体检子流程的 set_band 覆盖回去，
+    日志里三次都写着「已锁定 BAND 3」，读回来却是 BAND 38 / 39。
+    人的操作永远优先，体检必须会让路。
+    """
+
+
+# 同一时刻只允许一个「会切频段」的复合操作。体检和手动锁定共用它，
+# 而不是各切各的。非阻塞地拿：拿不到就知道有人在动设备。
+_CYCLE_LOCK = threading.Lock()
+_CYCLE_CANCEL = threading.Event()
+
+
 def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     """单频段多轮实测，取中位数，同时保留离散度用于判断可信程度。
 
@@ -643,14 +660,21 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     任何一步失败（设备切频段瞬间失联、写频段被拒、测速异常）都只让**这一个
     频段**判为不可用，绝不允许异常冒出去把整轮体检打断 —— 否则设备会被留在
     半途的频段上（实测踩过：停在 BAND 8，丢包 60%）。
+
+    唯一例外是 CycleCancelled：那是「人接管了」，必须立刻往上抛，让上层
+    还原/让路，不能当成「这个频段不行」继续测下一个。
     """
     empty = {"band": band, "ok": False, "mbps": 0, "mbps_all": [],
              "mbps_min": 0, "mbps_max": 0, "avg": None, "max": None,
              "jitter": None, "loss": 100, "rounds": 0, "rsrp": None,
              "pci": None}
 
+    if _CYCLE_CANCEL.is_set():
+        raise CycleCancelled()
     try:
         dev.set_band(band)
+    except CycleCancelled:
+        raise
     except KeyboardInterrupt:
         raise
     except Exception as e:  # noqa: BLE001
@@ -665,6 +689,8 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
 
     if status != "ok":
         return dict(empty, reason=status, waited=waited)
+    if _CYCLE_CANCEL.is_set():
+        raise CycleCancelled()
 
     # 注册成功 ≠ 数据通道就绪。实测（2026-10-29 手机端）：BAND 40 在 4.6 秒就被判
     # 「有信号但数据不通」，而它实际能跑 27~31 Mbps —— 刚注册完那一两秒 ping 全丢，
@@ -702,6 +728,10 @@ def measure_band(dev, band, rounds=3, speed_url=None, ping_host=None):
     time.sleep(3)
     candidates = [speed_url] + [u for u in probe.SPEED_CANDIDATES if u != speed_url]
     for i in range(rounds):
+        # 每轮测速前都看一眼有没有人来接管 —— 一轮 20 秒，最坏也就等这么久，
+        # 比让用户连点三次锁定都没反应强得多。
+        if _CYCLE_CANCEL.is_set():
+            raise CycleCancelled()
         try:
             mbps, _used = probe.throughput_any(candidates, 4, 8)
         except Exception:  # noqa: BLE001
@@ -1939,8 +1969,11 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
     """
     results = []
     t0 = time.time()
+    interrupted = False
     try:
         for idx, b in enumerate(bands, 1):
+            if _CYCLE_CANCEL.is_set():
+                raise CycleCancelled()
             print(f"\n      [{idx}/{len(bands)}] BAND {b} 测试中…")
             r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
             results.append(r)
@@ -2057,17 +2090,25 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
                       f"（{merged}）")
     except KeyboardInterrupt:
         print("\n[!] 已中断，马上切回原频段…")
+    except CycleCancelled:
+        # 人接管了（自己锁了/解锁了）。这时**千万不能还原** —— 还原就是把
+        # 刚设好的那个覆盖掉，实测连点三次都没成功正是这个原因。
+        interrupted = True
+        print("\n[!] 有人手动改了频段，体检先停下（不还原，听人的）…")
     finally:
         # 无论正常结束、抛异常还是 Ctrl+C，都必须还原。
         # 这条是血的教训：之前在测 BAND 8 时驱动超时崩溃，整个进程退出，
         # 设备被留在 BAND 8（丢包 60%），用户当场上不了网。
-        print(f"\n[还原] 切回 {cur_label} …")
-        ok, _st = restore_band(dev, cur_band)
-        if ok:
-            print("      已切回")
+        if interrupted or _CYCLE_CANCEL.is_set():
+            print("      设备留在你刚设的那条上，不再动它")
         else:
-            print(f"      [!] 自动还原失败。请手动在设备后台把频段改回 {cur_label}")
-            print("          设备可能刚重启射频，等 1 分钟再试 `mifi --restore` 也行。")
+            print(f"\n[还原] 切回 {cur_label} …")
+            ok, _st = restore_band(dev, cur_band)
+            if ok:
+                print("      已切回")
+            else:
+                print(f"      [!] 自动还原失败。请手动在设备后台把频段改回 {cur_label}")
+                print("          设备可能刚重启射频，等 1 分钟再试 `mifi --restore` 也行。")
     return results
 
 
@@ -4873,11 +4914,21 @@ def _guard_measure(args, prefer=None, *, net_down=False):
         print("      [!] 现在整条链路不通，体检测出来会全是 0（唯一确定的结果是"
               "再断网几分钟）—— 这次不测，等网络恢复", flush=True)
         return None
-    print(f"      跑完整体检选最优（会断网几次，{_measure_eta()}）…", flush=True)
-    code = run_cycle(args, lte_only=True)
-    band = _guard_plan_band(prefer) if code == 0 else prefer
-    print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
-    return band
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        # 已经有一轮在跑了（用户手动锁定时也会占这把锁）。再起一轮只会
+        # 两个流程互相切频段 —— 实机 2026-11-03 08:49 就是这么把设备
+        # 在 8 / 38 / 39 / 40 之间来回拽的。
+        print("      [!] 已经有一轮体检在跑，这次不重复起", flush=True)
+        return None
+    try:
+        _CYCLE_CANCEL.clear()
+        print(f"      跑完整体检选最优（会断网几次，{_measure_eta()}）…", flush=True)
+        code = run_cycle(args, lte_only=True)
+        band = _guard_plan_band(prefer) if code == 0 else prefer
+        print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
+        return band
+    finally:
+        _CYCLE_LOCK.release()
 
 
 def _install_stop_signals():
@@ -6079,6 +6130,30 @@ def run_lock_band(dev, args, st0=None):
     又锁回 BAND 40。体检仍是最好的默认，但「我已经知道答案」时要有一条不啰嗦的路。
     """
     band = int(args.lock_band)
+    # 体检在跑就先让它让路 —— 人的操作永远优先。
+    # 实机 2026-11-03 08:49：守护起了一轮体检，用户等不了、连点三次
+    # `--lock-band 3`，每次都打印「已锁定 BAND 3」，读回来却是 BAND 38/39：
+    # 体检子流程紧接着又 set_band 回去了。所以这里先举旗（CANCEL），
+    # 再等体检放手（LOCK）；体检那边每轮测速前都会看一眼旗子。
+    _CYCLE_CANCEL.set()
+    got_lock = _CYCLE_LOCK.acquire(timeout=45)
+    if not got_lock:
+        # 45 秒还没放手，说明那一轮正卡在切频段/等注册里。这时候硬切有两个
+        # 人都改设备的窗口，宁可让用户再点一次，也不给他一个「看起来成功、
+        # 实际被覆盖」的结果（那正是他昨天连点三次的原因）。
+        _CYCLE_CANCEL.clear()
+        print("[!] 有一轮体检还在跑、45 秒内没停下来。请等 10 秒再点一次，"
+              "或者在界面上先停掉守护体检")
+        return 1
+    try:
+        return _run_lock_band_locked(dev, band, st0)
+    finally:
+        _CYCLE_LOCK.release()
+        _CYCLE_CANCEL.clear()
+
+
+def _run_lock_band_locked(dev, band, st0=None):
+    """真正执行「锁到某条」的那一段（调用方已持有 _CYCLE_LOCK）。"""
     # band=0 是「解除锁定」，不是「锁定到 0 号频段」—— 界面上那个「自动」选项
     # 走的就是这条。措辞必须分开，否则用户看到「切到 BAND 0」只会以为出错了。
     if band == 0:
