@@ -6,11 +6,9 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.pm.PackageManager
-import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
@@ -1275,8 +1273,12 @@ class MainActivity : Activity() {
      *
      * 两键**同字号同内边距**，高度自然就一样，只有底色和描边不同。
      * 11-03 真机量出来上一版主键 16sp、次键 14sp，两个键高度差 4px，顶上
-     * 齐不了。反过来的坑也踩了：写死高度 dp(46) 会被这一层测量裁到 39dp，
-     * 底边变成平切 —— 所以高度交给内边距撑，不写死。
+     * 齐不了。反过来的坑也踩了：
+     *   · 写死高度 dp(46) → 被这一层测量压到 39dp，底边平切；
+     *   · 用 RippleDrawable 包一层背景 → 背景跟着整体下移 21px，可见区里
+     *     只剩上面 117px，底部圆角连着被切掉（用户原话「显示不全」）。
+     * 所以这里退回和 [actionButton] 完全同一套做法：纯 GradientDrawable，
+     * 高度交给对称内边距撑。主次只靠颜色和描边区分，不再玩包装层。
      */
     private fun verdictButton(text: String, primary: Boolean) = TextView(this).apply {
         this.text = text
@@ -1284,9 +1286,7 @@ class MainActivity : Activity() {
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
         setTypeface(typeface, Typeface.BOLD)
         setTextColor(if (primary) Color.WHITE else INK)
-        // 中文字体自带上下留白，跟着 padding 一起会把 46dp 撑歪，关掉它。
-        includeFontPadding = false
-        val shape = GradientDrawable().apply {
+        background = GradientDrawable().apply {
             cornerRadius = dp(12).toFloat()
             if (primary) {
                 // 斜向渐变比纯色更有「按一下会发生事情」的感觉，也不至于太花。
@@ -1298,10 +1298,6 @@ class MainActivity : Activity() {
                 setStroke(dp(1), Color.parseColor("#DFE2E8"))
             }
         }
-        background = RippleDrawable(
-            ColorStateList.valueOf(
-                if (primary) Color.parseColor("#40FFFFFF")
-                else Color.parseColor("#14000000")), shape, null)
         setPadding(dp(18), dp(13), dp(18), dp(13))
         // 副键按文字宽度走，但要有个下限：否则「不用了」贴上左右内边距就是
         // 一个窄条，缩成一行小字等于没有拒绝的入口。
