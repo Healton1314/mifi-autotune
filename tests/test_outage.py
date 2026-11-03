@@ -370,5 +370,43 @@ class NoCooldownNoiseWhenLocked(unittest.TestCase):
         self.assertEqual(action, "unlock")
 
 
+class PinOnUnrecordedSite(unittest.TestCase):
+    """在一个还没测过的位置手动锁一次，记录必须建起来。
+
+    实机 2026-11-03 15:19：锁完 BAND 3，pin_site=115-CMCC 指向一个不存在的键，
+    pin_cells=[] —— 这条 pin 只在正好读到 PCI 115 时才管用，设备一重选就失效。
+    """
+
+    def setUp(self):
+        d = Path(tempfile.mkdtemp())
+        self._p = [mock.patch.object(A, "SITES", d / "sites.json"),
+                   mock.patch.object(A, "CONFIG", d / "config.json")]
+        for p in self._p:
+            p.start()
+        A.save_sites({})
+        A.save_config({})
+
+    def tearDown(self):
+        for p in self._p:
+            p.stop()
+
+    def test_site_record_is_created(self):
+        A.pin_site_best("115-CMCC", 3)
+        data = A.load_sites()
+        self.assertIn("115-CMCC", data)
+        self.assertEqual(data["115-CMCC"]["best"], 3)
+        self.assertEqual(data["115-CMCC"]["pinned"], 3)
+
+    def test_pin_cells_is_never_empty(self):
+        A.set_device_pin(3, {"band": 3,
+                             "signal": {"pci": "115", "operator": "CMCC"}})
+        cfg = A.load_config()
+        self.assertEqual(cfg["pin_band"], 3)
+        self.assertEqual(cfg["pin_cells"], [115])
+        # 同一条 PCI + 同频段要命中，这是「刚锁完那一拍」最要紧的判定
+        self.assertEqual(A.device_pin_here(
+            {"band": 3, "signal": {"pci": "115", "operator": "CMCC"}}), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

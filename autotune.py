@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.24"
+__version__ = "0.9.25"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -3720,6 +3720,12 @@ def set_device_pin(band, st=None):
                     cfg["pin_cells"] = [c for c in cells if c is not None]
                 except (OSError, ValueError):
                     cfg["pin_cells"] = []
+                if not cfg["pin_cells"]:
+                    # 兜底：至少把「刚才这个小区」记进去。空列表意味着这条 pin
+                    # 只在一个精确的 PCI 上管用 —— 设备在同一间屋子里重选一次
+                    # 就失效了，而这恰恰是「我明明锁过 3，它却不认」的成因之一。
+                    here = _pci_num((st.get("signal") or {}).get("pci"))
+                    cfg["pin_cells"] = [here] if here is not None else []
         save_config(cfg)
     except (OSError, TypeError, ValueError):
         pass
@@ -6060,7 +6066,13 @@ def pin_site_best(key, band):
         real = find_site(data, key)
         rec = data.get(real)
         if not rec:
-            return
+            # 第一次在这个位置手动锁 —— 记录得建起来。
+            # 原来这里直接 return，于是「在一个还没测过的位置锁一次」什么都不留：
+            # pin_site 指向一个不存在的键，pin_cells 也跟着空。实机 2026-11-03
+            # 15:19 就是这样：锁完 BAND 3，配置里 pin_site=115-CMCC、pin_cells=[]，
+            # 这条 pin 只在正好读到 PCI 115 时才管用，设备一重选就失效。
+            rec = data.setdefault(real or key, {"seen": 0, "bands": {}})
+            _remember_cell(rec, key, band)
         rec["best"] = int(band)
         rec["verified_at"] = datetime.now().isoformat(timespec="seconds")
         rec["pinned"] = int(band)
