@@ -187,9 +187,14 @@ class BridgeReadsLivePlan(unittest.TestCase):
         self.assertNotIn("error", out)
 
     def test_never_uses_the_code_dir(self):
-        """钉住写法：不许再按 server.HERE 去找运行期文件。"""
+        """钉住写法：整个 bridge 不许再拿 server.HERE 去找运行期文件。
+
+        锚点具体一点会漏 —— 11-03 就是只钉了 plan.json，别处再冒出同样的写法
+        照样能过。运行期文件只有 autotune 的那几个全局路径是对的。
+        """
         src = BRIDGE.read_text(encoding="utf-8")
-        self.assertNotIn('server.HERE / "plan.json"', src)
+        self.assertNotIn("server.HERE", src)
+        self.assertIn("autotune.PLAN", src)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ def status():
 def plan():
     """上次体检留下的结论（plan.json），没有就是 None。
 
-    路径必须跟着 autotune 的数据目录走，**不能用 server.HERE**：HERE 是
+    路径必须跟着 autotune 的数据目录走，**不能用 server 上那个 HERE**：它是
     Chaquopy 的解包目录，运行期文件早就搬到 files/data/ 了，那里根本不存在
     plan.json。实机 2026-11-03：中午那次完整体检的结论（BAND 3 → BAND 40，
     实测 15.7 对 8.8 Mbps、+78%）一次都没弹出来 —— 这里读到 None，界面就
