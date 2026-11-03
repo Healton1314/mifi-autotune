@@ -71,9 +71,16 @@ def status():
 
 
 def plan():
-    """上次体检留下的结论（plan.json），没有就是 None。"""
+    """上次体检留下的结论（plan.json），没有就是 None。
+
+    路径必须跟着 autotune 的数据目录走，**不能用 server.HERE**：HERE 是
+    Chaquopy 的解包目录，运行期文件早就搬到 files/data/ 了，那里根本不存在
+    plan.json。实机 2026-11-03：中午那次完整体检的结论（BAND 3 → BAND 40，
+    实测 15.7 对 8.8 Mbps、+78%）一次都没弹出来 —— 这里读到 None，界面就
+    落到「体检没留下结论，看日志找原因」，而日志里明明白白写着结论。
+    """
     try:
-        p = server.HERE / "plan.json"
+        p = autotune.PLAN
         if not p.exists():
             return _dumps({"plan": None})
         return _dumps({"plan": json.loads(p.read_text(encoding="utf-8"))})

@@ -273,21 +273,24 @@ class MainActivity : Activity() {
         verdictBox.addView(tvVerdict)
         verdictBox.addView(tvVerdictSub)
 
-        // 两个按钮并排，但**不是**一样大：应用占两份宽、不用了占一份。
-        // 实测中 的原话是「应用建议的按钮不好看，换一个」—— 原来两个
-        // 键各占一半、都是实心色块，看着像两个同等分量的选项；可「应用」和
-        // 「不用了」从来不等价，一个是执行结论，一个是让它过去。
-        // 拒绝的入口仍然是一个正经按钮，不缩成一行小字（那样等于没有）。
+        // 两个键并排，但**不是**一样大：一个是执行结论，一个是让它过去。
+        //
+        // 2026-11-02 用户说「应用建议的按钮不好看，换一个」，当时改成 2:1 权重；
+        // 11-03 真机量出来两个问题：副键被等分权重撑到 108dp（三个字占那么宽，
+        // 看着就是个大色块），而且主键 16sp、副键 14sp，两键高度差 4px、顶上
+        // 齐不了 —— 眼睛看到的是「一大一小还歪着」。
+        // 现在：主键吃掉剩余宽度，副键按文字自适应（给个 minWidth 保证不挤），
+        // 两键统一 46dp 高、同一字号，只靠颜色和填充区分主次。
         val acts = row()
         btnApply = verdictButton("应用建议", true)
         btnApply.setOnClickListener { applyNow() }
         btnDecline = verdictButton("不用了", false)
         btnDecline.setOnClickListener { declineVerdict() }
         acts.addView(btnApply, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f).apply { topMargin = dp(14) })
+            0, dp(BTN_H), 1f).apply { topMargin = dp(14) })
         acts.addView(spacerW(10))
         acts.addView(btnDecline, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { topMargin = dp(14) })
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(BTN_H)).apply { topMargin = dp(14) })
         verdictBox.addView(acts)
 
         box.addView(verdictBox)
@@ -1263,17 +1266,24 @@ class MainActivity : Activity() {
      *
      * 和主按钮（[actionButton]）分开写，因为这两个是「对一句话表态」，
      * 需要一眼看出主次：
-     *   · 主键：渐变蓝 + 轻微上浮 + 按下去有水波纹，占两份宽；
-     *   · 次键：白底细描边，占一份宽 —— 看得见、点得到，但不抢注意力。
+     *   · 主键：渐变蓝 + 按下去有水波纹，吃掉整行剩余的宽度；
+     *   · 次键：白底细描边、按文字自适应（minWidth 兜底），看得见点得到，
+     *     但不抢注意力。
+     *
+     * 两键**同高同字号**，只有底色和描边不同。11-03 真机量出来上一版主键
+     * 16sp、次键 14sp，两个键高度差 4px，顶上齐不了 —— 这种一像素级别的不齐
+     * 在大色块旁边特别扎眼。
      */
     private fun verdictButton(text: String, primary: Boolean) = TextView(this).apply {
         this.text = text
         gravity = Gravity.CENTER
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, if (primary) 16f else 14f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
         setTypeface(typeface, Typeface.BOLD)
         setTextColor(if (primary) Color.WHITE else INK)
+        // 中文字体自带上下留白，跟着 padding 一起会把 46dp 撑歪，关掉它。
+        includeFontPadding = false
         val shape = GradientDrawable().apply {
-            cornerRadius = dp(16).toFloat()
+            cornerRadius = dp(12).toFloat()
             if (primary) {
                 // 斜向渐变比纯色更有「按一下会发生事情」的感觉，也不至于太花。
                 orientation = GradientDrawable.Orientation.TL_BR
@@ -1288,12 +1298,14 @@ class MainActivity : Activity() {
             ColorStateList.valueOf(
                 if (primary) Color.parseColor("#40FFFFFF")
                 else Color.parseColor("#14000000")), shape, null)
-        if (primary) elevation = dp(6).toFloat()
-        setPadding(dp(16), dp(15), dp(16), dp(15))
+        setPadding(dp(18), 0, dp(18), 0)
+        // 副键按文字宽度走，但要有个下限：否则「不用了」贴上左右内边距就是
+        // 一个窄条，缩成一行小字等于没有拒绝的入口。
+        minWidth = dp(84)
         isClickable = true
         isFocusable = true
         layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(BTN_H)
         )
     }
 
@@ -1365,6 +1377,10 @@ class MainActivity : Activity() {
 
         // 任务种类。目前只有体检需要冻住读数（它要挨个切频段，数字会乱跳）。
         private const val KIND_PREVIEW = "preview"
+
+        // 结论卡片那两个键的高度（dp）。写死而不是靠 padding 撑：主次两键
+        // 字号一旦不同，wrap_content 就会差几个像素，顶上齐不了。
+        private const val BTN_H = 46
 
         private val BG = Color.parseColor("#F7F7F5")
         private val INK = Color.parseColor("#16181D")

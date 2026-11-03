@@ -7,6 +7,8 @@
   · 「日志还在吗」—— 运行日志只存在内存，App 进程一换就没了。
 """
 
+import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -15,6 +17,16 @@ from unittest import mock
 
 import autotune as A
 import server as S
+
+BRIDGE = Path(__file__).resolve().parents[1] / "android" / "app" / "src" / "apkpy" / "bridge.py"
+
+
+def _load_bridge():
+    """按文件路径加载 bridge.py —— 它不在包目录里，import 不到。"""
+    spec = importlib.util.spec_from_file_location("mifi_bridge", BRIDGE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class NoFork(unittest.TestCase):
@@ -140,6 +152,44 @@ class LogSurvivesRestart(unittest.TestCase):
         rows = self.AUDIT.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(rows), S.AUDIT_KEEP)
         self.assertEqual(rows[-1], f"行 {S.AUDIT_KEEP + 19}")
+
+
+class BridgeReadsLivePlan(unittest.TestCase):
+    """App 的「体检建议」必须读到真实的 plan.json。
+
+    实机 2026-11-03：中午那次完整体检的结论（BAND 3 → BAND 40、实测
+    15.7 对 8.8 Mbps、+78%）一次都没弹出来。原因是 bridge.plan() 读的是
+    server.HERE —— Chaquopy 的解包目录，而运行期文件早搬到 files/data/ 了，
+    那儿根本没有 plan.json。于是界面落到「体检没留下结论，看日志找原因」，
+    可日志里结论写得清清楚楚。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.bridge = _load_bridge()
+        self._p = [mock.patch.object(A, "PLAN", self.tmp / "plan.json")]
+        for p in self._p:
+            p.start()
+
+    def tearDown(self):
+        for p in self._p:
+            p.stop()
+
+    def test_reads_from_data_dir(self):
+        A.PLAN.write_text(json.dumps({"changes": ["频段 BAND 3 → BAND 40"]},
+                                     ensure_ascii=False), encoding="utf-8")
+        out = json.loads(self.bridge.plan())
+        self.assertEqual(out["plan"]["changes"], ["频段 BAND 3 → BAND 40"])
+
+    def test_missing_plan_is_none_not_error(self):
+        out = json.loads(self.bridge.plan())
+        self.assertIsNone(out["plan"])
+        self.assertNotIn("error", out)
+
+    def test_never_uses_the_code_dir(self):
+        """钉住写法：不许再按 server.HERE 去找运行期文件。"""
+        src = BRIDGE.read_text(encoding="utf-8")
+        self.assertNotIn('server.HERE / "plan.json"', src)
 
 
 if __name__ == "__main__":
