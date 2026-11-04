@@ -150,6 +150,39 @@ class DeadBandGoesStraightToNext(unittest.TestCase):
         self.assertEqual(calls["restore"], 2)
         self.assertEqual(calls["measured"], [3, 38, 40])
 
+    def test_last_band_dead_still_restores_at_the_end(self):
+        """最后一条没信号也一样：收尾必须切回原频段，不能把人留在死频段上。"""
+        calls = {"restore": [], "measured": []}
+        res = {3: self.ok(3), 40: self.ok(40),
+               41: self.dead(41)}
+
+        def fake_measure(dev, b, **kw):
+            calls["measured"].append(b)
+            return dict(res[b])
+
+        def fake_restore(dev, b, **kw):
+            calls["restore"].append(b)
+            return True, {}
+
+        with mock.patch.object(A, "measure_band", side_effect=fake_measure), \
+                mock.patch.object(A, "restore_band", side_effect=fake_restore), \
+                mock.patch.object(A, "_CYCLE_CANCEL") as cancel:
+            cancel.is_set.return_value = False
+            out = A.measure_all_bands(mock.Mock(), [3, 40, 41], 1, 3, "BAND 3",
+                                      contest_band=None)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(calls["restore"], [3])      # 只在收尾还原一次，回到原频段
+
+    def test_restore_failure_does_not_raise(self):
+        """自动还原失败时只许喊一声，不能把异常抛给上层（会把整轮结论弄丢）。"""
+        with mock.patch.object(A, "measure_band", return_value=self.ok(3)), \
+                mock.patch.object(A, "restore_band", return_value=(False, {})), \
+                mock.patch.object(A, "_CYCLE_CANCEL") as cancel:
+            cancel.is_set.return_value = False
+            out = A.measure_all_bands(mock.Mock(), [3], 1, 40, "BAND 40",
+                                      contest_band=None)
+        self.assertEqual(len(out), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
