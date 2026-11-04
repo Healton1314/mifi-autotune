@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.30"
+__version__ = "0.9.31"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -157,13 +157,24 @@ REVIEW_BAD_MIN = 2
 # 就能给整条频段定罪 —— 而一次偶发（隔壁开微波炉）不该让晚上不能用它。
 GUARD_FLAP_HOUR_RATIO = 0.6
 FLAP_SWAP_RATIO = 0.85              # 稳的那个只要不慢过 15%，就优先它
-SITE_MERGE_MIN = 20                 # 同运营商、上次记录在这么多分钟内 → 算同一个地方
+# 同运营商、上次记录在这么多分钟内 → 算同一个地方。
+# 原来给 20 分钟，本意是「刚切完频段就接着测」。但人从住处走到办公区也就十几分钟，
+# 于是新地方被并进旧记录 —— 实机 2026-11-04 办公区第一次来，被认成住处第 5 次，
+# 连住处攒的「38/41 没信号」都跟着跳过。切频段是秒级到一分钟的事，5 分钟足够。
+SITE_MERGE_MIN = 5
 # 一个位置「见过哪些小区」。为什么不能只靠上面那条时间窗：20 分钟一过，
 # 同一张桌子的两条记录就互不相认了。实测（2026-10-30 住处）就是这么分家的 ——
 # 锁 BAND 3 时是 PCI 350（记着 BAND 3 有 46.8 Mbps），解锁后设备自己驻留 BAND 40
 # 变成 PCI 236，于是新建了一条空记录；下次再测，46.8 那条历史完全没被看到。
 # 所以位置改成「一组见过的小区」：只要当前 PCI 在这组里，就是同一处，跨天也认得出。
-SITE_CELL_KEEP = 12                 # 每个位置最多记几个见过的小区
+SITE_CELL_KEEP = 8                  # 每个位置最多记几个见过的小区
+# 同一个频段只留最近一个服务小区。一张桌子上 BAND 3 只会驻留一个小区；
+# 同一条频段攒出好几个 PCI，那不是「这张桌子换过小区」，是几个地方被并进来了。
+# 实机 2026-11-04：cells 滚到上限 12 个，办公区的 PCI 441 在名单里，直接被认成住处。
+SITE_CELL_PER_BAND = 1
+# 「没实测过的临时记录」并到附近已测记录的时间窗。原来套用 SITE_FRESH_HOURS（72h），
+# 等于三天内任何新地方都会被并进最近测过的那条 —— 办公区第一次就是这么丢的。
+SITE_PROV_MERGE_HOURS = 2
 # 为什么是 12：一次体检就会把这张桌子的 6 条频段（6 个 PCI）全记进来，再加上
 # 期间设备自己重选过的小区。原来 8 太紧 —— 截断时从最先记下的开始丢，而最先
 # 记下的往往正是最常用的那条频段。
@@ -1210,27 +1221,98 @@ def _remember_cell(rec, key, band=None):
     每切一次就把自己「搬了次家」，历史全废（实测 2026-10-30 住处的 350 / 236）。
     """
     pci, _ = _split_key(key)
-    if not pci or not rec:
+    # 用 is None 而不是 not rec：空 dict 是合法的「新记录」，falsy 判断会让
+    # 第一次登记就被丢掉（cells 永远建不起来）。
+    if not pci or rec is None:
         return
     cells = rec.setdefault("cells", [])
     stamp = datetime.now().isoformat(timespec="seconds")
+    band = int(band) if band else None
     for c in cells:
         if str(c.get("pci")) == pci:
             c["n"] = int(c.get("n") or 0) + 1
             c["last"] = stamp
             if band:
-                c["band"] = int(band)
+                c["band"] = band
             return
-    cells.append({"pci": pci, "band": int(band) if band else None, "n": 1,
-                  "last": stamp})
+    if band:
+        # 同一条频段只留最近一个服务小区（SITE_CELL_PER_BAND=1）。
+        # 为什么必须去重：cells 的语义是「这张桌子在每条频段上驻留哪个小区」，
+        # 数量天然有上限（频段数）。一旦同一条频段攒出好几个 PCI，说明这些 PCI
+        # 来自不同地点 —— 而它们全都会变成「同一处的证据」，越滚越像，
+        # 最后任何地方读到任何一个都算「来过」。实机 2026-11-04 就是这么把
+        # 办公区认成住处的（cells 满 12 个，办公区的 441 赫然在列）。
+        cells[:] = [c for c in cells if c.get("band") != band]
+    cells.append({"pci": pci, "band": band, "n": 1, "last": stamp})
     del cells[:-SITE_CELL_KEEP]
+
+
+SITE_HEAL_VER = 2
+
+
+def _heal_site_memory(data):
+    """把滚雪球滚坏的 cells / dead 修回可用的样子。幂等，只改内存。
+
+    要修的病：一条记录的 cells 里**同一个频段出现好几个 PCI**。
+    一张桌子上同一条频段只会驻留一个服务小区，出现两个就说明这条记录是
+    几个地方被并到一起了 —— 而每一个 PCI 都会变成「这处来过」的证据，
+    证据越多越容易再并进来，自我强化。实机 2026-11-04：cells 滚到上限 12 个，
+    办公区里读到的 441 在列，于是「第一次来办公区」被认成「来过 4 次的住处」，
+    连住处攒下的「38/41 没信号」都跟着跳过。
+
+    顺手把这种记录的 dead 清零：dead 的语义是「**这个地方**这条频段没信号」，
+    记录本身都说不清是哪个地方了，这个计数就没有归属，留着只会误伤别处。
+    """
+    if not isinstance(data, dict):
+        return 0
+    fixed = 0
+    for rec in data.values():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            if int(rec.get("heal") or 0) >= SITE_HEAL_VER:
+                continue
+        except (TypeError, ValueError):
+            pass
+        by_band, loose, dup = {}, [], False
+        for c in (rec.get("cells") or []):
+            if not isinstance(c, dict):
+                continue
+            b = c.get("band")
+            if b is None:
+                loose.append(c)
+                continue
+            b = str(b)
+            keep = by_band.get(b)
+            if keep is None:
+                by_band[b] = c
+                continue
+            dup = True
+            # 同一条频段留最近一次见到的那个小区
+            if str(c.get("last") or "") > str(keep.get("last") or ""):
+                by_band[b] = c
+        if dup:
+            merged = list(by_band.values()) + loose
+            merged.sort(key=lambda c: str(c.get("last") or ""))
+            rec["cells"] = merged[-SITE_CELL_KEEP:]
+            for bv in (rec.get("bands") or {}).values():
+                if isinstance(bv, dict) and bv.get("dead"):
+                    bv["dead"] = 0
+            fixed += 1
+        rec["heal"] = SITE_HEAL_VER
+    return fixed
 
 
 def load_sites():
     try:
-        return json.loads(SITES.read_text(encoding="utf-8"))
+        data = json.loads(SITES.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    try:
+        _heal_site_memory(data)
+    except Exception:  # noqa: BLE001  自愈失败绝不能让读记忆这条路挂掉
+        pass
+    return data
 
 
 def set_data_dir(root):
@@ -1574,7 +1656,7 @@ def _site_measured(rec):
     return False
 
 
-def find_site(data, key, now=None):
+def find_site(data, key, now=None, band=None):
     """认出「刚切过频段、PCI 变了但人没挪窝」还是同一个地方。
 
     设备锁到哪个频段，服务小区就跟着换 —— 实测同一张桌子（2026-10-30）：
@@ -1619,14 +1701,31 @@ def find_site(data, key, now=None):
             # 判（stale → 全测一遍），不认地方却会让名字彻底失联。
             continue
         seen = int(v.get("seen") or 0)
-        cells = {str(c.get("pci")) for c in (v.get("cells") or [])}
+        cells = v.get("cells") or []
+        cell = next((c for c in cells if str(c.get("pci")) == pci), None)
+        cell_band = (cell or {}).get("band")
+        band_ok = (not band or not cell_band
+                   or str(cell_band) == str(band))
+        # 这条记录在**当前这条频段**上已经记着别的服务小区了吗？
+        # 记着就说明：这张桌子在这条频段上驻留的是那个小区，不是当前这个。
+        # 于是下面那两个「时间窗 / 临时记录」的宽松兜底必须对它关闭 ——
+        # 那两个兜底是给「还没有任何小区证据」的记录用的（刚切完频段、
+        # 老版本留下的数据）；对有证据的记录放行，就等于承认「同一条频段上
+        # 有两个服务小区」，而那正是把办公区并进住处的那条路。
+        known_here = bool(band) and any(
+            str(c.get("band")) == str(band) for c in cells)
         if k == key:
-            bonus = 1
-        elif pci in cells:
-            bonus = 2
+            bonus = 3
+        elif cell is not None and band_ok:
+            # 「这处换过这个小区」——但只在同一条频段上算数。
+            # PCI 只有 0~503，每个频段各一套编号；BAND 40 上的 32 和
+            # BAND 3 上的 32 毫无关系。band 未知的就当老数据降权放行一次。
+            bonus = 2 if cell_band else 1
+        elif known_here:
+            continue
         elif age <= SITE_MERGE_MIN / 60.0:
             bonus = 0
-        elif prov and not v.get("provisional") and age <= SITE_FRESH_HOURS:
+        elif prov and not v.get("provisional") and age <= SITE_PROV_MERGE_HOURS:
             bonus = 0
         else:
             continue
@@ -1860,21 +1959,26 @@ def import_memory(payload, data=None):
     return stat
 
 
-def record_site(key, results, best_band=None, reset_best=False):
+def record_site(key, results, best_band=None, reset_best=False, cur_band=None):
     """把这次的结果记到位置上。只记「有没有信号」和「最好跑到多少」。
 
     reset_best：这次是全量重测（隔太久没来），历史速度数字已经不作数，
     直接用本次的成绩覆盖，而不是和旧值取最大。
+
+    cur_band：**当前驻留**的那条频段。key 里的 PCI 是这条频段上的服务小区，
+    所以 cells 里要按这条频段归档。以前这里传的是 best_band（本次跑得最快的
+    那条），于是「BAND 40 上的 PCI 32」被标成 BAND 3 —— 归错槽之后，
+    按频段去重就形同虚设，跨频段还是会互相命中。
     """
     if not key:
         return
     data = load_sites()
-    real = find_site(data, key)
+    real = find_site(data, key, band=cur_band)
     # 认出是同一处、但历史存在另一个 PCI 名下 → 先并成一条，再往下写。
     _absorb_site(data, real, key)
     rec = data.setdefault(real, {"seen": 0, "bands": {}})
     # 记下这处还见过哪些小区：下次换个频段（PCI 跟着变）才认得出是同一张桌子。
-    _remember_cell(rec, key, best_band)
+    _remember_cell(rec, key, cur_band)
     if real != key:
         # 老字段留着，人看 sites.json 时能明白「为什么只有一条记录」
         al = rec.setdefault("aliases", [])
@@ -2267,7 +2371,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 prune_sites()
             data = load_sites()
             # 切过频段之后 PCI 会变（同一张桌子 236 ↔ 350），那不算搬家。
-            site = find_site(data, site) if site else ""
+            site = find_site(data, site, band=cmp_band) if site else ""
             rec = data.get(site) if site else None
             if getattr(args, "fresh", False):
                 rec = None
@@ -2345,7 +2449,8 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
         if args.bands in ("default", "all") and not args.wifi_only:
             # 记忆过期那次是全测，速度数字就是最新的：把「历史最好」换成这次的，
             # 否则 8 天前那个偏高的旧数字会一直压着，快速模式又会被它骗一次。
-            record_site(_site_key(st0), lte, best_band, reset_best=(state == "stale"))
+            record_site(_site_key(st0), lte, best_band,
+                        reset_best=(state == "stale"), cur_band=cmp_band)
 
     # ---- 三、结论 ----
     cur_res = next((r for r in lte if r["band"] == cmp_band), None)

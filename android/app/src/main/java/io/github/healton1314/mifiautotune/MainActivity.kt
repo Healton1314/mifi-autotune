@@ -398,9 +398,19 @@ class MainActivity : Activity() {
                     busyKind = ""
                     btnMain.isEnabled = true
                     btnMain.alpha = 1f
-                    // 体检成功不代表没事可做，也不代表该「优化」—— plan.json 里
+                    // 体检成功不代表没事可做，也不该「优化」—— plan.json 里
                     // changes 为空就是「现在这设置已经最好，别折腾」。让按钮去说实话。
-                    if (kind == "preview" && exit == 0) afterPreview() else resetMain()
+                    //
+                    // 反过来，「恢复默认 / 手动设频段 / 手动设信道」这类动作**必须**
+                    // 把上一条体检结论收掉：结论说的是「建议改成 X」，而设置已经被
+                    // 人改过了，还摆在那儿就是一个点得动的过期建议（实机 2026-11-04：
+                    // 点了恢复默认，上面写着「自动 BAND 40」，结论卡和那两个键纹丝不动）。
+                    if (kind == "preview" && exit == 0) {
+                        afterPreview()
+                    } else {
+                        hideVerdict()
+                        resetMain()
+                    }
                     // 立刻刷一次读数，别等下一个 5 秒的轮询。改完设置最想看的就是
                     // 「变了没有」，这几秒的空窗会被读成「没生效」。
                     refreshStatus()
@@ -652,6 +662,10 @@ class MainActivity : Activity() {
             .setPositiveButton("恢复") { _, _ ->
                 busy = true
                 busyKind = "restore"
+                // 「恢复默认」= 推倒重来。刚才那条体检结论（建议改成 BAND X）
+                // 从这一刻起就作废了，留着只会让人以为还得照着点一下。
+                planReady = false
+                hideVerdict()
                 btnMain.text = "正在恢复…"
                 btnMain.isEnabled = false
                 btnMain.alpha = 0.6f

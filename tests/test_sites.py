@@ -331,7 +331,7 @@ class PreviewUsesSiteMemory(unittest.TestCase):
 
     def test_pci_change_after_band_switch_reuses_memory(self):
         """切过频段 PCI 变了，但人没动：仍然沿用同一份记忆（不白等死频段）。"""
-        measured, data = self._run({"seen": 3, "best": 40, "last": ago(minutes=5),
+        measured, data = self._run({"seen": 3, "best": 40, "last": ago(minutes=3),
                                     "bands": {"38": {"dead": 5, "ok": 0},
                                               "40": {"dead": 0, "ok": 3, "best": 43},
                                               "3": {"dead": 0, "ok": 3, "best": 42}}},
@@ -499,7 +499,7 @@ class SiteMerge(unittest.TestCase):
                              "bands": {"40": {"dead": 0, "ok": 3, "best": 40.0}}}}
 
     def test_recent_same_operator_is_the_same_place(self):
-        data = self._data(0.1)                       # 6 分钟前刚测过
+        data = self._data(0.05)                       # 3 分钟前刚测过（窗口 11-04 从 20 分钟收到 5 分钟，见 find_site）
         self.assertEqual(A.find_site(data, "350-CMCC"), "236-CMCC")
 
     def test_long_ago_is_a_new_place(self):
@@ -515,7 +515,7 @@ class SiteMerge(unittest.TestCase):
         self.assertEqual(A.find_site(data, "236-CMCC"), "236-CMCC")
 
     def test_record_site_merges_and_remembers_alias(self):
-        self.tmp.write_text(json.dumps(self._data(0.1)), encoding="utf-8")
+        self.tmp.write_text(json.dumps(self._data(0.05)), encoding="utf-8")
         A.record_site("350-CMCC", [{"band": 40, "ok": True, "mbps": 33.0}])
         data = json.loads(self.tmp.read_text(encoding="utf-8"))
         self.assertEqual(list(data), ["236-CMCC"])   # 没多出一条「新地方」
