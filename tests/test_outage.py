@@ -159,9 +159,11 @@ class PlanBandNeverLocksDeadBand(unittest.TestCase):
         for p in self._p:
             p.stop()
 
-    def _write(self, rows, reliable=False):
-        self.plan.write_text(json.dumps({"lte": rows, "reliable": reliable}),
-                             encoding="utf-8")
+    def _write(self, rows, reliable=False, **extra):
+        body = {"lte": rows, "reliable": reliable,
+                "ts": datetime.now().isoformat(timespec="seconds")}
+        body.update(extra)
+        self.plan.write_text(json.dumps(body), encoding="utf-8")
 
     def test_dead_prefer_is_replaced_by_a_live_band(self):
         self._write([
@@ -337,7 +339,10 @@ class MeasureEta(unittest.TestCase):
         self.assertIn("6 分钟", eta)     # 5 × 70s ≈ 5.8 分
 
     def test_falls_back_without_plan(self):
-        self.assertEqual(A._measure_eta(), "约 5~8 分钟")
+        # 没有历史可参考时按「6 个频段」估（ZTE 常见就是 3/8/38/39/40/41），
+        # 宁可多报也别少报 —— 少报就是让人以为卡死。
+        eta = A._measure_eta()
+        self.assertIn("6 个频段", eta)
 
 
 class NoCooldownNoiseWhenLocked(unittest.TestCase):

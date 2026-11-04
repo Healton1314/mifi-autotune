@@ -9,6 +9,7 @@
 """
 
 import unittest
+from datetime import datetime
 from unittest import mock
 
 import autotune as A
@@ -909,9 +910,13 @@ class GuardPlanBand(unittest.TestCase):
     def tearDown(self):
         self._p.stop()
 
-    def _plan(self, lte, target=0):
-        self.PLAN.write_text(self.json.dumps(
-            {"lte": lte, "target": {"band": target}}), encoding="utf-8")
+    def _plan(self, lte, target=0, **extra):
+        # ts 必须有：_guard_plan_band 现在会看结论的年龄，过期的不拿来锁
+        # （实机 11-04 就是拿前一天 17:20 的结论锁了 BAND 3）。
+        body = {"lte": lte, "target": {"band": target},
+                "ts": datetime.now().isoformat(timespec="seconds")}
+        body.update(extra)
+        self.PLAN.write_text(self.json.dumps(body), encoding="utf-8")
 
     def test_picks_fastest_usable(self):
         # 22:53 那次体检的真实数字：BAND 40 带宽不低但丢包 80%，不能选
@@ -941,7 +946,8 @@ class GuardPlanBand(unittest.TestCase):
         self.PLAN.write_text(self.json.dumps(
             {"lte": [{"band": 40, "ok": True, "mbps": 40.0, "avg": 60, "loss": 0},
                      {"band": 3, "ok": True, "mbps": 12.0, "avg": 70, "loss": 0}],
-             "reliable": False, "target": {"band": 40}}), encoding="utf-8")
+             "reliable": False, "target": {"band": 40},
+             "ts": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
         self.assertEqual(A._guard_plan_band(prefer=3), 3)
 
 

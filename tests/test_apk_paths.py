@@ -45,7 +45,7 @@ class NoFork(unittest.TestCase):
                 mock.patch.object(A, "_run_cycle_inprocess", return_value=0) as run:
             self.assertEqual(A.run_cycle(args), 0)
         # lte_only 也一起带过去：守护体检不扫 2.4G 信道（见 run_cycle 的说明）。
-        run.assert_called_once_with(args, lte_only=False)
+        run.assert_called_once_with(args, lte_only=False, preview=False)
         sp.Popen.assert_not_called()        # 关键：不许再去 Popen
 
     def test_guard_cycle_skips_channel_scan(self):
@@ -54,7 +54,7 @@ class NoFork(unittest.TestCase):
         with mock.patch.object(A, "_can_fork_python", return_value=False), \
                 mock.patch.object(A, "_run_cycle_inprocess", return_value=0) as run:
             A.run_cycle(args, lte_only=True)
-        run.assert_called_once_with(args, lte_only=True)
+        run.assert_called_once_with(args, lte_only=True, preview=False)
 
     def test_inprocess_argv_matches_cli(self):
         args = mock.Mock(wifi_only=False, lte_only=True, bands="3,8", ssid="X")

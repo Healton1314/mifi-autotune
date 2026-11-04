@@ -663,9 +663,13 @@ class MainActivity : Activity() {
     // ---------------- 手动选频段 / 信道 ----------------
 
     private fun showBandDialog() {
+        // 守护开着也让人设。这是实测中 明确要求的「手动权限更高」：
+        // 他当时的处境是「我现在就要用网」，可界面先拦一句「先关守护」，
+        // 关掉之后那轮体检还在跑，又得等到它跑完。
+        // 引擎那边已经保证了这件事：手动锁会举起取消旗，正在跑的体检在下一个
+        // 检查点就退出来（不还原、不覆盖），守护也会按这条重新对齐。
         if (guardOn) {
-            showLog("守护在跑，先关掉它再手动设")
-            return
+            showLog("守护在跑：设完它会按你这条对齐，正在跑的体检会立刻停下")
         }
         if (!capLockBand) {
             showLog("这台设备不支持锁定频段")
@@ -698,8 +702,8 @@ class MainActivity : Activity() {
 
     private fun showChannelDialog() {
         if (guardOn) {
-            showLog("守护在跑，先关掉它再手动设")
-            return
+            // 同上：人的操作优先。守护只管频段，信道它本来就不碰。
+            showLog("守护在跑：信道它会照你设的留着")
         }
         if (!capSetChannel) {
             showLog("这台设备不支持改信道")

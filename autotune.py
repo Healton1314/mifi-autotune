@@ -50,7 +50,7 @@ CONFIG = DATA_DIR / "config.json"
 
 # 版本号：手机上排查「我装的到底是哪一版」全靠它（mifi --version）。
 # 改功能就往上加，别让两个不同的行为共用一个号。
-__version__ = "0.9.29"
+__version__ = "0.9.30"
 
 SETTLE_SEC = 26                     # 换频段后等待重新注册
 # 判「当地没这个频段」之前的宽限。设备从别的频段切过来要重新搜索、注册，
@@ -184,8 +184,14 @@ _GUARD_STOP = threading.Event()
 
 
 def guard_request_stop():
-    """请求守护停下。最多等一个采样间隔（30 秒）就真的退出。"""
+    """请求守护停下。最多等一个采样间隔（30 秒）就真的退出。
+
+    同时把正在跑的那轮体检也掐掉：用户关守护的真实原因通常是「我现在要用网」，
+    而体检要挨个切频段、断网五六分钟。实机 2026-11-04 早上就是这样 ——
+    开关已经关了，屏幕上体检还在跑，人只能干等。
+    """
     _GUARD_STOP.set()
+    _CYCLE_CANCEL.set()
     return True
 
 
@@ -252,6 +258,13 @@ GUARD_COOLDOWN = 300                # 动作后的冷却，避免反复断网（
 # 「刚解锁还一直不通」的判定窗口。必须比 GUARD_COOLDOWN 长，否则解锁刚把冷却
 # 挂上，窗口就已经关了，后面那条「解锁仍不通 → 跑体检」永远走不到。
 GUARD_RESCUE_WINDOW = 900
+# 手动设频段要等体检放手多久。体检的检查点在「每段开头 / 每轮测速前 / 每次切频段前」，
+# 最坏情况是一次等注册（20 秒）加一轮测速（18 秒），所以给到 3 分钟足够；
+# 原来是 45 秒 —— 一卡在两次检查点之间就白等了，用户看到的就是「点了没用」。
+MANUAL_PREEMPT_SEC = 180
+# 守护只认这么新的体检结论（秒）。plan.json 是共享文件，昨天那份同样在里面，
+# 拿它锁就是「体检说 40、锁了 3」的成因之一。
+GUARD_PLAN_MAX_AGE = 1800
 
 # 没网的时候「测」是纯浪费。实测中 18:44~18:55 的实机日志：
 #   18:45:24  延迟 不通  丢包 100%
@@ -357,6 +370,12 @@ GUARD_RSRP_NOTE_SEC = 300
 # 单轮测速的波动轻易就能有 10~20%，差 8% 的两个频段谁快谁慢根本说不清 ——
 # 这时只复测第一名，等于拿运气当结论（实测 2026-10-30：31.5 vs 29.0）。
 CONTEST_CLOSE_RATIO = 0.25
+
+# 反过来：第一名领先超过这个比例、而且自己几轮测下来不飘，就不用再来一轮复核。
+# 决赛每次要多切两次频段（回原频段 + 切候选），实机约 70 秒 —— 实测中
+# 的抱怨「等得越来越久」，这一段是纯可省的。只在「明显赢了」时才省：
+# 差距不够大、或第一名自己的几轮数字就上下差一倍，照样复核。
+CONTEST_SKIP_GAP = 1.35
 
 DEFAULT_CONFIG = {
     "own_ssid": "",                 # 自己设备的 WiFi 名，用于从干扰源里排除
@@ -548,6 +567,10 @@ def wait_for_service(dev, band, timeout=None, step=2.5, dead_confirm=3, grace=No
     miss = 0
     seen_band = False
     while time.time() - t0 < timeout:
+        # 人接管了就立刻收手：这里本来要傻等 20 多秒（切频段后等重新注册），
+        # 那段等待里设备状态一直在变，用户点「手动锁」时最容易被这一段吞掉。
+        if _CYCLE_CANCEL.is_set():
+            raise CycleCancelled()
         time.sleep(step)
         try:
             st = dev.get_state()
@@ -1955,6 +1978,38 @@ def resolve_bands(caps, args, cfg):
     return [int(x) for x in args.bands.split(",") if x.strip()]
 
 
+def _contest_skip_reason(usable, contest_band=None):
+    """这次决赛能不能省掉。返回一句人话（能省）或 None（不能省）。
+
+    省的条件要同时满足，缺一条就老老实实复核：
+      1. 至少两条候选；
+      2. 第一名领先第二名 >= CONTEST_SKIP_GAP（35%）；
+      3. 第一名自己几轮的数字不飘（最快/最慢 <= 1.8 倍）—— 一个 [27, 23, 2.8]
+         这种过山车，领先得再多也不能省；
+      4. 当前驻留那条不在前两名里（它要留着做「提升多少」的对照）。
+    """
+    rows = [r for r in (usable or []) if r.get("mbps")]
+    if len(rows) < 2:
+        return None
+    rows.sort(key=lambda r: -(r.get("mbps") or 0))
+    fastest, second = rows[0], rows[1]
+    if not second.get("mbps"):
+        return None
+    gap = fastest["mbps"] / second["mbps"]
+    if gap < CONTEST_SKIP_GAP:
+        return None
+    samples = [x for x in (fastest.get("mbps_all") or []) if x]
+    if len(samples) > 1:
+        lo = min(samples)
+        if lo <= 0 or max(samples) / lo > 1.8:
+            return None
+    if contest_band is not None and str(contest_band) in {
+            str(fastest.get("band")), str(second.get("band"))}:
+        return None
+    return (f"BAND {fastest['band']} 领先 {gap:.1f} 倍"
+            f"（{fastest['mbps']} 对 {second['mbps']} Mbps）")
+
+
 def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
                       speed_url=None, ping_host=None, contest_band=None):
     """逐个实测频段，并**保证**无论怎么退出都把设备切回 cur_band。
@@ -1970,49 +2025,81 @@ def measure_all_bands(dev, bands, rounds, cur_band, cur_label,
     results = []
     t0 = time.time()
     interrupted = False
+    # 每测完一条要不要先退回原频段再切下一条。
+    # 默认**不要**：实测中 说得对 —— 已经知道这条没信号了，直接从它
+    # 切到下一条就行，先切回原频段再切过去纯属多一次射频重启（每次 20~40 秒，
+    # 还要重新注册）。而「没覆盖」恰恰是最常见的跳过原因，一段白等 30 秒。
+    # 只有真的碰到「坏状态连累下一条」时才把它打开（见下面的 device_error 分支）。
+    restore_between = False
+
+    def show(r):
+        """把一条结果打出来（成功/跳过两种样子）。"""
+        if r["ok"]:
+            jit = f"{r['jitter']}ms" if r["jitter"] is not None else "—"
+            print(f"      {_band_label(r['band']):<8} {r['mbps']:>5} Mbps  "
+                  f"延迟 {r['avg']}ms  抖动 {jit}  丢包 {r['loss']}%")
+            bad = quality_issue(r)
+            if bad:
+                print(f"       [!] {bad} —— 质量不可接受，不会被选为最优"
+                      f"（决赛时只当对照，用来算「提升多少」）")
+        else:
+            why = {"no_signal": "无信号（当地没这个频段）",
+                   "timeout": "注册超时",
+                   "no_data": "有信号但数据不通",
+                   "speed_fail": "有信号但测不出速度（测速源不可用，或该频段几无数据能力）",
+                   "device_error": "设备通信中断"}.get(r.get("reason"), "不可用")
+            print(f"      {_band_label(r['band']):<8} {why}  已跳过（{r.get('waited', '?')}s）")
+            if r.get("error"):
+                print(f"      原因：{r['error']}")
+
+    def measure(b):
+        return measure_band(dev, b, rounds=rounds,
+                            speed_url=speed_url, ping_host=ping_host)
+
     try:
         for idx, b in enumerate(bands, 1):
             if _CYCLE_CANCEL.is_set():
                 raise CycleCancelled()
             print(f"\n      [{idx}/{len(bands)}] BAND {b} 测试中…")
-            r = measure_band(dev, b, rounds=rounds, speed_url=speed_url, ping_host=ping_host)
+            r = measure(b)
             results.append(r)
-            if r["ok"]:
-                jit = f"{r['jitter']}ms" if r["jitter"] is not None else "—"
-                print(f"      {_band_label(b):<8} {r['mbps']:>5} Mbps  "
-                      f"延迟 {r['avg']}ms  抖动 {jit}  丢包 {r['loss']}%")
-                bad = quality_issue(r)
-                if bad:
-                    print(f"       [!] {bad} —— 质量不可接受，不会被选为最优"
-                          f"（决赛时只当对照，用来算「提升多少」）")
-            else:
-                why = {"no_signal": "无信号（当地没这个频段）",
-                       "timeout": "注册超时",
-                       "no_data": "有信号但数据不通",
-                       "speed_fail": "有信号但测不出速度（测速源不可用，或该频段几无数据能力）",
-                       "device_error": "设备通信中断"}.get(r.get("reason"), "不可用")
-                print(f"      {_band_label(b):<8} {why}  已跳过（{r.get('waited', '?')}s）")
-                if r.get("error"):
-                    print(f"      原因：{r['error']}")
+            show(r)
             left = len(bands) - idx
 
-            # 这个频段测失败（没覆盖 / 读不到状态）时，先退回原频段再测下一个。
-            # 2026-10-29 实测：切到 BAND 38（当地无覆盖）后设备仍在线、仍发认证挑战，
-            # 但响应体是空的 —— 状态读不出来，于是后面每个频段都被判「通信中断」，
-            # 连自动还原都失败，用户被留在没信号的频段上。
-            # 从健康状态出发测下一个频段，就不会被上一个频段的坏状态连累。
-            if not r["ok"] and str(b) != str(cur_band) and left:
-                print("      退回原频段，避免在坏状态上继续切…")
+            # 坏状态连累：读不到状态。2026-10-29 实测过 —— 切到 BAND 38（当地
+            # 无覆盖）后设备仍在线、仍发认证挑战，但响应体是空的，后面每条都判
+            # 「通信中断」。这时退回原频段重测这条，并把「每条之间都先还原」
+            # 打开：宁可慢，也不能把一整轮测成废数据。
+            if (not r["ok"] and r.get("reason") == "device_error"
+                    and not restore_between and str(b) != str(cur_band) and left):
+                print("      [!] 切完读不到状态 —— 退回原频段，把这条重测一次")
+                restore_between = True
                 ok_r, _ = restore_band(dev, cur_band, tries=2, poll=45)
                 if not ok_r:
                     print("      [!] 退不回去，剩下的频段先不测了")
                     break
+                print(f"      重测 BAND {b}…")
+                r = measure(b)
+                results[-1] = r
+                show(r)
+            elif not r["ok"] and str(b) != str(cur_band) and left:
+                if r.get("reason") == "no_signal" and not restore_between:
+                    print(f"      没信号就直接切下一条（省掉一次切回 {cur_label}）…")
+                else:
+                    print("      退回原频段，避免在坏状态上继续切…")
+                    ok_r, _ = restore_band(dev, cur_band, tries=2, poll=45)
+                    if not ok_r:
+                        print("      [!] 退不回去，剩下的频段先不测了")
+                        break
             if left:
                 used = (time.time() - t0) / idx
                 print(f"      （还剩 {left} 个，预计 {used * left / 60:.1f} 分钟）")
 
         usable = bands_worth_comparing(results)
-        if contest_band and usable and len(bands) > 2:
+        skip_why = _contest_skip_reason(usable, contest_band)
+        if skip_why:
+            print(f"\n[决赛] 不用复核：{skip_why} —— 省掉一次切频段（约 1 分钟）")
+        if contest_band and usable and len(bands) > 2 and not skip_why:
             # 决赛前先把设备从「上一个频段」拉回健康状态。
             # 实测（连续两轮，2026-10-29）：BAND 41（当地无覆盖）刚跳过，紧接着决赛
             # BAND 3，两轮复测都只有 8.7 / 9.9 Mbps，而第一轮是 40.1 / 46.6 Mbps ——
@@ -2347,6 +2434,10 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                         if picked.get("risky") and not picked.get("rsrp_drop") else "")])
                    + ([f"信道 {cur_ch} → {target['channel']}"] if do_ch else []),
     })
+    # 被打断的体检（人锁了 / 关守护）只测了一半，结论要标出来：守护那边
+    # 看到这个标记就不会拿「已测部分里最快」去锁设备。
+    if _CYCLE_CANCEL.is_set():
+        plan["interrupted"] = True
     PLAN.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 56)
@@ -3001,11 +3092,17 @@ def _can_fork_python():
     return bool(exe) and Path(exe).exists()
 
 
-def _run_cycle_inprocess(args, lte_only=False):
+def _run_cycle_inprocess(args, lte_only=False, preview=False):
     """同一个解释器里跑一次「体检 + 应用」。
 
     用的还是 main() 那一套（临时换 sys.argv）：参数定义只此一份，不会漏。
     调用方（守护）已经把设备连接放掉了，所以这里重新登录不会互相顶。
+
+    preview=True 时走 `--preview` 而不是 `--apply`：两条路都会实测，但**只有
+    preview 会把结论写进 plan.json**。守护必须走这条 —— 实机 2026-11-04
+    09:58 的体检结论是「BAND 40 32.6 Mbps 最优」，可日志下一句就变成
+    「瞄准 BAND 3」：因为它走的是 apply，plan.json 压根没更新，守护读到的是
+    前一天 17:20 那份旧计划（那份的 target 恰好是 3）。
     """
     argv = []
     if getattr(args, "wifi_only", False):
@@ -3016,7 +3113,7 @@ def _run_cycle_inprocess(args, lte_only=False):
         argv += ["--bands", args.bands]
     if getattr(args, "ssid", None):
         argv += ["--ssid", args.ssid]
-    argv.append("--apply")
+    argv.append("--preview" if preview else "--apply")
     old = sys.argv
     sys.argv = [str(Path(__file__).resolve())] + argv
     try:
@@ -3031,16 +3128,19 @@ def _run_cycle_inprocess(args, lte_only=False):
         sys.argv = old
 
 
-def run_cycle(args, lte_only=False):
+def run_cycle(args, lte_only=False, preview=False):
     """跑一次完整的体检 + 应用，返回退出码。
 
     lte_only=True 时跳过 2.4G 信道扫描。守护要用这个模式：它管的是「锁哪条
     频段」，信道是另一件事，而扫一遍要 5 轮 AP 扫描（一分钟上下）。实机
     2026-11-02 18:47 那轮扫完的结论是「当前信道 0 评分 None，保持现状」——
     守护拿它一个字都用不上。
+
+    preview=True 走 `--preview`：同样实测，但会把结论写进 plan.json。
+    守护必须用这条 —— 它锁哪条是**读 plan.json 决定的**，不写就等于拿旧结论锁。
     """
     if not _can_fork_python():
-        return _run_cycle_inprocess(args, lte_only=lte_only)
+        return _run_cycle_inprocess(args, lte_only=lte_only, preview=preview)
     cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
     if args.wifi_only:
         cmd.append("--wifi-only")
@@ -3050,7 +3150,7 @@ def run_cycle(args, lte_only=False):
         cmd += ["--bands", args.bands]
     if args.ssid:
         cmd += ["--ssid", args.ssid]
-    cmd.append("--apply")
+    cmd.append("--preview" if preview else "--apply")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
     for raw in iter(p.stdout.readline, b""):
         line = raw.decode("utf-8", "ignore").rstrip()
@@ -4787,7 +4887,19 @@ def _guard_lock_current(dev, serving):
     return _guard_lock_band(dev, serving)
 
 
-def _guard_plan_band(prefer=None):
+def _plan_age_sec(plan):
+    """plan.json 的年龄（秒）。读不出时间戳返回 None（当作不可信）。"""
+    ts = (plan or {}).get("ts")
+    if not ts:
+        return None
+    try:
+        when = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (datetime.now() - when).total_seconds())
+
+
+def _guard_plan_band(prefer=None, max_age=None):
     """从体检留下的 plan.json 里取出「该锁哪条频段」。
 
     守护的目的是「把最优那条锁住，别让设备自己乱跳」，所以体检结论哪怕是
@@ -4813,6 +4925,21 @@ def _guard_plan_band(prefer=None):
     try:
         plan = json.loads(PLAN.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return prefer
+    # 被打断的那次体检只测了一半，tab 里的「最优」是「已测部分里最快」，
+    # 拿它锁还不如锁当前驻留。
+    if plan.get("interrupted"):
+        print("      [!] 上次体检是被打断的，半截数据不拿来锁", flush=True)
+        return prefer
+    # plan.json 是个共享文件，上一轮的结论会一直躺在那儿。实机 2026-11-04
+    # 09:58 那份体检算出 BAND 40 最好，守护却锁了 BAND 3 —— 因为它读到的
+    # 是前一天 17:20 留在文件里的旧结论。结论有保质期，过期的当没有。
+    age = _plan_age_sec(plan)
+    limit = GUARD_PLAN_MAX_AGE if max_age is None else max_age
+    if limit and (age is None or age > limit):
+        when = "时间未知" if age is None else f"{age / 60:.0f} 分钟前"
+        print(f"      [!] 手上的体检结论是{when}的，不算数 —— 这次不拿它锁",
+              flush=True)
         return prefer
     rows = plan.get("lte") or []
     dead = {r.get("band") for r in rows
@@ -4891,18 +5018,27 @@ def _guard_verify_memo(dev, memo, serving, key, speed_url, host, trace=None):
 def _measure_eta():
     """估一下这次体检要多久，给等待的人一个准数。
 
-    原来写死「约 5 分钟」，实机 2026-11-02 18:47 那轮跑了 8 分 9 秒 ——
-    等的人看着「5 分钟」早就该好了，会以为卡死。按上次测过的频段数算，
-    每段 3 轮约 85 秒、没覆盖的会提前退出，所以取 70 秒/段。
+    这个数字以前错得离谱，是「等得越来越久」的一半原因：它按 plan.json 里
+    上次测过的**条数**算。实机 2026-11-04 09:58 那轮，旧 plan 里只剩 4 条，
+    于是先说「约 5 分钟（4 个频段）」，实际测了 6 个频段、跑了 9 分钟。
+    现在取「上次测过的条数」和「配置里的候选频段数」的较大值，都没有就按 6 条
+    （绝大多数 ZTE 机型就是 3/8/38/39/40/41），并把决赛那 70 秒算进去。
     """
+    n = 0
     try:
-        rows = json.loads(PLAN.read_text(encoding="utf-8")).get("lte") or []
-        n = len(rows)
+        n = len(json.loads(PLAN.read_text(encoding="utf-8")).get("lte") or [])
     except (OSError, ValueError, AttributeError):
         n = 0
-    if not n:
-        return "约 5~8 分钟"
-    return f"约 {max(2, round(n * 70 / 60))} 分钟（{n} 个频段）"
+    try:
+        n = max(n, len(load_config().get("candidate_bands") or []))
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    if n < 4:
+        n = 6
+    per = 55                    # 切+等注册约 30s，测速+延迟约 25s
+    total = n * per + (70 if n > 2 else 0)
+    tail = "，含最后复核" if n > 2 else ""
+    return f"约 {max(2, round(total / 60))} 分钟（{n} 个频段{tail}）"
 
 
 def _guard_measure(args, prefer=None, *, net_down=False):
@@ -4929,7 +5065,19 @@ def _guard_measure(args, prefer=None, *, net_down=False):
     try:
         _CYCLE_CANCEL.clear()
         print(f"      跑完整体检选最优（会断网几次，{_measure_eta()}）…", flush=True)
-        code = run_cycle(args, lte_only=True)
+        try:
+            code = run_cycle(args, lte_only=True, preview=True)
+        except CycleCancelled:
+            # 人接管（手锁/关守护）时，体检可能直接把取消异常抛上来。
+            # 这条不该冒到线程顶层变成一个红字 traceback —— 它不是错误。
+            print("      [!] 体检被打断（有人接管了），这轮不锁，听人的", flush=True)
+            return None
+        if _CYCLE_CANCEL.is_set():
+            # 体检被人接管了（手动锁 / 关守护 / 用户要上网）。这时候手里的
+            # 数据是半截的，绝不能拿去锁 —— 人都改完了，程序再按半截结论
+            # 覆盖一次，就是「我点了三次都是 BAND 3，结果还是 38」那种事。
+            print("      [!] 体检被打断（有人接管了），这轮不锁，听人的", flush=True)
+            return None
         band = _guard_plan_band(prefer) if code == 0 else prefer
         print(f"      体检结束（exit={code}），重新接管设备…", flush=True)
         return band
@@ -5029,8 +5177,12 @@ def guard_still_reset(*, pci_changed, moving, band_changed=False,
 
 def run_guard(args, cfg):
     """全自动守护：打开一次就一直在，按「人在不在动」管频段锁定。"""
-    # 上一轮如果是被界面停掉的，标志还留着 —— 不清掉这一轮会立刻退出
+    # 上一轮如果是被界面停掉的，标志还留着 —— 不清掉这一轮会立刻退出。
+    # 取消旗同理：上一轮手动锁/停守护留下 CANCEL，会让这一轮第一次切频段
+    # 就被当成「人接管了」而中止。但手动锁正持着锁时不能清，那是人家的旗。
     _GUARD_STOP.clear()
+    if not _CYCLE_LOCK.locked():
+        _CYCLE_CANCEL.clear()
     interval = max(15, args.guard_interval)
     settle = max(interval * 4, args.guard_settle)
     quick_sec = max(interval * 2, min(GUARD_QUICK_SEC, settle / 2.0))
@@ -5913,6 +6065,10 @@ def run_guard(args, cfg):
                                 if pending_lock:
                                     print(f"      → 体检跑了就得真的锁上：瞄准 BAND {pending_lock}"
                                           f"（体检结论「保持现状」不等于「别锁」）", flush=True)
+                                elif _CYCLE_CANCEL.is_set():
+                                    # 人接管了：手锁 / 关守护。不是"没结论"，是"不用结论"。
+                                    print("      → 这轮体检被人的操作打断，不锁了，"
+                                          "照你刚设的来", flush=True)
                                 else:
                                     # 连当前驻留都读不到。不吭声地跳过正是这次要修的病。
                                     print("      [!] 体检没留下结论、也读不到当前驻留频段，"
@@ -6148,14 +6304,20 @@ def run_lock_band(dev, args, st0=None):
     # 体检子流程紧接着又 set_band 回去了。所以这里先举旗（CANCEL），
     # 再等体检放手（LOCK）；体检那边每轮测速前都会看一眼旗子。
     _CYCLE_CANCEL.set()
-    got_lock = _CYCLE_LOCK.acquire(timeout=45)
+    print("  正在让正在跑的那轮体检先停下（最多等 %d 秒）…" % MANUAL_PREEMPT_SEC)
+    got_lock = False
+    deadline = time.time() + MANUAL_PREEMPT_SEC
+    while time.time() < deadline:
+        if _CYCLE_LOCK.acquire(timeout=5):
+            got_lock = True
+            break
     if not got_lock:
-        # 45 秒还没放手，说明那一轮正卡在切频段/等注册里。这时候硬切有两个
+        # 等到最后仍然没放手：那一轮多半卡在切频段/等注册里。这时候硬切有两个
         # 人都改设备的窗口，宁可让用户再点一次，也不给他一个「看起来成功、
-        # 实际被覆盖」的结果（那正是他昨天连点三次的原因）。
+        # 实际被覆盖」的结果（那正是他 11-03 连点三次的原因）。
         _CYCLE_CANCEL.clear()
-        print("[!] 有一轮体检还在跑、45 秒内没停下来。请等 10 秒再点一次，"
-              "或者在界面上先停掉守护体检")
+        print("[!] 体检一直没停下来（可能卡在切频段/等注册）。请再点一次；"
+              "实在不行先关掉守护再设。")
         return 1
     try:
         return _run_lock_band_locked(dev, band, st0)

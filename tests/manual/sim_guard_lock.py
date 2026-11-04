@@ -113,6 +113,8 @@ else:
     }), encoding="utf-8")
 
 PLAN_EXAM = {
+    # ts 必须有：守护现在只认「这段时间内」的结论（11-04 拿前一天那份锁错过）
+    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
     "lte": [
         {"band": 3, "ok": True, "mbps": 22.0, "avg": 66, "loss": 0},
         {"band": 8, "ok": True, "mbps": 10.5, "avg": 65, "loss": 0},
@@ -126,7 +128,7 @@ PLAN_EXAM = {
 exam_runs = []
 
 
-def fake_run_cycle(args):
+def fake_run_cycle(args, lte_only=False, preview=False):
     exam_runs.append(time.strftime("%H:%M:%S"))
     PLAN.write_text(json.dumps(PLAN_EXAM, ensure_ascii=False), encoding="utf-8")
     print("      [模拟体检] 结论：BAND 3 最优 22.0 Mbps；"
