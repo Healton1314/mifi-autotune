@@ -127,7 +127,7 @@ class TestScanRounds(unittest.TestCase):
 class TermuxFieldNames(unittest.TestCase):
     """Termux:API 有两个版本的 JSON 字段名，必须都认。
 
-    2026-10-29 实测：退出码 0、API 桥通，但工具说「一个都没扫到」。
+    实测：退出码 0、API 桥通，但工具说「一个都没扫到」。
     真因是代码只读 `frequency` / `level`，而这台机器返回的是
     `frequency_mhz` / `rssi` —— 每条记录都被当成「没有频率」丢掉了。
     这个 bug 的表现和「没权限」一模一样，所以必须用真实返回锁住。

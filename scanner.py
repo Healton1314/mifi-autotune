@@ -230,7 +230,7 @@ def _parse_scan_array(data):
         #   旧版 Termux:API → frequency / level
         #   新版（Android 10+ 直接转 WifiScanner 的 ScanResult）→ frequency_mhz / rssi
         # 只读 frequency 的话，新版机器上每个 AP 都会被当成「没有频率」扔掉 ——
-        # 表现就是「明明扫到了，工具却说一个都没扫到」（2026-10-29 实测踩到）。
+        # 表现就是「明明扫到了，工具却说一个都没扫到」（实测踩到）。
         freq = ap.get("frequency_mhz") or ap.get("frequency")
         if not freq:
             continue
@@ -416,7 +416,7 @@ def scan_diagnose():
 def _describe_termux_records():
     """有数据却用不上时，说清「系统到底给了什么」。
 
-    实测（2026-10-29 实测）：退出码 0、API 桥也通，但只返回 1 条
+    实测中：退出码 0、API 桥也通，但只返回 1 条
     5200MHz、SSID 空、timestamp 是 2022-12-04 的记录 —— 那是系统缓存，
     不是这次扫描的结果。原来那句「可能只返回了当前连接的那个」与证据不符
     （当时连的是 2.4G，这条是 5GHz），等于把人往错的方向引。

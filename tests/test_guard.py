@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """全自动守护的决策规则。
 
-实测中 定的策略：
+设计时定的策略：
   · 在动 → 解锁（锁死一个频段，走到没覆盖的地方就断网）
   · 久坐 → 锁住当前驻留的那个（不重新测，几乎不断网；只为阻止设备自己乱跳）
   · 锁了之后不通 → 先解锁自救；解锁后仍不通 → 才跑体检换频段
@@ -481,7 +481,7 @@ class MemoIsTheServingBand(unittest.TestCase):
     def test_pin_holds_even_when_that_band_is_slow(self):
         """pin 那条只有 3 Mbps，但链路干净 → 照样听人的。
 
-        这一条是实测中 亲口纠正的。他设 BAND 3 的原因就是这个：
+        这一条是实机验证后纠正的。他设 BAND 3 的原因就是这个：
         「住处的 BAND 40 网速和信号有时候检测会比 BAND 3 好，就会导致直接锁
         BAND 40，但 BAND 40 丢包就会用起来一会一卡，就设置在住处优先锁 BAND 3」。
 
@@ -720,7 +720,7 @@ class StillReset(unittest.TestCase):
 
         2026-10-31 17:39 实测：锁着 BAND 40，40 丢包 100%，第一拍就把
         已经攒够的静止时间清零回「0/10」，而人还坐在原处。丢包是链路的事，
-        该走「换备选 / 解锁自救」，不该把「我在这儿坐够了」这个结论作废。
+        该走「换备选 / 解锁自救」，不该把「在这儿坐够了」这个结论作废。
         """
         self.assertFalse(A.guard_still_reset(pci_changed=False, moving=False))
 
@@ -733,7 +733,7 @@ class StillReset(unittest.TestCase):
     def test_weak_evidence_does_not_reset(self):
         """放宽后的「移动」不能顺带清零。
 
-        实测中 的原话：「不想它识别不出我在移动，但也不想它一直判我在动、
+        实机验证后的要求：「不想它识别不出人在移动，但也不想它一直判人还在动、
         坐不到十分钟一直不锁」。两件事的代价不对称：多解锁一次只是几十秒，清零
         却要人从头再坐十分钟。所以解锁用宽判据，清零只认严格那套。
         """
@@ -1060,7 +1060,7 @@ class DevicePin(unittest.TestCase):
 
     def test_clear_on_restore(self):
         A.set_device_pin(3)
-        A.clear_device_pin()          # --restore 就是「我要自动」
+        A.clear_device_pin()          # --restore 就是「回到自动」
         self.assertIsNone(A.device_pin())
 
     def test_restore_must_clear_the_site_level_pin_too(self):
@@ -1086,7 +1086,7 @@ class DevicePin(unittest.TestCase):
     def test_site_pin_does_not_expire(self):
         """位置级 pin 不设时效 —— 它说的是「这个地方」，那是长期属性。
 
-        实测中 解释了他设 BAND 3 的原因：住处的 BAND 40 信号和速度
+        实测确认了设 BAND 3 的原因：住处的 BAND 40 信号和速度
         有时候比 3 好，程序就锁 40，可 40 会周期性丢包、用起来一会一卡。
         这种「这个地方这条更稳」的结论，不会因为过了一个星期就变假。
         跨位置的误伤由 device_pin_here() 挡（设备级那条记了来源位置）。
@@ -1434,7 +1434,7 @@ class QuickLineFormat(unittest.TestCase):
 class DevicePinScope(unittest.TestCase):
     """设备级 pin 只在「当初设它的那个地方」算数。
 
-    实测中 办公区里遇到的就是这个：住处里设的「优先 BAND 3」，到了办公区
+    实测中在办公区遇到的就是这个：住处里设的「优先 BAND 3」，到了办公区
     被当成「这台设备永远要 3」，程序本来算好该锁 BAND 40，被它直接改掉。
     pin 说的是「这个地方 3 比 40 稳」，不是「这台设备永远要 3」。
     """
@@ -1479,7 +1479,7 @@ class DevicePinScope(unittest.TestCase):
 class BandFlapByHour(unittest.TestCase):
     """「住处 BAND 40 尤其晚上丢包严重，别处可用性很高」—— 判定得分时段。
 
-    实测中 的原话：「band40 在住处尤其是晚上丢包严重，但是在其他地方
+    实机验证后的要求：「band40 在住处尤其是晚上丢包严重，但是在其他地方
     他的可用性还是很高的」。全天平均会把这个信息抹平：晚上掉 100%、白天一次
     没掉，平均下来只剩「这条偶尔掉」，于是白天的好时段被连坐、晚上的坏时段
     又不够刺眼。

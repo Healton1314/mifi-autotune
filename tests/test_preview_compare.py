@@ -360,7 +360,7 @@ class ServingBandParse(unittest.TestCase):
 class ContestPicksCorrectBands(unittest.TestCase):
     """决赛名单：第一名的领先幅度决定要不要复测第二名。
 
-    实测（2026-10-30 12:34）：BAND 40 31.5 vs BAND 3 29.0，只差 8%。
+    实测）：BAND 40 31.5 vs BAND 3 29.0，只差 8%。
     单轮测速的波动轻易就有 10~20%，这种差距根本说不清谁快谁慢；当时因为
     「最快的就是当前驻留的」只复测了一个，等于拿一次运气当结论。
     """

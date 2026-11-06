@@ -68,7 +68,7 @@ class TestPhonePackage(unittest.TestCase):
         """mifi --update 会 rm -rf 整个目录，不能顺手把位置记忆和上次结论删了。
 
         位置记忆要攒几次才敢跳过频段，每更新一次清一次等于永远攒不起来
-        （实测中 的手机上就踩到了）。
+        （实测中在手机上就踩到了）。
         """
         body = self.zip.read("mifi-autotune/phone/install.sh").decode("utf-8")
         self.assertIn('KEEP="$HOME/.mifi-keep"', body)
@@ -80,7 +80,7 @@ class TestPhonePackage(unittest.TestCase):
         """输出要能复盘，但只写 Termux 自己的目录。
 
         曾经优先写 ~/storage/downloads（即手机 /sdcard/Download），好处是插数据线
-        能直接拷出来；实测中 明确要求「将日志放到 termux 目录」——
+        能直接拷出来；需求里明确要求「将日志放到 termux 目录」——
         那是他的私人空间，工具不该拿它当调试通道。这里把「不许再写手机存储」
         钉成断言，免得以后为了图方便又改回去。
         """

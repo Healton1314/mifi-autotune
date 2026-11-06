@@ -26,7 +26,7 @@ def res(band, mbps, samples=None):
 
 
 class DecideBand(unittest.TestCase):
-    """自动裁决规则（实测中 定）：
+    """自动裁决规则（设计时定）：
 
       1) 一方速度强太多 → 选快的
       2) 速度差不多     → 选更稳的
