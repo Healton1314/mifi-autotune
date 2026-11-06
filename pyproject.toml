@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mifi-autotune"
-version = "0.6.9"
-description = "自动为 4G 随身WiFi / CPE 选出最优 LTE 频段与 2.4G 信道（跨平台、零依赖、驱动化）"
+version = "0.10.0"
+description = "自动为 4G 随身WiFi / CPE 选出最优 LTE 频段与 2.4G 信道：体检、一键应用、长期守护、按位置记忆（跨平台、零依赖、驱动化）"
 readme = "README.md"
 requires-python = ">=3.8"
-authors = [{ name = "Healton1314" }]
+authors = [{ name = "mifi-autotune contributors" }]
 keywords = ["mifi", "4g", "lte", "cpe", "wifi", "channel", "autotune", "band-lock"]
 classifiers = [
   "Programming Language :: Python :: 3",

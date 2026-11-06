@@ -1,8 +1,25 @@
 # mifi-autotune
 
-给 4G 随身WiFi / CPE 用的**调优工具**：先体检、告诉你能快多少，再一键应用。
+给 4G 随身WiFi / CPE 用的**调优工具**：先体检、告诉你能快多少，再一键应用；也可以交给它长期值守，走到哪儿自己判断该锁哪条频段。
 
-纯 Python 标准库，**零第三方依赖**，不刷机、不连厂商云、不需要 root。
+纯 Python 标准库，**零第三方依赖**，不刷机、不连厂商云、不需要 root。同一个引擎有三种跑法：电脑命令行、手机上的 Termux、以及一个自带界面的 Android App。
+
+**它做什么**
+
+| 能力 | 说明 |
+|---|---|
+| **体检** | 逐个锁频段实测带宽/延迟/丢包，同时扫描 2.4G 邻居算信道干扰分，给出「现在 → 能到多少」 |
+| **应用** | 按结论只切一次，全程断网 30~60 秒；不加参数绝不写设备 |
+| **守护**（`--guard`） | 长期值守：人在动就解锁、坐够才锁、锁完每 20 分钟复核、撑不住就自救 |
+| **位置记忆** | 按「服务小区 + 运营商」认地方，同一个地方不重复踩坑；可导出搬到另一台机器 |
+| **回评** | 每次锁定前后对比丢包和延迟，记下「锁对了没」，两次锁坏就不再优先选它 |
+
+**它不做什么**
+
+- 不刷机、不改固件、不碰厂商云
+- 不绕过运营商限速（那是 SIM 卡上的 QoS，设备侧改不了）
+- 只扫 2.4G WiFi（多数随身WiFi 是单频）
+- 只认已经写好驱动的固件，目前是 ZTE-RTA 系；别的机型要照着模板补一个驱动
 
 ```
 $ python autotune.py --preview          # ① 体检，输出「现在多少 → 能到多少」
@@ -74,6 +91,7 @@ score(信道) = Σ  邻居  (信号%/100)² × (重叠宽度 / 20MHz)
 | 系统 | 信道扫描 | 状态 |
 |---|---|---|
 | Windows 10/11 | `netsh wlan show networks mode=bssid` | ✅ 已验证。字段名多语言适配（中/英/日/韩/德/法/西/意/葡/俄/繁） |
+| **Android App（APK）** | 系统 `WifiManager`（Kotlin 侧注入） | ✅ 已实现。自带界面、前台服务守护、开机不丢状态，不需要 Termux |
 | **Android（Termux）** | `termux-wifi-scaninfo` | ⚠️ 已实现，需 Termux:API + 定位权限。**可在手机上完全独立运行** |
 | **iOS / iPadOS** | 无（系统不开放接口） | ⚠️ **只做频段优化**，信道扫描固定跳过。见下文「在手机上独立运行」 |
 | Linux | `nmcli` → 失败回落 `iw` | ⚠️ 已实现，未实机验证。`iw` 需 root 才能主动扫描 |
@@ -101,6 +119,15 @@ pip install .
 mifi-autotune                 # 等价于 python autotune.py
 mifi-panel --lan              # 等价于 python server.py --lan
 ```
+
+**方式三：Android 安装包（带界面，不需要 Termux）**
+
+仓库里**不放** `.apk`（`.gitignore` 挡着，避免把半成品当成品发出去）。要装就自己构建一份：GitHub 仓库 → Actions → `apk` → Run workflow，跑完在产物里下载，产物只留 3 天。
+
+App 里能做的事和命令行是同一套引擎：体检、应用建议、守护开关、扫描信道、手动设频段/信道、恢复默认。守护跑在**前台服务**里，通知栏常驻，退到后台不会被静默杀掉。
+
+> **0.10.0 起包名变了**：从 `io.github.mifiautotune.app` 改成 `io.github.mifiautotune.app`。
+> 对 Android 来说这是**另一个应用**——旧版不会自动升级，要手动卸载再装；旧版里的设置和位置记忆也不会跟着过去。
 
 前置条件：
 
@@ -260,7 +287,7 @@ python autotune.py --watch              # 进阶：持续挂在后台，劣化�
 
 一个地方以前常来、隔了很久没来，中间可能加了基站、拆了基站、邻居换过几轮、晚上八点的人流也完全不同 —— 拿旧的速度数字跳着测，就是把过期结论当答案。所以隔久了就老老实实全测一遍，测完把历史速度数字**直接换成这次的**（不再和旧值取最大），免得那个偏高的旧数字再骗一次快速模式。
 
-位置用 **PCI + 运营商** 认，但**换了频段会换服务小区**：同一张桌子，锁 BAND 40 是 PCI 236，切到 BAND 3 变成 350。要是照 PCI 一条一条记，工具每切一次频段就等于把自己搬了次家，记忆永远攒不起来——而它偏偏一直在切。所以规则是：**同一运营商，且上一次记录在 20 分钟内**，就认作同一个地方（人真走到另一个小区，通常不会二十分钟内又测一遍；切频段只要几十秒）。记录里会留 `aliases`，界面上会写「同一处还见过 PCI 236」，一看就明白为什么只有一条记录。
+位置用 **PCI + 运营商** 认，但**换了频段会换服务小区**：同一张桌子，锁 BAND 40 是 PCI 236，切到 BAND 3 变成 350。要是照 PCI 一条一条记，工具每切一次频段就等于把自己搬了次家，记忆永远攒不起来——而它偏偏一直在切。所以规则是：**同一运营商，且上一次记录在 5 分钟内**，就认作同一个地方（切频段是秒级到一分钟的事；人真走到另一个小区，不会五分钟后还落回同一批服务小区）。记录里会留 `aliases`，界面上会写「同一处还见过 PCI 236」，一看就明白为什么只有一条记录。
 
 更要紧的是**一次体检就把同一个地方的每张面孔都记下来**：体检是唯一「人坐在这儿、把每条频段都锁一遍」的时刻，锁 BAND 3 读到 350、BAND 8 读到 401、BAND 41 读到 477 —— 这些都是同一张桌子。以前只记第一轮那个 PCI，剩下的靠 20 分钟窗口碰运气，窗口一过就分家（实机上「锁 3 之后守护认不出住处」就是这么来的）。现在每条频段的 PCI 都进 `cells`，隔一个月回来、换哪条频段驻留，都认得出这是同一处。
 
@@ -268,7 +295,7 @@ python autotune.py --watch              # 进阶：持续挂在后台，劣化�
 
 **守护模式和体检写的是同一本账**（0.7.6 起）。以前守护只在「锁定那一刻」写一次信号，其余时间采到的信号全丢；锁到一条新频段（PCI 跟着变）时，记忆里没有这条记录，采样连门都进不去——于是「守护跑了一早上」和「一次体检」各记各的，回到熟悉的地方照样判不出哪条最优。现在：
 
-- 锁着的时候每 5 分钟把那一下的信号写进当前频段；丢包 ≥15% 时立刻补一条样本。速度那一格留空而不是写 0——守护只 ping 不测速，写 0 等于在记忆里造一条假的「0 Mbps」，日后按速度统计就被带偏。
+- 锁着的时候每 5 分钟把那一下的信号写进当前频段；丢包 ≥20% 时补一条样本（两次之间至少隔 2 分钟）。速度那一格留空而不是写 0——守护只 ping 不测速，写 0 等于在记忆里造一条假的「0 Mbps」，日后按速度统计就被带偏。
 - 记忆里没有的 PCI 也会建一条**观测记录**：有 `observed`、有小区、有信号，就是没有 `last`。它不代表「测过」，`site_memory_state` 照样判它 stale，不会让过期记忆装成可信记忆；但设备换频段那一刻它会被并进这个位置的本体，不会变成两本账。
 - 「设备换频段 / 换小区、人没动」时顺手把两个 PCI 记成同一处，所以锁 BAND 3（PCI 350）攒下的信号，体检在 BAND 40（PCI 236）下也看得见。
 
@@ -434,9 +461,9 @@ python autotune.py --watch --watch-interval 600     # 探得更稀一些
 |---|---|
 | 连着 3 拍不通 / 丢包≥50% / 延迟≥2s | 先换记忆里的备选，没有才解锁 |
 | 锁定这条的信号比锁定那一刻塌了 10dB 以上（连着 2 拍） | 解锁。日志会写明是「人走开了」还是「设备在同一频段里换到了弱小区」 |
+| 每 20 分钟的复核判「不够用」 | 同上（先备选，后解锁） |
 
 「信号塌了」有两种成因，处置一样、说法不能混：**人真的走开了**（频段换了，或者一路往下掉），或者**人没动、设备在锁定的这个频段里换到了一个弱小区** —— 锁着频段它就换不出去，只能在这个频段里挑，挑到弱的也没法自救。后一种解锁之后，设备往往会自己挑回同一频段里更强的那个小区。
-| 每 20 分钟的复核判「不够用」 | 同上（先备选，后解锁） |
 
 久坐要锁的时候，优先用**这个位置的历史最优**（几乎不断网）。只有记忆里没有可用数据时才跑体检，而**体检跑完一定会真的锁上**——哪怕体检结论是「保持现状、没必要换」，也会把选出的那条锁住。不锁等于什么都没做：白等 10 分钟、白断网六七次，设备下一步照样自己乱跳。（0.7.0 之前就是这样，最后得手动锁，已修。）
 
@@ -740,7 +767,7 @@ python server.py --lan
 
 ```
 mifi-autotune/
-├── autotune.py            引擎（命令行入口，含 --watch 守护模式）
+├── autotune.py            引擎（命令行入口：体检 / 应用 / 守护 / 记忆）
 ├── scanner.py             2.4G 扫描层（跨平台 + 多语言）
 ├── probe.py               带宽 / 延迟测量层
 ├── server.py              本地 Web 面板服务（带令牌校验）
@@ -749,8 +776,13 @@ mifi-autotune/
 │   ├── index.html
 │   ├── manifest.webmanifest
 │   └── icon.svg
+├── android/               Android App（Chaquopy 把同一个引擎塞进 APK）
+│   ├── app/src/main/java/…/  Kotlin：界面、前台服务、WiFi 扫描桥
+│   └── app/src/apkpy/        Python 侧的桥接层（扫描结果注入、可写目录、面板启动）
+├── phone/                 Termux / a-Shell 的一键安装与 mifi 命令
+├── docs/                  附加文档（如 Termux 安装包来源）
 ├── tests/                 纯逻辑单元测试（CI 三系统跑）
-├── .github/workflows/     CI
+├── .github/workflows/     CI + APK 构建
 └── drivers/
     ├── base.py            设备抽象基类
     ├── zte_rta.py         ZTE-RTA 实现
@@ -758,7 +790,7 @@ mifi-autotune/
     └── __init__.py        注册表 + 自动探测
 ```
 
-运行期产物（`state.json`、`config.json`、`autotune-log.jsonl`、`.panel-token`）已在 `.gitignore` 里。
+运行期产物（`state.json`、`config.json`、`autotune-log.jsonl`、`sites.json`、`.panel-token`）已在 `.gitignore` 里。位置记忆和导出的 `mifi-memory*.json` 含真实小区与测速数据，**只在本机之间搬，不要提交**。
 
 ## 接口备忘
 
@@ -787,6 +819,9 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 - **不处理 5G WiFi。** 只扫 2.4G，因为多数随身WiFi 是单频 2.4G 设备。
 - **不改信道带宽和加密。** 属于策略问题，交给用户自己决定。
 - **切换会断网。** 这是切频段的物理代价，无法避免。
+- **只认已经写好的驱动。** 目前实机验证过 ZTE-RTA 系固件（`/xml_action.cgi` + Digest，`realm=Highwmg`）。别的品牌要照着 `drivers/template.py` 补一个驱动；后台**根本不开放**「锁频段」的机型（不少低价随身WiFi 就是这样）只能做信道那半边，工具会自己跳过频段部分而不是硬改。
+- **守护不能替你想起来。** 它开着的时候会自己判断该不该解，但没开的时候，出门前那条 `--restore` 还是得自己跑。
+- **iPhone / iPad 做不到信道扫描。** 系统不给第三方 App 邻居列表，这不是实现问题。频段优化不受影响。
 
 ## Roadmap
 
@@ -796,6 +831,9 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 - [x] 手机端面板（PWA，局域网访问 + 访问令牌）
 - [x] 持续检测（可选，面板上有开关和运行状态）
 - [x] 打包为可安装命令（`pip install .`）
+- [x] 全自动守护：移动判定、久坐锁定、定时复核、断网自救
+- [x] 位置记忆：按服务小区认地方、跨设备导入导出、锁定回评
+- [x] Android App（Chaquopy 内嵌解释器 + 前台服务守护）
 - [ ] 从 `autotune-log.jsonl` 生成长期趋势图
 - [ ] 按时段策略切换（夜里宽容、晚高峰激进）
 - [ ] 更多机型驱动（欢迎 PR）
@@ -803,20 +841,23 @@ POST /xml_action.cgi?method=set&module=duster&file=uapxb_wlan_basic_settings
 
 ## English
 
-**mifi-autotune** automatically finds the best LTE band and 2.4GHz WiFi channel for your 4G dongle / MiFi / CPE — it scans neighbouring APs, measures each band with multiple rounds, and applies the winner.
+**mifi-autotune** finds the best LTE band and 2.4 GHz WiFi channel for your 4G dongle / MiFi / CPE — it scans neighbouring APs, measures each band with multiple rounds, and applies the winner. A guard mode keeps it that way while you move around.
 
 - Zero dependencies (Python 3.8+ standard library only)
 - Read-only by default; `--apply` to write. Auto-rollback if the new band can't get online
-- `--watch` daemon mode: cheap latency probing, full re-measure only when the link actually degrades
+- `--guard`: unlocks when you move, locks after you settle, re-checks every 20 minutes, and gives up a lock that stops working (switch to a known-good alternative first, unlock only as a last resort)
+- Remembers places by serving cell (`PCI + operator`): which bands are receivable here, which one was fastest, which one flaps. Importable/exportable between machines
 - Driver-based: the engine knows nothing about brands. `drivers/zte_rta.py` is verified; copy `drivers/template.py` to add yours
-- Ships with a local PWA dashboard for your phone (`python server.py --lan`), protected by an access token
+- Runs on a PC, in Termux, or as a native Android app with a UI and a foreground-service guard
+- Also ships a local PWA dashboard for your phone (`python server.py --lan`), protected by an access token
 - `pip install .` gives you `mifi-autotune` and `mifi-panel` commands
 
 ```bash
-python autotune.py            # report only
-python autotune.py --apply    # measure and apply
-python autotune.py --watch    # keep watching, re-tune when it degrades
-python autotune.py --restore  # unlock band + auto channel  ← do this before travelling
+python autotune.py             # report only
+python autotune.py --apply     # measure and apply
+python autotune.py --guard     # stay resident: unlock when moving, lock when settled
+python autotune.py --status    # quick read-only look at device + place memory
+python autotune.py --restore   # unlock band + auto channel  ← do this before travelling
 ```
 
 ## License
