@@ -115,15 +115,24 @@ class BandPlan(unittest.TestCase):
         self.assertEqual(sorted(keep), [3, 8, 39, 40])   # 一个都不能丢
         self.assertEqual(slow, [])
 
-    def test_fast_mode_skips_much_slower_bands(self):
-        # 真实数据（2026-10-30）：43.2 / 34.5 / 10.7 / 8.2 → 只要 40 和 3
+    def test_slow_bands_are_still_measured(self):
+        """慢的频段也得测 —— 只有「没信号」才允许跳过。
+
+        这里曾经是「快速模式」：来过 2 次、最快比第二快 20%，就只测
+        「最优 + 当前驻留」两条（真实数据 43.2 / 34.5 / 10.7 / 8.2 → 只测 40 和 3）。
+        用户 2026-11-11 报的原话：「在一个地方测试两次后他就不会正常体检了，
+        我的意思是剔除无信号的，不是只测试信号好的那两个」。
+        速度是最会变的东西，所以这条测试现在钉住相反的行为。
+        """
         rec = self._rec({"40": {"dead": 0, "ok": 5, "best": 43.2},
                          "3": {"dead": 0, "ok": 3, "best": 34.5},
                          "8": {"dead": 0, "ok": 3, "best": 10.7},
                          "39": {"dead": 0, "ok": 3, "best": 8.2}}, best=40, seen=3)
-        keep, _, slow, _ = A.band_plan(rec, [3, 8, 39, 40], serving=40)
-        self.assertEqual(keep, [40, 3])
-        self.assertEqual(slow, [8, 39])
+        keep, dead, slow, _ = A.band_plan(rec, [3, 8, 39, 40], serving=40)
+        self.assertEqual(sorted(keep), [3, 8, 39, 40])   # 一条都不跳
+        self.assertEqual(dead, [])
+        self.assertEqual(slow, [])
+        self.assertEqual(keep[0], 40)                    # 只是排在前面
 
     def test_fast_mode_off_on_first_visit(self):
         # 只来过一次，历史不可信，必须全测

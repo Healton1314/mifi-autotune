@@ -10,6 +10,7 @@
 顺带钉住「守护触发的体检也走同一条路」。
 """
 
+import inspect
 import json
 import tempfile
 import time
@@ -164,6 +165,48 @@ class GuardCheckupSharesTheSamePath(unittest.TestCase):
         src = inspect.getsource(A.run_preview)
         self.assertIn('args.bands in ("default", "all")', src)
 
+
+
+class NoFastMode(Base):
+    """「只测信号好的那两个」已经被删掉了（2026-11-11）。
+
+    用户原话：「在一个地方测试两次后他就不会正常体检了，我的意思是剔除
+    无信号的，不是只测试信号好的那两个」。原来 band_plan 里有个快速模式：
+    来过 2 次 + 历史最优领先第二 20% → 只测「最优 + 当前驻留」。
+    下面几条钉住「现在只允许因为没信号而跳过」。
+    """
+
+    def _rec(self, bands, best=40, seen=3):
+        return {"seen": seen, "best": best, "last": A.datetime.now().isoformat(
+            timespec="seconds"), "bands": bands}
+
+    def test_second_visit_still_measures_everything(self):
+        rec = self._rec({"40": {"dead": 0, "ok": 5, "best": 43.2},
+                         "3": {"dead": 0, "ok": 3, "best": 34.5},
+                         "8": {"dead": 0, "ok": 3, "best": 10.7},
+                         "39": {"dead": 0, "ok": 3, "best": 8.2}})
+        keep, dead, slow, _ = A.band_plan(rec, [3, 8, 39, 40], serving=40)
+        self.assertEqual(sorted(keep), [3, 8, 39, 40])
+        self.assertEqual(dead, [])
+        self.assertEqual(slow, [])
+
+    def test_only_dead_bands_are_skipped(self):
+        rec = self._rec({"40": {"dead": 0, "ok": 5, "best": 43.2},
+                         "3": {"dead": 0, "ok": 3, "best": 34.5},
+                         "38": {"dead": 3, "ok": 0},
+                         "41": {"dead": 3, "ok": 0}})
+        keep, dead, slow, _ = A.band_plan(rec, [3, 38, 40, 41], serving=40)
+        self.assertEqual(sorted(keep), [3, 40])
+        self.assertEqual(sorted(dead), [38, 41])
+        self.assertEqual(slow, [])
+
+    def test_constants_are_gone(self):
+        for name in ("FAST_LEAD_RATIO", "FAST_MIN_SEEN"):
+            self.assertFalse(hasattr(A, name), f"{name} 应该已经被删掉")
+
+    def test_log_never_says_skip_for_being_slow(self):
+        src = inspect.getsource(A.run_preview)
+        self.assertNotIn("慢太多", src)
 
 if __name__ == "__main__":
     unittest.main()

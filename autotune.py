@@ -116,14 +116,18 @@ DEAD_REPROBE_EVERY = 5              # 但每 N 次强制全测一遍，防止环
 # 记忆会随时间过期。实测中指出的场景：一个地方以前常来，
 # 隔了很久没来 —— 这期间可能加了基站/拆了基站、邻居换了几轮、晚上八点的人流
 # 也完全不同，拿旧数据跳着测就是拿过期结论当答案。所以分三档：
-#   fresh  72 小时内  —— 记忆全信，可以用「只测两个」的快速模式
+#   fresh  72 小时内  —— 记忆可信：跳过「这里从来没信号」的，其余全测
 #   aging  3~7 天     —— 覆盖还在（有没有信号很稳定），速度作废：能收到的全测
 #   stale  超过 7 天  —— 整段记忆作废，一条都不跳，全部重测
 SITE_FRESH_HOURS = 72
 SITE_STALE_DAYS = 7
 SITE_TTL_DAYS = 30                  # 这么久没来过的位置，连记录一起删掉（搬家/换城市）
-FAST_LEAD_RATIO = 1.2               # 历史最优比第二名快这么多倍，才敢只测它俩
-FAST_MIN_SEEN = 2                   # 至少来过这么多次，历史才可信（一次不算）
+# 这里曾经有过一个「快速模式」：来过 2 次、历史最优比第二名快 20%，就只测
+# 「最优 + 当前驻留」两条。省时间是真的（省 3~4 分钟），但它把「有信号、只是
+# 上次慢」的频段也跳过了 —— 而速度是最会变的东西（BAND 40 晚上丢包、白天更快）。
+# 用户 2026-11-11：「在一个地方测试两次后他就不会正常体检了，我的意思是剔除
+# 无信号的，不是只测试信号好的那两个」。
+# 所以现在只有一条跳过规则：**这里从来没信号**。其余一律实测。
 
 # 滚动样本：每个频段留最近几次「几点、多快、丢包多少、延迟多少」。
 # 为什么光有 best 不够：54 秒的体检碰不到「每 3~5 分钟掉一次包」这种事
@@ -1462,28 +1466,12 @@ def band_plan(rec, bands, serving=None, now=None):
     if best is not None and best not in keep:
         best = None
 
-    # 快速模式：历史最优领先明显时，只测「历史最优 + 当前驻留」。
-    # 这是真正省时间的那一步 —— 跳过死频段只省 30 秒，而有信号的频段每个要 54 秒。
-    # 只在来过 >= FAST_MIN_SEEN 次后才敢这么做，且每 DEAD_REPROBE_EVERY 次全测一遍。
-    # 另外只有 fresh 档才敢用：速度是最容易变的东西，隔了 3 天以上就不认了。
+    # 没有「只测两个」的快速模式了（原因见上面 SITE_FRESH_HOURS 那段注释）。
+    # 现在跳过只允许一个理由：**这里从来没信号**。有信号、只是上次慢的频段
+    # 照样实测 —— 速度是最会变的东西，而「上次慢 20%」根本不构成不测的依据。
+    # 返回值第 3 项保留空列表：调用方按四元组解包，日志里那行
+    # 「跳过 X：历史只有 … 慢太多」从今以后不会再出现。
     slow = []
-    if (best is not None and seen >= FAST_MIN_SEEN and state == "fresh"
-            and seen % DEAD_REPROBE_EVERY != 0):
-        def v(b):
-            return float((hist.get(str(b)) or {}).get("best") or 0)
-
-        rest = [b for b in keep if b != best and b != serving]
-        second = max(rest, key=v) if rest else None
-        if second is not None and v(best) >= v(second) * FAST_LEAD_RATIO:
-            chosen = [best]
-            if serving and serving != best:
-                chosen.append(serving)
-            elif second is not None:
-                # 当前驻留就是最优时，也要带上第二名：只测一个没法交叉确认，
-                # 单轮测速的波动足以把结论翻转（实测中 指出的偶发性）。
-                chosen.append(second)
-            slow = [b for b in keep if b not in chosen]
-            keep = chosen
 
     if best is not None and best in keep:
         keep = [best] + [b for b in keep if b != best]
@@ -2378,7 +2366,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
             state = site_memory_state(rec)
             skipped = []
             if rec:
-                bands, dead_list, slow_list, known_best = band_plan(
+                bands, dead_list, _slow, known_best = band_plan(
                     rec, bands, serving=cmp_band)
                 seen = int(rec.get("seen") or 0)
                 hist = rec.get("bands") or {}
@@ -2413,10 +2401,6 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                           f"上次的速度数字不再作数：能收到的频段全部重新测速")
                 if dead_list:
                     print(f"      跳过 {dead_list}：这里从来没信号")
-                if slow_list:
-                    desc = " / ".join(f"BAND {b} {_hist_v(b)}" for b in slow_list)
-                    print(f"      跳过 {slow_list}：历史只有 {desc} Mbps，"
-                          f"比 BAND {known_best}（{_hist_v(known_best)}）慢太多")
                 if known_best and state != "stale":
                     print(f"      上次最好：BAND {known_best}，这次先测它")
                 tail = ("（一条都不跳）" if state == "stale"
@@ -2448,7 +2432,7 @@ def run_preview(dev, caps, st0, args, cfg, speed_url, ping_host):
                 demoted = fastest          # 后面选建议时把它排除掉，否则又会被选回来
         if args.bands in ("default", "all") and not args.wifi_only:
             # 记忆过期那次是全测，速度数字就是最新的：把「历史最好」换成这次的，
-            # 否则 8 天前那个偏高的旧数字会一直压着，快速模式又会被它骗一次。
+            # 否则 8 天前那个偏高的旧数字会一直压着，下次体检又会被它当成「上次就这水平」。
             record_site(_site_key(st0), lte, best_band,
                         reset_best=(state == "stale"), cur_band=cmp_band)
 
